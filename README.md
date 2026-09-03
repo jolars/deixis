@@ -57,6 +57,28 @@ cargo run
 The process reserves stdout for MCP messages. Set `RUST_LOG` to control logs,
 which are always written to stderr.
 
+## Nix
+
+The flake exposes `packages.<system>.deixis`, a default package and app, and a
+Home Manager module that installs Deixis and registers it in the shared
+`programs.mcp.servers` registry:
+
+```nix
+{
+  inputs.deixis = {
+    url = "github:jolars/deixis";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  # In the Home Manager module list:
+  imports = [ inputs.deixis.homeManagerModules.default ];
+  programs.deixis.enable = true;
+}
+```
+
+Run the packaged server directly with `nix run github:jolars/deixis`. During
+local development, replace the input URL with a `path:` URL to the checkout.
+
 ## Inspirations
 
 The project draws lessons from [Serena](https://github.com/oraios/serena),

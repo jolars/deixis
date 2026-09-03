@@ -19,6 +19,8 @@ and Windows.
   publishing workflows.
 - [x] Add project, contribution, design, roadmap, changelog, and license
   documentation.
+- [x] Add a Nix flake with package, app, check, formatter, and Home Manager MCP
+  integration outputs.
 
 ## 1. LSP vertical slice
 
