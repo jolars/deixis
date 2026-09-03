@@ -1,0 +1,26 @@
+version: "3"
+
+tasks:
+  fmt:
+    desc: Check Rust formatting.
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: Lint all Rust targets.
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    desc: Run all Rust tests.
+    cmds:
+      - cargo test --all-targets --locked
+
+  docs:
+    desc: Build Rust documentation.
+    cmds:
+      - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+  check:
+    desc: Run the same checks as CI.
+    deps: [fmt, lint, test, docs]

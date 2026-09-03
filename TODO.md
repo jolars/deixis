@@ -1,0 +1,138 @@
+# Deixis Roadmap
+
+Status: `[ ]` todo · `[~]` in progress · `[x]` complete
+
+The phases are ordered. Each functional phase should begin with a failing
+black-box test and end with the full repository gate passing on Linux, macOS,
+and Windows.
+
+## 0. Project bootstrap
+
+- [x] Initialize a Rust 2024 binary crate and pin Rust 1.98.0.
+- [x] Add a stdio MCP server that reports its name and version and advertises no
+  capabilities.
+- [x] Protect the protocol stream with stderr-only tracing and a real-binary MCP
+  handshake test.
+- [x] Add devenv, pre-commit hooks, Taskfile commands, rustfmt, and committed
+  dependency resolution.
+- [x] Add cross-platform CI, Dependabot, Versionary, and crates.io trusted
+  publishing workflows.
+- [x] Add project, contribution, design, roadmap, changelog, and license
+  documentation.
+
+## 1. LSP vertical slice
+
+- [ ] Add a portable mock language-server binary used only by integration tests.
+  It must exercise initialization, notifications, requests, cancellation,
+  diagnostics, shutdown, malformed messages, and forced termination.
+- [ ] Spike `async-lsp` against the mock server. Record the result in
+  `DESIGN.md`; adopt it behind a small internal client boundary or document
+  why a different transport is required.
+- [ ] Add strict TOML configuration with explicit server commands, arguments,
+  environment overrides, language IDs, file patterns, and initialization
+  options. Reject unknown and ambiguous fields.
+- [ ] Add `--config` and `--root`; default the root to the current directory,
+  canonicalize it at startup, and keep it immutable.
+- [ ] Start one configured server lazily and implement `initialize`,
+  `initialized`, `shutdown`, `exit`, timeout, and forced-kill behavior.
+- [ ] Handle server stderr without touching MCP stdout and attach the server
+  name to every child-process log event.
+- [ ] Implement server-to-client configuration, workspace-folder, dynamic
+  registration, log-message, and unknown-method handling. Reject
+  `workspace/applyEdit` while read-only.
+
+Acceptance: an integration test starts `deixis`, routes through the mock LSP,
+observes a typed response, cancels a pending request, and leaves no child
+process running.
+
+## 2. Documents, positions, and first tools
+
+- [ ] Add root-contained path normalization, including traversal and symlink
+  escape tests. Permit external locations in results without reading them.
+- [ ] Add lazy `didOpen`, content-hash change detection, monotonic versions,
+  full-document replacement, and `didClose` on shutdown.
+- [ ] Convert positions between the MCP boundary's zero-based UTF-8 units and
+  negotiated LSP UTF-8, UTF-16, and UTF-32 units. Test ASCII, combining
+  marks, non-BMP characters, line endings, and invalid boundaries.
+- [ ] Add capability-gated `hover` with structured markup and a concise text
+  fallback.
+- [ ] Add capability-gated `definition`, normalize `Location` and
+  `LocationLink`, and retain source-server provenance.
+- [ ] Define a consistent structured error shape for invalid paths, invalid
+  positions, unsupported capabilities, timeouts, server exits, and LSP
+  errors.
+
+Acceptance: edits made outside Deixis are observed on the next request, and
+hover and definition agree across every negotiated position encoding in the mock
+matrix.
+
+## 3. Read-only semantic coverage
+
+- [ ] Add `declaration`, `type_definition`, and `implementation`.
+- [ ] Add references with explicit declaration inclusion.
+- [ ] Add hierarchical document symbols and normalize flat-symbol responses.
+- [ ] Add workspace symbols, fan out across capable servers, and merge in stable
+  configuration order.
+- [ ] Cache versioned push diagnostics and implement pull diagnostics when
+  advertised. Mark unavailable or stale reports explicitly.
+- [ ] Add stable text renderers for all tools without discarding structured LSP
+  fields.
+- [ ] Test null, empty, partial, multi-location, deprecated, and extension-rich
+  LSP responses.
+
+Acceptance: the read-only tool set works end to end against the mock server, and
+each tool is absent or returns a capability error when its server does not
+support the corresponding LSP method.
+
+## 4. Polyglot routing and resilience
+
+- [ ] Manage several lazy language-server processes under one project.
+- [ ] Route file operations by ordered file patterns and language IDs, with an
+  explicit server override for ambiguous files.
+- [ ] Fan out workspace operations concurrently while preserving deterministic
+  output order and per-server provenance.
+- [ ] Bound queues, response sizes, concurrency, startup time, request time, and
+  shutdown time with documented defaults.
+- [ ] Forward MCP cancellation to LSP and fail all outstanding requests when a
+  child exits.
+- [ ] Add bounded restart behavior with crash-loop protection and useful stderr
+  context.
+- [ ] Exercise concurrent requests, late responses, duplicate IDs, cancellation
+  races, notification floods, and one-server failure in a multi-server
+  project.
+
+Acceptance: failure or restart of one language server does not corrupt document
+state, block unrelated servers, reorder notifications, or leak a child process.
+
+## 5. Compatibility and usability
+
+- [ ] Test manually against rust-analyzer, a TypeScript server, Pyright, gopls,
+  clangd, and one language server with unusual initialization requirements.
+- [ ] Document installation, full MCP client configuration, strict TOML schema,
+  logging, timeouts, and troubleshooting.
+- [ ] Decide whether a user-owned XDG configuration can complement explicit
+  `--config` without allowing implicit project code execution.
+- [ ] Evaluate a filesystem watcher for proactive diagnostics. Keep request-time
+  content validation as the correctness backstop.
+- [ ] Add release binaries for Linux, macOS, and Windows after the source build
+  is stable; include checksums and provenance.
+- [ ] Add MCP Registry metadata when a functional read-only tool set is
+  released.
+
+## 6. Mutating operations
+
+- [ ] Design preview, authorization, conflict detection, atomic application, and
+  rollback for `WorkspaceEdit` before exposing any mutating tool.
+- [ ] Add prepare-rename and rename only after that design is accepted.
+- [ ] Add code-action discovery separately from code-action application.
+- [ ] Consider formatting only if its whole-document edit model fits the same
+  safety contract.
+- [ ] Keep query-only deployments able to omit all mutation capabilities.
+
+## Deferred unless demand appears
+
+- [ ] Streamable HTTP transport.
+- [ ] MCP resources, prompts, and long-running tasks.
+- [ ] A built-in language-server catalog or installer.
+- [ ] Multiple project roots in one process.
+- [ ] Non-LSP semantic backends, persistent indexing, or agent memory.

@@ -1,0 +1,18 @@
+# Cargo
+/target
+**/*.rs.bk
+**/mutants.out*/
+
+# devenv and direnv
+.devenv*
+.direnv/
+devenv.local.nix
+devenv.local.yaml
+.pre-commit-config.yaml
+
+# go-task
+.task/
+
+# Nix build results
+/result
+/result-*
