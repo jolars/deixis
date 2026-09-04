@@ -22,3 +22,11 @@ devenv.local.yaml
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Gas City
+.beads/*
+!.beads/identity.toml
+.codex/skills/
+/.codex
+/.gc
+/.beads
