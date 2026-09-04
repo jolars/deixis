@@ -16,3 +16,9 @@ devenv.local.yaml
 # Nix build results
 /result
 /result-*
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
