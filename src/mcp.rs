@@ -1,4 +1,4 @@
-use std::{error::Error, sync::Arc};
+use std::{collections::BTreeMap, error::Error, sync::Arc};
 
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -28,24 +28,32 @@ const HOVER_TOOL: &str = "hover";
 #[derive(Clone)]
 pub struct DeixisServer {
     startup: StartupState,
-    language_server: Option<Arc<LazyLanguageServer>>,
+    language_servers: BTreeMap<String, Arc<LazyLanguageServer>>,
 }
 
 impl DeixisServer {
     pub fn new(startup: StartupState) -> Self {
-        let language_server = startup
+        let language_servers = startup
             .config()
-            .and_then(|config| config.servers().first())
-            .cloned()
             .map(|config| {
-                Arc::new(LazyLanguageServer::new(
-                    config,
-                    startup.project().clone(),
-                ))
-            });
+                config
+                    .servers()
+                    .iter()
+                    .cloned()
+                    .map(|config| {
+                        let name = config.name().to_owned();
+                        let server = Arc::new(LazyLanguageServer::new(
+                            config,
+                            startup.project().clone(),
+                        ));
+                        (name, server)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             startup,
-            language_server,
+            language_servers,
         }
     }
 
@@ -57,9 +65,19 @@ impl DeixisServer {
         self.startup.config()
     }
 
-    pub async fn shutdown_language_server(&self) -> Result<(), Box<dyn Error>> {
-        if let Some(language_server) = &self.language_server {
-            language_server.shutdown().await?;
+    pub async fn shutdown_language_servers(
+        &self,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut first_error = None;
+        for language_server in self.language_servers.values() {
+            if let Err(error) = language_server.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(Box::new(error));
         }
         Ok(())
     }
@@ -68,10 +86,10 @@ impl DeixisServer {
 impl ServerHandler for DeixisServer {
     fn get_info(&self) -> ServerInfo {
         let _project = self.project();
-        let capabilities = if self.language_server.is_some() {
-            ServerCapabilities::builder().enable_tools().build()
-        } else {
+        let capabilities = if self.language_servers.is_empty() {
             ServerCapabilities::default()
+        } else {
+            ServerCapabilities::builder().enable_tools().build()
         };
 
         ServerInfo::new(capabilities).with_server_info(Implementation::new(
@@ -85,10 +103,10 @@ impl ServerHandler for DeixisServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools = if self.language_server.is_some() {
-            vec![server_status_tool(), hover_tool()]
-        } else {
+        let tools = if self.language_servers.is_empty() {
             Vec::new()
+        } else {
+            vec![server_status_tool(), hover_tool()]
         };
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -111,20 +129,32 @@ impl DeixisServer {
         &self,
         request: &CallToolRequestParams,
     ) -> Result<CallToolResponse, McpError> {
-        let Some(language_server) = &self.language_server else {
+        let arguments = serde_json::from_value::<ServerStatusArguments>(
+            JsonValue::Object(request.arguments.clone().unwrap_or_default()),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid server status arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate()?;
+        let language_server = match arguments.server.as_deref() {
+            Some(name) => self.language_servers.get(name),
+            None => self.language_servers.values().next(),
+        };
+        let Some(language_server) = language_server else {
+            let message = arguments.server.map_or_else(
+                || "no language server is configured".to_owned(),
+                |name| format!("server `{name}` is not configured"),
+            );
             return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "no language server is configured",
+                message,
             )])
             .into());
         };
 
-        let start = request
-            .arguments
-            .as_ref()
-            .and_then(|arguments| arguments.get("start"))
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false);
-        let status = if start {
+        let status = if arguments.start {
             match language_server.ensure_started().await {
                 Ok(status) => status,
                 Err(error) => {
@@ -156,15 +186,38 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
-        let Some(language_server) = &self.language_server else {
+        let Some(config) = self.config() else {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "no language server is configured",
             )])
             .into());
         };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    error.to_string(),
+                )])
+                .into());
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![
+                        ContentBlock::text(error.to_string()),
+                    ])
+                    .into());
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
 
         let hover = match language_server
-            .hover(&arguments.path, &arguments.language_id, arguments.position)
+            .hover(file.absolute(), route.language_id(), arguments.position)
             .await
         {
             Ok(hover) => hover,
@@ -209,7 +262,8 @@ impl DeixisServer {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct HoverArguments {
     path: String,
-    language_id: String,
+    #[serde(default)]
+    server: Option<String>,
     position: Position,
 }
 
@@ -221,9 +275,38 @@ impl HoverArguments {
                 None,
             ));
         }
-        if self.language_id.is_empty() {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
             return Err(McpError::invalid_params(
-                "invalid hover arguments: `languageId` must not be empty",
+                "invalid hover arguments: `server` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServerStatusArguments {
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    start: bool,
+}
+
+impl ServerStatusArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "invalid server status arguments: `server` must not be empty",
                 None,
             ));
         }
@@ -237,7 +320,7 @@ pub async fn serve_stdio(startup: StartupState) -> Result<(), Box<dyn Error>> {
     let service = server.serve(stdio()).await?;
     let reason = service.waiting().await?;
     info!(?reason, "stopping deixis");
-    cleanup.shutdown_language_server().await?;
+    cleanup.shutdown_language_servers().await?;
 
     Ok(())
 }
@@ -245,10 +328,15 @@ pub async fn serve_stdio(startup: StartupState) -> Result<(), Box<dyn Error>> {
 fn server_status_tool() -> Tool {
     Tool::new(
         SERVER_STATUS_TOOL,
-        "Return status for the first configured language server, optionally starting it.",
+        "Return status for a configured language server, optionally starting it.",
         object_schema(json!({
             "type": "object",
             "properties": {
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name. Defaults to the first name in stable lexical order."
+                },
                 "start": {
                     "type": "boolean",
                     "description": "Start the configured language server before returning status."
@@ -278,14 +366,14 @@ fn hover_tool() -> Tool {
                     "minLength": 1,
                     "description": "Project-relative or root-contained absolute file path."
                 },
-                "languageId": {
+                "server": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "LSP language identifier used to synchronize the document."
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
                 },
                 "position": position_schema(),
             },
-            "required": ["path", "languageId", "position"],
+            "required": ["path", "position"],
             "additionalProperties": false
         })),
     )

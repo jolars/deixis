@@ -30,12 +30,12 @@ and Windows.
 - [x] Spike `async-lsp` against the mock server. Record the result in
   `DESIGN.md`; adopt it behind a small internal client boundary or document
   why a different transport is required.
-- [x] Add strict TOML configuration with explicit server commands, arguments,
-  environment overrides, language IDs, file patterns, and initialization
-  options. Reject unknown and ambiguous fields.
+- [x] Add strict TOML configuration with named servers, explicit commands,
+  arguments, environment overrides, extension and glob language routes, and
+  initialization options. Reject unknown and invalid fields.
 - [x] Add `--config` and `--root`; default the root to the current directory,
   canonicalize it at startup, and keep it immutable.
-- [x] Start one configured server lazily and implement `initialize`,
+- [x] Start configured servers lazily and implement `initialize`,
   `initialized`, `shutdown`, `exit`, timeout, and forced-kill behavior.
 - [x] Handle server stderr without touching MCP stdout and attach the server
   name to every child-process log event.
@@ -90,13 +90,15 @@ support the corresponding LSP method.
 
 ## 4. Polyglot routing and resilience
 
-- [ ] Manage several lazy language-server processes under one project.
-- [ ] Route file operations by ordered file patterns and language IDs, with an
+- [x] Manage several lazy language-server processes under one project.
+- [x] Route file operations by extension and glob language maps, with an
   explicit server override for ambiguous files.
 - [ ] Fan out workspace operations concurrently while preserving deterministic
   output order and per-server provenance.
 - [ ] Bound queues, response sizes, concurrency, startup time, request time, and
   shutdown time with documented defaults.
+- [ ] Track language-server readiness signals and distinguish transient startup
+  empties from stable no-result responses.
 - [ ] Forward MCP cancellation to LSP and fail all outstanding requests when a
   child exits.
 - [ ] Add bounded restart behavior with crash-loop protection and useful stderr
@@ -110,12 +112,15 @@ state, block unrelated servers, reorder notifications, or leak a child process.
 
 ## 5. Compatibility and usability
 
-- [ ] Test manually against rust-analyzer, a TypeScript server, Pyright, gopls,
-  clangd, and one language server with unusual initialization requirements.
+- [x] Test the first routed tool manually against rust-analyzer.
+- [ ] Test against a TypeScript server, Pyright, gopls, clangd, and one language
+  server with unusual initialization requirements.
 - [ ] Document installation, full MCP client configuration, strict TOML schema,
   logging, timeouts, and troubleshooting.
-- [ ] Decide whether a user-owned XDG configuration can complement explicit
-  `--config` without allowing implicit project code execution.
+- [x] Load user-owned platform configuration when `--config` is absent without
+  discovering executable commands from project content.
+- [x] Generate that configuration from a typed Home Manager server catalog and
+  register one root-agnostic MCP command.
 - [ ] Evaluate a filesystem watcher for proactive diagnostics. Keep request-time
   content validation as the correctness backstop.
 - [ ] Add release binaries for Linux, macOS, and Windows after the source build

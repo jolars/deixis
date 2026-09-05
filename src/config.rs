@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use globset::Glob;
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Number, Value as JsonValue};
 use tokio::process::Command;
@@ -42,7 +43,129 @@ impl Config {
     pub fn server(&self, name: &str) -> Option<&LanguageServerConfig> {
         self.servers.iter().find(|server| server.name == name)
     }
+
+    pub fn route<'a>(
+        &'a self,
+        path: &Path,
+        server_name: Option<&str>,
+    ) -> Result<ServerRoute<'a>, ConfigRouteError> {
+        if let Some(server_name) = server_name {
+            let server = self.server(server_name).ok_or_else(|| {
+                ConfigRouteError::UnknownServer(server_name.to_owned())
+            })?;
+            return server
+                .language_id_for_path(path)?
+                .map(|language_id| ServerRoute {
+                    server,
+                    language_id,
+                })
+                .ok_or_else(|| ConfigRouteError::NoMatch {
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_owned()),
+                });
+        }
+
+        let mut matches = Vec::new();
+        for server in &self.servers {
+            if let Some(language_id) = server.language_id_for_path(path)? {
+                matches.push(ServerRoute {
+                    server,
+                    language_id,
+                });
+            }
+        }
+
+        match matches.len() {
+            0 => Err(ConfigRouteError::NoMatch {
+                path: path.to_path_buf(),
+                server: None,
+            }),
+            1 => Ok(matches.remove(0)),
+            _ => Err(ConfigRouteError::AmbiguousServers {
+                path: path.to_path_buf(),
+                servers: matches
+                    .into_iter()
+                    .map(|route| route.server.name.clone())
+                    .collect(),
+            }),
+        }
+    }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServerRoute<'a> {
+    server: &'a LanguageServerConfig,
+    language_id: &'a str,
+}
+
+impl<'a> ServerRoute<'a> {
+    pub fn server(self) -> &'a LanguageServerConfig {
+        self.server
+    }
+
+    pub fn language_id(self) -> &'a str {
+        self.language_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigRouteError {
+    UnknownServer(String),
+    NoMatch {
+        path: PathBuf,
+        server: Option<String>,
+    },
+    AmbiguousServers {
+        path: PathBuf,
+        servers: Vec<String>,
+    },
+    AmbiguousLanguages {
+        path: PathBuf,
+        server: String,
+        languages: Vec<String>,
+    },
+}
+
+impl fmt::Display for ConfigRouteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownServer(server) => {
+                write!(formatter, "server `{server}` is not configured")
+            }
+            Self::NoMatch {
+                path,
+                server: Some(server),
+            } => write!(
+                formatter,
+                "server `{server}` has no route for file `{}`",
+                path.display()
+            ),
+            Self::NoMatch { path, server: None } => write!(
+                formatter,
+                "no language server matches file `{}`",
+                path.display()
+            ),
+            Self::AmbiguousServers { path, servers } => write!(
+                formatter,
+                "file `{}` matches multiple servers: {}",
+                path.display(),
+                quoted_list(servers)
+            ),
+            Self::AmbiguousLanguages {
+                path,
+                server,
+                languages,
+            } => write!(
+                formatter,
+                "file `{}` matches multiple language IDs for server `{server}`: {}",
+                path.display(),
+                quoted_list(languages)
+            ),
+        }
+    }
+}
+
+impl Error for ConfigRouteError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LanguageServerConfig {
@@ -50,8 +173,8 @@ pub struct LanguageServerConfig {
     command: String,
     args: Vec<String>,
     environment: BTreeMap<String, String>,
-    language_ids: Vec<String>,
-    file_patterns: Vec<String>,
+    file_extensions: BTreeMap<String, String>,
+    file_patterns: BTreeMap<String, String>,
     initialization_options: JsonValue,
     timeouts: TimeoutConfig,
 }
@@ -73,11 +196,11 @@ impl LanguageServerConfig {
         &self.environment
     }
 
-    pub fn language_ids(&self) -> &[String] {
-        &self.language_ids
+    pub fn file_extensions(&self) -> &BTreeMap<String, String> {
+        &self.file_extensions
     }
 
-    pub fn file_patterns(&self) -> &[String] {
+    pub fn file_patterns(&self) -> &BTreeMap<String, String> {
         &self.file_patterns
     }
 
@@ -93,6 +216,47 @@ impl LanguageServerConfig {
         let mut command = Command::new(&self.command);
         command.args(&self.args).envs(&self.environment);
         command
+    }
+
+    fn language_id_for_path<'a>(
+        &'a self,
+        path: &Path,
+    ) -> Result<Option<&'a str>, ConfigRouteError> {
+        let pattern_languages = self
+            .file_patterns
+            .iter()
+            .filter(|(pattern, _)| {
+                Glob::new(pattern)
+                    .expect("validated file pattern should compile")
+                    .compile_matcher()
+                    .is_match(path)
+            })
+            .map(|(_, language_id)| language_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if pattern_languages.len() > 1 {
+            return Err(ConfigRouteError::AmbiguousLanguages {
+                path: path.to_path_buf(),
+                server: self.name.clone(),
+                languages: pattern_languages
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            });
+        }
+        if let Some(language_id) = pattern_languages.into_iter().next() {
+            return Ok(Some(language_id));
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str())
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .file_extensions
+            .iter()
+            .filter(|(extension, _)| file_name.ends_with(extension.as_str()))
+            .max_by_key(|(extension, _)| extension.len())
+            .map(|(_, language_id)| language_id.as_str()))
     }
 }
 
@@ -154,7 +318,7 @@ impl Error for ConfigError {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
-    servers: Vec<RawLanguageServerConfig>,
+    servers: BTreeMap<String, RawLanguageServerConfig>,
 }
 
 impl RawConfig {
@@ -163,40 +327,22 @@ impl RawConfig {
             return Err(validation("config must declare at least one server"));
         }
 
-        let mut names = BTreeSet::new();
-        let mut language_routes = BTreeMap::new();
-        let mut pattern_routes = BTreeMap::new();
         let mut servers = Vec::with_capacity(self.servers.len());
 
-        for server in self.servers {
-            let name = require_non_empty("server name", server.name)?;
-            if !names.insert(name.clone()) {
-                return Err(validation(format!(
-                    "duplicate server name `{name}`"
-                )));
-            }
-
+        for (name, server) in self.servers {
+            let name = require_non_empty("server name", name)?;
             let command = require_non_empty(
                 &format!("server `{name}` command"),
                 server.command,
             )?;
             validate_environment(&name, &server.environment)?;
-            validate_routes(
-                &name,
-                "language id",
-                &server.language_ids,
-                &mut language_routes,
-            )?;
-            validate_routes(
-                &name,
-                "file pattern",
-                &server.file_patterns,
-                &mut pattern_routes,
-            )?;
-            if server.language_ids.is_empty() && server.file_patterns.is_empty()
+            validate_file_extensions(&name, &server.file_extensions)?;
+            validate_file_patterns(&name, &server.file_patterns)?;
+            if server.file_extensions.is_empty()
+                && server.file_patterns.is_empty()
             {
                 return Err(validation(format!(
-                    "server `{name}` must declare language_ids, file_patterns, or both"
+                    "server `{name}` must declare file_extensions, file_patterns, or both"
                 )));
             }
 
@@ -213,7 +359,7 @@ impl RawConfig {
                 command,
                 args: server.args,
                 environment: server.environment,
-                language_ids: server.language_ids,
+                file_extensions: server.file_extensions,
                 file_patterns: server.file_patterns,
                 initialization_options,
                 timeouts: server.timeouts.validate()?,
@@ -227,16 +373,15 @@ impl RawConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLanguageServerConfig {
-    name: String,
     command: String,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     environment: BTreeMap<String, String>,
     #[serde(default)]
-    language_ids: Vec<String>,
+    file_extensions: BTreeMap<String, String>,
     #[serde(default)]
-    file_patterns: Vec<String>,
+    file_patterns: BTreeMap<String, String>,
     #[serde(default)]
     initialization_options: Option<toml::Value>,
     #[serde(default)]
@@ -296,33 +441,63 @@ fn validate_environment(
     Ok(())
 }
 
-fn validate_routes(
+fn validate_file_extensions(
     server_name: &str,
-    route_kind: &str,
-    routes: &[String],
-    seen: &mut BTreeMap<String, String>,
+    routes: &BTreeMap<String, String>,
 ) -> Result<(), ConfigError> {
-    let mut local = BTreeSet::new();
-    for route in routes {
-        if route.trim().is_empty() {
+    for (extension, language_id) in routes {
+        if !extension.starts_with('.') {
             return Err(validation(format!(
-                "server `{server_name}` {route_kind} entries must not be empty"
+                "server `{server_name}` extension `{extension}` must start with `.`"
             )));
         }
-        if !local.insert(route.clone()) {
-            return Err(validation(format!(
-                "server `{server_name}` declares duplicate {route_kind} `{route}`"
-            )));
-        }
-        if let Some(previous) =
-            seen.insert(route.clone(), server_name.to_owned())
+        if extension.len() == 1
+            || extension.contains('/')
+            || extension.contains('\\')
         {
             return Err(validation(format!(
-                "{route_kind} `{route}` is ambiguous between servers `{previous}` and `{server_name}`"
+                "server `{server_name}` extension `{extension}` must be a file-name suffix"
+            )));
+        }
+        if language_id.trim().is_empty() {
+            return Err(validation(format!(
+                "server `{server_name}` language id for extension `{extension}` must not be empty"
             )));
         }
     }
     Ok(())
+}
+
+fn validate_file_patterns(
+    server_name: &str,
+    routes: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    for (pattern, language_id) in routes {
+        if pattern.trim().is_empty() {
+            return Err(validation(format!(
+                "server `{server_name}` file patterns must not be empty"
+            )));
+        }
+        if let Err(source) = Glob::new(pattern) {
+            return Err(validation(format!(
+                "server `{server_name}` has invalid file pattern `{pattern}`: {source}"
+            )));
+        }
+        if language_id.trim().is_empty() {
+            return Err(validation(format!(
+                "server `{server_name}` language id for file pattern `{pattern}` must not be empty"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn quoted_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("`{value}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn duration_or_default(
@@ -384,31 +559,34 @@ fn validation(message: impl Into<String>) -> ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, time::Duration};
+    use std::{ffi::OsStr, path::Path, time::Duration};
 
     use serde_json::json;
 
     use super::{Config, ConfigError};
 
     const VALID_CONFIG: &str = r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
 args = ["--log-file", "/tmp/rust-analyzer.log"]
-language_ids = ["rust"]
-file_patterns = ["**/*.rs"]
 
-[servers.environment]
+[servers.rust.file_extensions]
+".rs" = "rust"
+
+[servers.rust.file_patterns]
+"generated/**/*.rs" = "rust-generated"
+
+[servers.rust.environment]
 RUST_LOG = "info"
 
-[servers.initialization_options]
+[servers.rust.initialization_options]
 checkOnSave = true
 
-[servers.initialization_options.cargo]
+[servers.rust.initialization_options.cargo]
 allFeatures = true
 features = ["serde", "toml"]
 
-[servers.timeouts]
+[servers.rust.timeouts]
 request_ms = 12000
 shutdown_ms = 3000
 "#;
@@ -416,10 +594,10 @@ shutdown_ms = 3000
     #[test]
     fn parses_valid_language_server_config() {
         let config = Config::from_toml_str(VALID_CONFIG).unwrap();
-        let server = config.server("rust-analyzer").unwrap();
+        let server = config.server("rust").unwrap();
 
         assert_eq!(config.servers().len(), 1);
-        assert_eq!(server.name(), "rust-analyzer");
+        assert_eq!(server.name(), "rust");
         assert_eq!(server.command(), "rust-analyzer");
         assert_eq!(
             server.args(),
@@ -429,8 +607,17 @@ shutdown_ms = 3000
             server.environment().get("RUST_LOG").map(String::as_str),
             Some("info")
         );
-        assert_eq!(server.language_ids(), &["rust".to_owned()]);
-        assert_eq!(server.file_patterns(), &["**/*.rs".to_owned()]);
+        assert_eq!(
+            server.file_extensions().get(".rs").map(String::as_str),
+            Some("rust")
+        );
+        assert_eq!(
+            server
+                .file_patterns()
+                .get("generated/**/*.rs")
+                .map(String::as_str),
+            Some("rust-generated")
+        );
         assert_eq!(
             server.initialization_options(),
             &json!({
@@ -448,7 +635,7 @@ shutdown_ms = 3000
     #[test]
     fn builds_a_direct_tokio_command() {
         let config = Config::from_toml_str(VALID_CONFIG).unwrap();
-        let command = config.server("rust-analyzer").unwrap().to_command();
+        let command = config.server("rust").unwrap().to_command();
         let command = command.as_std();
 
         assert_eq!(command.get_program(), OsStr::new("rust-analyzer"));
@@ -468,10 +655,9 @@ shutdown_ms = 3000
     fn rejects_unknown_fields() {
         let error = parse_error(
             r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 shell = true
 "#,
         );
@@ -481,32 +667,29 @@ shell = true
     }
 
     #[test]
-    fn rejects_duplicate_server_names() {
+    fn rejects_duplicate_server_tables() {
         let error = parse_error(
             r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer-nightly"
-language_ids = ["rust-nightly"]
+file_extensions = { ".rs" = "rust" }
 "#,
         );
 
-        assert!(error.contains("duplicate server name `rust-analyzer`"));
+        assert!(error.contains("duplicate key"));
     }
 
     #[test]
     fn rejects_empty_commands() {
         let error = parse_error(
             r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = " "
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 "#,
         );
 
@@ -517,48 +700,94 @@ language_ids = ["rust"]
     fn rejects_missing_routing_selectors() {
         let error = parse_error(
             r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
 "#,
         );
 
         assert!(error.contains(
-            "server `rust-analyzer` must declare language_ids, file_patterns, or both"
+            "server `rust` must declare file_extensions, file_patterns, or both"
         ));
     }
 
     #[test]
-    fn rejects_ambiguous_language_routes() {
-        let error = parse_error(
+    fn reports_ambiguous_routes_and_accepts_an_explicit_server() {
+        let config = Config::from_toml_str(
             r#"
-[[servers]]
-name = "first"
+[servers.first]
 command = "server-one"
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 
-[[servers]]
-name = "second"
+[servers.second]
 command = "server-two"
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 "#,
-        );
+        )
+        .unwrap();
 
-        assert!(error.contains(
-            "language id `rust` is ambiguous between servers `first` and `second`"
+        let error = config.route(Path::new("src/lib.rs"), None).unwrap_err();
+        let route = config
+            .route(Path::new("src/lib.rs"), Some("second"))
+            .unwrap();
+
+        assert!(error.to_string().contains(
+            "file `src/lib.rs` matches multiple servers: `first`, `second`"
         ));
+        assert_eq!(route.server().name(), "second");
+        assert_eq!(route.language_id(), "rust");
+    }
+
+    #[test]
+    fn routes_by_longest_extension_and_prefers_file_patterns() {
+        let config = Config::from_toml_str(
+            r#"
+[servers.typescript]
+command = "vtsls"
+file_extensions = { ".ts" = "typescript", ".d.ts" = "typescript-declaration" }
+file_patterns = { "generated/**/*.d.ts" = "generated-typescript" }
+"#,
+        )
+        .unwrap();
+
+        let declaration =
+            config.route(Path::new("src/types.d.ts"), None).unwrap();
+        let generated = config
+            .route(Path::new("generated/api/types.d.ts"), None)
+            .unwrap();
+
+        assert_eq!(declaration.language_id(), "typescript-declaration");
+        assert_eq!(generated.language_id(), "generated-typescript");
+    }
+
+    #[test]
+    fn reports_unknown_servers_and_unmatched_files() {
+        let config = Config::from_toml_str(VALID_CONFIG).unwrap();
+
+        assert!(
+            config
+                .route(Path::new("src/lib.rs"), Some("missing"))
+                .unwrap_err()
+                .to_string()
+                .contains("server `missing` is not configured")
+        );
+        assert!(
+            config
+                .route(Path::new("README.md"), None)
+                .unwrap_err()
+                .to_string()
+                .contains("no language server matches file `README.md`")
+        );
     }
 
     #[test]
     fn rejects_invalid_timeout_values() {
         let error = parse_error(
             r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 
-[servers.timeouts]
+[servers.rust.timeouts]
 request_ms = 0
 "#,
         );
@@ -570,18 +799,17 @@ request_ms = 0
     fn rejects_initialization_options_that_are_not_json() {
         let error = parse_error(
             r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 
-[servers.initialization_options]
+[servers.rust.initialization_options]
 generated_at = 2026-09-05T14:43:00Z
 "#,
         );
 
         assert!(error.contains(
-            "servers.rust-analyzer.initialization_options.generated_at contains a TOML datetime"
+            "servers.rust.initialization_options.generated_at contains a TOML datetime"
         ));
     }
 
@@ -589,11 +817,10 @@ generated_at = 2026-09-05T14:43:00Z
     fn uses_default_timeout_and_initialization_options() {
         let config = Config::from_toml_str(
             r#"
-[[servers]]
-name = "pyright"
+[servers.pyright]
 command = "pyright-langserver"
 args = ["--stdio"]
-file_patterns = ["**/*.py"]
+file_extensions = { ".py" = "python" }
 "#,
         )
         .unwrap();
@@ -602,6 +829,40 @@ file_patterns = ["**/*.py"]
         assert_eq!(server.timeouts().request(), Duration::from_secs(30));
         assert_eq!(server.timeouts().shutdown(), Duration::from_secs(5));
         assert_eq!(server.initialization_options(), &json!({}));
+    }
+
+    #[test]
+    fn rejects_invalid_extensions_patterns_and_language_ids() {
+        let invalid_extension = parse_error(
+            r#"
+[servers.rust]
+command = "rust-analyzer"
+file_extensions = { "rs" = "rust" }
+"#,
+        );
+        let invalid_pattern = parse_error(
+            r#"
+[servers.rust]
+command = "rust-analyzer"
+file_patterns = { "[" = "rust" }
+"#,
+        );
+        let empty_language = parse_error(
+            r#"
+[servers.rust]
+command = "rust-analyzer"
+file_extensions = { ".rs" = " " }
+"#,
+        );
+
+        assert!(
+            invalid_extension.contains("extension `rs` must start with `.`")
+        );
+        assert!(invalid_pattern.contains("invalid file pattern `[`"));
+        assert!(
+            empty_language
+                .contains("language id for extension `.rs` must not be empty")
+        );
     }
 
     fn parse_error(input: &str) -> String {

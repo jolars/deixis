@@ -447,20 +447,19 @@ fn write_config(
         &config_path,
         format!(
             r#"
-[[servers]]
-name = "mock-lsp"
+[servers.mock-lsp]
 command = {}
 args = ["--mode", "{}"]
-language_ids = ["rust"]
+file_extensions = {{ ".rs" = "rust" }}
 
-[servers.timeouts]
+[servers.mock-lsp.timeouts]
 request_ms = {}
 shutdown_ms = {}
 
-[servers.initialization_options]
+[servers.mock-lsp.initialization_options]
 answer = 42
 
-[servers.initialization_options.mock]
+[servers.mock-lsp.initialization_options.mock]
 one = "alpha"
 two = 2
 "#,

@@ -24,8 +24,11 @@ mod support;
 #[tokio::test]
 async fn negotiates_an_empty_mcp_server_over_stdio()
 -> Result<(), Box<dyn Error>> {
+    let config_home = unique_dir("empty-user-config")?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
-    command.env("RUST_LOG", "deixis=debug");
+    command
+        .env("RUST_LOG", "deixis=debug")
+        .env("XDG_CONFIG_HOME", config_home);
     let transport = TokioChildProcess::new(command)?;
 
     let client =
@@ -50,9 +53,12 @@ async fn negotiates_an_empty_mcp_server_over_stdio()
 async fn accepts_an_explicit_root_without_config() -> Result<(), Box<dyn Error>>
 {
     let root = unique_dir("explicit-root")?;
+    let config_home = unique_dir("explicit-root-empty-config")?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
     command.arg("--root").arg(&root);
-    command.env("RUST_LOG", "deixis=debug");
+    command
+        .env("RUST_LOG", "deixis=debug")
+        .env("XDG_CONFIG_HOME", config_home);
     let transport = TokioChildProcess::new(command)?;
 
     let client =
@@ -214,6 +220,31 @@ async fn configured_child_diagnostics_stay_on_stderr_with_server_name()
 }
 
 #[tokio::test]
+async fn discovers_the_user_config_without_fixing_the_project_root()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("xdg-project-root")?;
+    let config_home = unique_dir("xdg-config-home")?;
+    let config_dir = config_home.join("deixis");
+    fs::create_dir(&config_dir)?;
+    write_mock_config_to(&config_dir.join("config.toml"), "normal")?;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .current_dir(&root)
+        .env("XDG_CONFIG_HOME", &config_home);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+
+    assert!(tools.tools.iter().any(|tool| tool.name == "hover"));
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn hover_returns_structured_markup_across_position_encodings()
 -> Result<(), Box<dyn Error>> {
     for mode in [
@@ -244,14 +275,13 @@ async fn hover_returns_structured_markup_across_position_encodings()
             .expect("configured servers should expose hover");
         assert_eq!(
             hover_tool.input_schema.get("required"),
-            Some(&json!(["path", "languageId", "position"])),
+            Some(&json!(["path", "position"])),
             "{mode}"
         );
         assert!(hover_tool.output_schema.is_some(), "{mode}");
 
         let arguments = json!({
             "path": "main.rs",
-            "languageId": "rust",
             "position": {
                 "line": 0,
                 "character": 8,
@@ -315,7 +345,6 @@ async fn hover_rejects_a_server_without_the_capability()
         timeout(Duration::from_secs(10), ().serve(transport)).await??;
     let arguments = json!({
         "path": "main.rs",
-        "languageId": "rust",
         "position": { "line": 0, "character": 8 },
     })
     .as_object()
@@ -340,6 +369,93 @@ async fn hover_rejects_a_server_without_the_capability()
         message
             .text
             .contains("does not support `textDocument/hover`")
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn routes_hover_to_the_server_selected_by_the_file_extension()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("multi-server-routing")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let server = support::mock_lsp_server()?;
+    let config_path = root.join("deixis.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[servers.python]
+command = {}
+args = ["--mode", "hover-unsupported"]
+file_extensions = {{ ".py" = "python" }}
+
+[servers.rust]
+command = {}
+args = ["--mode", "hover-utf-8"]
+file_extensions = {{ ".rs" = "rust" }}
+"#,
+            support::toml_string(&server),
+            support::toml_string(&server),
+        ),
+    )?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("hover").with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(
+        result.structured_content.as_ref().and_then(|value| value
+            .get("contents")
+            .and_then(|contents| contents.get("value"))
+            .and_then(JsonValue::as_str)),
+        Some("`answer`: the ultimate value")
+    );
+
+    let status_arguments = json!({
+        "server": "python",
+        "start": true,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("deixis_server_status")
+                .with_arguments(status_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(
+        status
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("configuredName"))
+            .and_then(JsonValue::as_str),
+        Some("python")
     );
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
@@ -372,19 +488,26 @@ fn write_mock_config_for_mode(
     root: &std::path::Path,
     mode: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let server = support::mock_lsp_server()?;
     let config_path = root.join("deixis.toml");
+    write_mock_config_to(&config_path, mode)?;
+    Ok(config_path)
+}
+
+fn write_mock_config_to(
+    config_path: &std::path::Path,
+    mode: &str,
+) -> Result<(), Box<dyn Error>> {
+    let server = support::mock_lsp_server()?;
     fs::write(
-        &config_path,
+        config_path,
         format!(
             r#"
-[[servers]]
-name = "mock-lsp"
+[servers.mock-lsp]
 command = {}
 args = ["--mode", {}]
-language_ids = ["rust"]
+file_extensions = {{ ".rs" = "rust" }}
 
-[servers.timeouts]
+[servers.mock-lsp.timeouts]
 request_ms = 1000
 shutdown_ms = 1000
 "#,
@@ -392,7 +515,7 @@ shutdown_ms = 1000
             serde_json::to_string(mode)?,
         ),
     )?;
-    Ok(config_path)
+    Ok(())
 }
 
 async fn write_json_line(

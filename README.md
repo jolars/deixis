@@ -1,6 +1,6 @@
 # Deixis
 
-Deixis is a planned Model Context Protocol (MCP) server that gives coding agents
+Deixis is a Model Context Protocol (MCP) server that gives coding agents
 direct, typed access to Language Server Protocol (LSP) operations. The name
 comes from the linguistic act of pointing to a referent whose meaning depends on
 context—much like resolving a symbol from its source position.
@@ -10,10 +10,9 @@ expose their semantic capabilities; it will not grow a second filesystem, shell,
 memory, indexing, or agent framework around them.
 
 > [!NOTE]
-> The project is under active development. The binary parses startup root and
-> configuration options, completes an MCP handshake over stdio, and exposes
-> capability-gated hover information through the first configured language
-> server.
+> The project is under active development. The binary manages explicitly
+> configured language servers for one project and exposes capability-gated
+> hover information through path-based routing.
 
 ## Direction
 
@@ -56,47 +55,62 @@ root:
 cargo run
 ```
 
-To select a different project root or parse an explicit language-server
-configuration before serving MCP traffic:
+To select a different project root or an explicit language-server configuration
+before serving MCP traffic:
 
 ```console
 cargo run -- --root /path/to/project --config /path/to/deixis.toml
 ```
 
 `--root` defaults to the current directory and is canonicalized once at startup.
-When `--config` is omitted, Deixis preserves the current capability-free MCP
-bootstrap. When `--config` is present, the file must already exist and must use
-the strict TOML server schema. Configured commands are executed directly, never
-through a shell, and no command is inferred from project contents:
+`--config` takes precedence over the user configuration at
+`$XDG_CONFIG_HOME/deixis/config.toml` (normally
+`~/.config/deixis/config.toml`). macOS and Windows use their native user
+configuration directories when `XDG_CONFIG_HOME` is unset. If neither file
+exists, Deixis preserves the capability-free MCP bootstrap. Deixis never loads
+configuration from the project tree.
+
+Configuration uses named servers. File-name suffixes and project-relative glob
+patterns map directly to LSP language identifiers:
 
 ```toml
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
 args = []
-language_ids = ["rust"]
-file_patterns = ["**/*.rs"]
 
-[servers.initialization_options]
+[servers.rust.file_extensions]
+".rs" = "rust"
+
+[servers.rust.file_patterns]
+"generated/**/*.rs" = "rust"
+
+[servers.rust.initialization_options]
 checkOnSave = true
 
-[servers.environment]
+[servers.rust.environment]
 RUST_LOG = "info"
 
-[servers.timeouts]
+[servers.rust.timeouts]
 request_ms = 30000
 shutdown_ms = 5000
 ```
 
-The internal lifecycle manager starts the configured server only when an LSP
-operation needs it. In configured sessions, Deixis advertises two read-only
-tools: `deixis_server_status` and `hover`. Calling the lifecycle probe with
-`{ "start": true }` starts the first configured server and returns its recorded
-status. The `hover` tool accepts a project-contained `path`, an LSP
-`languageId`, and a zero-based UTF-8 `position`; it synchronizes the document,
-checks the server's negotiated hover capability, and returns structured LSP
-markup with a concise text fallback. Definition, references, symbols,
-diagnostics, and other semantic tools remain unshipped.
+Configured commands are executed directly, never through a shell, and no
+command is inferred from project contents. Each server starts only when a routed
+LSP operation needs it. A file pattern takes precedence over an extension within
+one server; the longest matching extension wins. A path that matches several
+servers is rejected unless the caller supplies the optional `server` override.
+
+Configured sessions advertise two read-only tools: `deixis_server_status` and
+`hover`. Calling the lifecycle probe with
+`{ "server": "rust", "start": true }` starts that server and returns its
+recorded status. Without `server`, it selects the first configured name in
+stable lexical order. The `hover` tool accepts a project-contained `path`, a
+zero-based UTF-8 `position`, and an optional `server`; Deixis infers the LSP
+language identifier, synchronizes the document, checks the negotiated hover
+capability, and returns structured LSP markup with a concise text fallback.
+Definition, references, symbols, diagnostics, and other semantic tools remain
+unshipped.
 
 Startup sends `initialize` and `initialized`, records reported capabilities,
 correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,
@@ -126,8 +140,8 @@ termination primitive if the configured timeout expires. The CI test matrix runs
 ## Nix
 
 The flake exposes `packages.<system>.deixis`, a default package and app, and a
-Home Manager module that installs Deixis and registers it in the shared
-`programs.mcp.servers` registry:
+Home Manager module. A nonempty server catalog generates the user configuration
+and registers Deixis in the shared `programs.mcp.servers` registry:
 
 ```nix
 {
@@ -138,9 +152,31 @@ Home Manager module that installs Deixis and registers it in the shared
 
   # In the Home Manager module list:
   imports = [ inputs.deixis.homeManagerModules.default ];
-  programs.deixis.enable = true;
+  programs.deixis = {
+    enable = true;
+    servers = {
+      rust = {
+        command = "rust-analyzer";
+        fileExtensions.".rs" = "rust";
+      };
+
+      typescript = {
+        command = "vtsls";
+        args = [ "--stdio" ];
+        fileExtensions = {
+          ".js" = "javascript";
+          ".ts" = "typescript";
+        };
+      };
+    };
+  };
 }
 ```
+
+The module also accepts `programs.deixis.configFile` instead of `servers`.
+Enabling the module without either option installs the package without
+registering an inert MCP server. The generated MCP command has no fixed root;
+Deixis binds itself to the MCP process's working directory.
 
 Run the packaged server directly with `nix run github:jolars/deixis`. During
 local development, replace the input URL with a `path:` URL to the checkout.

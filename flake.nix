@@ -111,6 +111,89 @@
           }:
           let
             cfg = config.programs.deixis;
+            tomlFormat = pkgs.formats.toml { };
+            serverType = lib.types.submodule {
+              options = {
+                command = lib.mkOption {
+                  type = lib.types.str;
+                  description = "Language-server executable or command name.";
+                };
+
+                args = lib.mkOption {
+                  type = lib.types.listOf lib.types.str;
+                  default = [ ];
+                  description = "Arguments passed directly to the language server.";
+                };
+
+                environment = lib.mkOption {
+                  type = lib.types.attrsOf lib.types.str;
+                  default = { };
+                  description = "Environment variables added to the language-server process.";
+                };
+
+                fileExtensions = lib.mkOption {
+                  type = lib.types.attrsOf lib.types.str;
+                  default = { };
+                  example = {
+                    ".rs" = "rust";
+                  };
+                  description = "File-name suffixes mapped to LSP language identifiers.";
+                };
+
+                filePatterns = lib.mkOption {
+                  type = lib.types.attrsOf lib.types.str;
+                  default = { };
+                  example = {
+                    "**/CMakeLists.txt" = "cmake";
+                  };
+                  description = "Project-relative glob patterns mapped to LSP language identifiers.";
+                };
+
+                initializationOptions = lib.mkOption {
+                  type = tomlFormat.type;
+                  default = { };
+                  description = "Language-server initialization options.";
+                };
+
+                timeouts = lib.mkOption {
+                  default = { };
+                  description = "Language-server request and shutdown timeouts.";
+                  type = lib.types.submodule {
+                    options = {
+                      requestMs = lib.mkOption {
+                        type = lib.types.ints.positive;
+                        default = 30000;
+                        description = "Request timeout in milliseconds.";
+                      };
+
+                      shutdownMs = lib.mkOption {
+                        type = lib.types.ints.positive;
+                        default = 5000;
+                        description = "Shutdown timeout in milliseconds.";
+                      };
+                    };
+                  };
+                };
+              };
+            };
+            generatedConfig = tomlFormat.generate "deixis-config.toml" {
+              servers = lib.mapAttrs (_: server: {
+                inherit (server)
+                  args
+                  command
+                  environment
+                  ;
+                file_extensions = server.fileExtensions;
+                file_patterns = server.filePatterns;
+                initialization_options = server.initializationOptions;
+                timeouts = {
+                  request_ms = server.timeouts.requestMs;
+                  shutdown_ms = server.timeouts.shutdownMs;
+                };
+              }) cfg.servers;
+            };
+            hasConfig = cfg.configFile != null || cfg.servers != { };
+            configSource = if cfg.configFile != null then cfg.configFile else generatedConfig;
           in
           {
             options.programs.deixis = {
@@ -122,15 +205,48 @@
                 defaultText = lib.literalExpression "inputs.deixis.packages.\${pkgs.system}.deixis";
                 description = "The Deixis package to install and expose as an MCP server.";
               };
-            };
 
-            config = lib.mkIf cfg.enable {
-              home.packages = [ cfg.package ];
-              programs.mcp = {
-                enable = true;
-                servers.deixis.command = lib.getExe cfg.package;
+              configFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = ''
+                  Existing Deixis TOML configuration to install in the user
+                  configuration directory. This cannot be combined with
+                  `programs.deixis.servers`.
+                '';
+              };
+
+              servers = lib.mkOption {
+                type = lib.types.attrsOf serverType;
+                default = { };
+                description = ''
+                  Named language servers. When nonempty, Home Manager generates
+                  `deixis/config.toml` and registers Deixis as an MCP server.
+                '';
               };
             };
+
+            config = lib.mkIf cfg.enable (
+              lib.mkMerge [
+                {
+                  assertions = [
+                    {
+                      assertion = cfg.configFile == null || cfg.servers == { };
+                      message = "programs.deixis.configFile and programs.deixis.servers are mutually exclusive";
+                    }
+                  ];
+                  home.packages = [ cfg.package ];
+                }
+
+                (lib.mkIf hasConfig {
+                  xdg.configFile."deixis/config.toml".source = configSource;
+                  programs.mcp = {
+                    enable = true;
+                    servers.deixis.command = lib.getExe cfg.package;
+                  };
+                })
+              ]
+            );
           };
       };
     };

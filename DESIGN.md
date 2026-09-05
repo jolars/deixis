@@ -8,11 +8,12 @@ This document records the intended architecture and the reasons behind it.
 The repository currently contains the project infrastructure, strict
 language-server configuration parsing, immutable project-root startup handling,
 a portable mock language-server fixture, a valid MCP stdio server, and an
-internal lazy lifecycle manager for one configured language server. It can parse
-explicit startup inputs, negotiate an MCP session over stdio, report its name
-and version, start the configured server on internal demand, handle common
-server-to-client messages, continue after malformed server output, and shut
-that server down with a bounded forced-kill fallback. A configured session
+internal lazy lifecycle manager for each configured language server. It can
+parse explicit or user-owned startup configuration, negotiate an MCP session
+over stdio, report its name and version, route a project file to a server, start
+that server on demand, handle common server-to-client messages, continue after
+malformed server output, and shut down all started servers with a bounded
+forced-kill fallback. A configured session
 exposes the read-only `deixis_server_status` lifecycle probe and a
 capability-gated `hover` tool. Hover synchronizes project-contained documents,
 translates negotiated position encodings, and returns structured markup plus a
@@ -89,44 +90,54 @@ layer. It is not part of the first functional release.
 
 ## Startup and configuration
 
-The current invocation is:
+The invocation is:
 
 ```console
-deixis --root <project> --config <config.toml>
+deixis [--root <project>] [--config <config.toml>]
 ```
 
 `--root` defaults to the current directory. The selected path is canonicalized
-once and cannot change during the session. The configuration path is explicit;
-Deixis will not silently load an executable command from a cloned repository.
-CLI options may override process-wide settings, but language-server definitions
-remain declarative TOML.
+once and cannot change during the session. An explicit `--config` takes
+precedence over the platform user configuration directory. On Linux, that is
+`$XDG_CONFIG_HOME/deixis/config.toml`, falling back to
+`~/.config/deixis/config.toml`; macOS and Windows use their native user
+configuration directories when `XDG_CONFIG_HOME` is unset. Deixis never
+discovers configuration in the project tree, so cloned content cannot silently
+authorize an executable command. Language-server definitions remain
+declarative TOML.
 
 Configuration parsing rejects unknown fields. A server entry contains the
 following explicit concepts:
 
 ```toml
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
 args = []
-language_ids = ["rust"]
-file_patterns = ["**/*.rs"]
-initialization_options = {}
 
-[servers.environment]
+[servers.rust.file_extensions]
+".rs" = "rust"
+
+[servers.rust.file_patterns]
+"generated/**/*.rs" = "rust"
+
+[servers.rust.initialization_options]
+checkOnSave = true
+
+[servers.rust.environment]
 RUST_LOG = "info"
 
-[servers.timeouts]
+[servers.rust.timeouts]
 request_ms = 30000
 shutdown_ms = 5000
 ```
 
-The current lifecycle probe starts only the first configured server. Later
-file-scoped routing will use ordered entries: the first matching server that
-advertises the required capability wins unless the caller supplies an explicit
-server name. Workspace-wide operations will fan out to all capable configured
-servers and merge results in configuration order, retaining the originating
-server name.
+Extension and glob values are the LSP language IDs used for document
+synchronization. Within one server, a matching glob takes precedence over an
+extension, and the longest matching extension wins. Matching routes in several
+servers are an error unless the caller supplies an explicit server name. This
+keeps routing independent of TOML table order. Workspace-wide operations will
+fan out to all capable configured servers and merge results in stable lexical
+server-name order, retaining the originating server name.
 
 Commands run directly, without a shell. They inherit the Deixis environment plus
 explicit overrides. Configuration never causes package installation, network
@@ -134,12 +145,12 @@ access, or command interpolation.
 
 ## MCP surface
 
-Without `--config`, the current server advertises no tools. With `--config`, it
-advertises the read-only `deixis_server_status` lifecycle probe and `hover`.
-Calling the probe with `{ "start": true }` starts the first configured language
-server, returns the recorded server status, and gives black-box tests a narrow
-route for proving child-process stdout/stderr isolation. The `hover` tool takes
-a root-contained path, a language ID, and a zero-based UTF-8 position. It
+Without selected configuration, the current server advertises no tools. With
+configuration, it advertises the read-only `deixis_server_status` lifecycle
+probe and `hover`. The probe accepts an optional server name and `start` flag;
+without a name, it uses the first name in stable lexical order. The `hover` tool
+takes a root-contained path, a zero-based UTF-8 position, and an optional server
+override. It resolves the path before routing, infers the language ID,
 synchronizes the document, verifies `hoverProvider`, converts the request and
 optional response range through the negotiated position encoding, and returns
 the LSP hover contents as structured JSON with readable text content. Neither

@@ -132,12 +132,20 @@ pub struct StartupState {
 impl StartupState {
     pub fn from_options(options: CliOptions) -> Result<Self, ProjectError> {
         let cwd = env::current_dir().map_err(ProjectError::CurrentDirectory)?;
-        Self::from_options_in(options, cwd)
+        Self::from_options_in_with_user_config(options, cwd, user_config_path())
     }
 
     pub fn from_options_in(
         options: CliOptions,
         cwd: impl AsRef<Path>,
+    ) -> Result<Self, ProjectError> {
+        Self::from_options_in_with_user_config(options, cwd, user_config_path())
+    }
+
+    fn from_options_in_with_user_config(
+        options: CliOptions,
+        cwd: impl AsRef<Path>,
+        user_config_path: Option<PathBuf>,
     ) -> Result<Self, ProjectError> {
         let cwd = cwd.as_ref();
         let root_input = options
@@ -147,10 +155,15 @@ impl StartupState {
         let root_path =
             canonicalize_root(resolve_against_cwd(&root_input, cwd))?;
 
-        let config_path = options
-            .config_path()
-            .map(|path| canonicalize_config(resolve_against_cwd(path, cwd)))
-            .transpose()?;
+        let config_path = match options.config_path() {
+            Some(path) => {
+                Some(canonicalize_config(resolve_against_cwd(path, cwd))?)
+            }
+            None => user_config_path
+                .map(existing_user_config)
+                .transpose()?
+                .flatten(),
+        };
         let config = config_path
             .as_ref()
             .map(Config::from_path)
@@ -237,6 +250,54 @@ fn canonicalize_config(path: PathBuf) -> Result<PathBuf, ProjectError> {
         .map_err(|source| ProjectError::ConfigPath { path, source })
 }
 
+fn existing_user_config(
+    path: PathBuf,
+) -> Result<Option<PathBuf>, ProjectError> {
+    match fs::metadata(&path) {
+        Ok(_) => canonicalize_config(path).map(Some),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ProjectError::ConfigPath { path, source }),
+    }
+}
+
+fn user_config_path() -> Option<PathBuf> {
+    if let Some(config_home) = non_empty_env("XDG_CONFIG_HOME") {
+        return Some(config_home.join("deixis").join("config.toml"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return non_empty_env("APPDATA")
+            .map(|path| path.join("deixis").join("config.toml"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return non_empty_env("HOME").map(|path| {
+            path.join("Library")
+                .join("Application Support")
+                .join("deixis")
+                .join("config.toml")
+        });
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return non_empty_env("HOME").map(|path| {
+            path.join(".config").join("deixis").join("config.toml")
+        });
+    }
+
+    #[allow(unreachable_code)]
+    None
+}
+
+fn non_empty_env(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -253,17 +314,20 @@ mod tests {
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
     const VALID_CONFIG: &str = r#"
-[[servers]]
-name = "rust-analyzer"
+[servers.rust]
 command = "rust-analyzer"
-language_ids = ["rust"]
+file_extensions = { ".rs" = "rust" }
 "#;
 
     #[test]
     fn defaults_root_to_current_directory() {
         let cwd = unique_dir("default-root");
-        let startup =
-            StartupState::from_options_in(CliOptions::default(), &cwd).unwrap();
+        let startup = StartupState::from_options_in_with_user_config(
+            CliOptions::default(),
+            &cwd,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(startup.project().root(), canonical(&cwd).as_path());
         assert_eq!(startup.project().config_path(), None);
@@ -277,7 +341,10 @@ language_ids = ["rust"]
         fs::create_dir(&nested).unwrap();
         let options = CliOptions::new(None, Some(nested.join("..")));
 
-        let startup = StartupState::from_options_in(options, &root).unwrap();
+        let startup = StartupState::from_options_in_with_user_config(
+            options, &root, None,
+        )
+        .unwrap();
 
         assert_eq!(startup.project().root(), canonical(&root).as_path());
     }
@@ -296,6 +363,74 @@ language_ids = ["rust"]
             Some(canonical(&config_path).as_path())
         );
         assert_eq!(startup.config().unwrap().servers().len(), 1);
+    }
+
+    #[test]
+    fn loads_a_user_config_when_no_explicit_config_is_given() {
+        let cwd = unique_dir("user-config-project");
+        let config_home = unique_dir("user-config-home");
+        let config_path = config_home.join("deixis").join("config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, VALID_CONFIG).unwrap();
+
+        let startup = StartupState::from_options_in_with_user_config(
+            CliOptions::default(),
+            &cwd,
+            Some(config_path.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup.project().config_path(),
+            Some(canonical(&config_path).as_path())
+        );
+        assert!(startup.config().unwrap().server("rust").is_some());
+    }
+
+    #[test]
+    fn an_explicit_config_takes_precedence_over_the_user_config() {
+        let cwd = unique_dir("explicit-config-precedence");
+        let explicit = cwd.join("explicit.toml");
+        let user = cwd.join("user.toml");
+        fs::write(
+            &explicit,
+            VALID_CONFIG.replace("[servers.rust]", "[servers.explicit]"),
+        )
+        .unwrap();
+        fs::write(
+            &user,
+            VALID_CONFIG.replace("[servers.rust]", "[servers.user]"),
+        )
+        .unwrap();
+
+        let startup = StartupState::from_options_in_with_user_config(
+            CliOptions::new(Some(explicit.clone()), None),
+            &cwd,
+            Some(user),
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup.project().config_path(),
+            Some(canonical(&explicit).as_path())
+        );
+        assert!(startup.config().unwrap().server("explicit").is_some());
+    }
+
+    #[test]
+    fn ignores_a_missing_user_config_and_never_discovers_project_config() {
+        let cwd = unique_dir("no-implicit-project-config");
+        fs::write(cwd.join("deixis.toml"), VALID_CONFIG).unwrap();
+
+        let startup = StartupState::from_options_in_with_user_config(
+            CliOptions::default(),
+            &cwd,
+            Some(cwd.join("missing-user-config.toml")),
+        )
+        .unwrap();
+
+        assert_eq!(startup.project().config_path(), None);
+        assert!(startup.config().is_none());
     }
 
     #[test]

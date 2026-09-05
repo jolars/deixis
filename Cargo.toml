@@ -12,6 +12,7 @@ keywords = ["mcp", "lsp", "language-server", "code-intelligence"]
 categories = ["development-tools"]
 
 [dependencies]
+globset = "0.4.20"
 rmcp = { version = "3.2.0", default-features = false, features = [
     "server",
     "transport-io",
