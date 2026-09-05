@@ -57,6 +57,11 @@ impl LazyLanguageServer {
         serde_json::from_value(value).map_err(LspError::DecodeResult)
     }
 
+    pub async fn ensure_started(&self) -> Result<ServerSnapshot, LspError> {
+        let active = self.active_server().await?;
+        Ok(active.status.lock().await.clone())
+    }
+
     pub async fn status(&self) -> ServerSnapshot {
         let active = {
             let state = self.state.lock().await;

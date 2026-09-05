@@ -11,9 +11,10 @@ a valid, capability-free MCP server, and an internal lazy lifecycle manager for
 one configured language server. It can parse explicit startup inputs, negotiate
 an MCP session over stdio, report its name and version, start the configured
 server on internal demand, and shut that server down with a bounded forced-kill
-fallback. It still exposes no public semantic MCP tools. Nothing in this
-document should be read as already implemented unless it is also marked complete
-in `TODO.md`.
+fallback. A configured session exposes one read-only lifecycle probe tool,
+`deixis_server_status`, for status and startup proof. It still exposes no
+public semantic MCP tools. Nothing in this document should be read as already
+implemented unless it is also marked complete in `TODO.md`.
 
 ## Purpose
 
@@ -124,8 +125,14 @@ access, or command interpolation.
 
 ## MCP surface
 
-The current server advertises no capabilities. The planned first tool set is
-read-only:
+Without `--config`, the current server advertises no tools. With `--config`, it
+advertises the read-only `deixis_server_status` lifecycle probe. Calling the
+tool with `{ "start": true }` starts the first configured language server,
+returns the recorded server status, and gives black-box tests a narrow route for
+proving child-process stdout/stderr isolation. It is not a semantic LSP
+operation and does not forward arbitrary JSON-RPC.
+
+The planned semantic tool set remains read-only:
 
 - `hover`;
 - `definition` and `declaration`;

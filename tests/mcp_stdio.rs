@@ -2,7 +2,7 @@ use std::{
     error::Error,
     fs,
     path::PathBuf,
-    process,
+    process::{self, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,7 +10,14 @@ use std::{
 use rmcp::{
     ServiceExt, model::ServerCapabilities, transport::TokioChildProcess,
 };
-use tokio::{process::Command, time::timeout};
+use serde_json::{Value as JsonValue, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{ChildStdin, ChildStdout, Command},
+    time::timeout,
+};
+
+mod support;
 
 #[tokio::test]
 async fn negotiates_an_empty_mcp_server_over_stdio()
@@ -94,6 +101,112 @@ async fn reports_invalid_config_on_stderr_without_stdout()
     Ok(())
 }
 
+#[tokio::test]
+async fn configured_child_diagnostics_stay_on_stderr_with_server_name()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("child-stderr-root")?;
+    let config_path = write_mock_config(&root)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .env("RUST_LOG", "deixis=info")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take().expect("deixis stdin should be piped");
+    let stdout = child.stdout.take().expect("deixis stdout should be piped");
+    let mut stderr =
+        child.stderr.take().expect("deixis stderr should be piped");
+    let stderr_task = tokio::spawn(async move {
+        let mut output = String::new();
+        stderr.read_to_string(&mut output).await.map(|_| output)
+    });
+    let mut stdout = BufReader::new(stdout);
+
+    write_json_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "deixis-test",
+                    "version": "0.1.0"
+                }
+            }
+        }),
+    )
+    .await?;
+    let initialize = read_stdout_json_line(&mut stdout).await?;
+    assert_eq!(initialize["id"], 1);
+    assert!(initialize["result"]["capabilities"]["tools"].is_object());
+
+    write_json_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    )
+    .await?;
+    write_json_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "deixis_server_status",
+                "arguments": {
+                    "start": true
+                }
+            }
+        }),
+    )
+    .await?;
+
+    let tool_response = read_stdout_json_line(&mut stdout).await?;
+    assert_eq!(tool_response["id"], 2);
+    assert_eq!(
+        tool_response["result"]["structuredContent"]["configuredName"],
+        "mock-lsp"
+    );
+    assert_eq!(
+        tool_response["result"]["structuredContent"]["serverName"],
+        "deixis-mock-lsp"
+    );
+    assert_eq!(
+        tool_response["result"]["structuredContent"]["started"],
+        true
+    );
+
+    drop(stdin);
+    let remaining_stdout = read_remaining_stdout(stdout).await?;
+    assert!(
+        remaining_stdout.is_empty(),
+        "unexpected extra MCP stdout messages: {remaining_stdout:?}"
+    );
+    let status = timeout(Duration::from_secs(10), child.wait()).await??;
+    assert!(status.success());
+
+    let stderr = timeout(Duration::from_secs(10), stderr_task).await???;
+    assert!(stderr.contains("server=mock-lsp"), "{stderr}");
+    assert!(
+        stderr.contains("mock-lsp started in normal mode"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("mock-lsp initializing"), "{stderr}");
+    Ok(())
+}
+
 fn unique_dir(name: &str) -> Result<PathBuf, std::io::Error> {
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -108,4 +221,80 @@ fn unique_dir(name: &str) -> Result<PathBuf, std::io::Error> {
     ));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+fn write_mock_config(
+    root: &std::path::Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let server = support::mock_lsp_server()?;
+    let config_path = root.join("deixis.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[[servers]]
+name = "mock-lsp"
+command = {}
+args = ["--mode", "normal"]
+language_ids = ["rust"]
+
+[servers.timeouts]
+request_ms = 1000
+shutdown_ms = 1000
+"#,
+            support::toml_string(&server),
+        ),
+    )?;
+    Ok(config_path)
+}
+
+async fn write_json_line(
+    stdin: &mut ChildStdin,
+    value: JsonValue,
+) -> Result<(), Box<dyn Error>> {
+    stdin.write_all(value.to_string().as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn read_stdout_json_line(
+    stdout: &mut BufReader<ChildStdout>,
+) -> Result<JsonValue, Box<dyn Error>> {
+    let mut line = String::new();
+    let bytes =
+        timeout(Duration::from_secs(10), stdout.read_line(&mut line)).await??;
+    if bytes == 0 {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "deixis stdout closed before a JSON-RPC response",
+        )));
+    }
+
+    parse_stdout_json_line(&line)
+}
+
+async fn read_remaining_stdout(
+    mut stdout: BufReader<ChildStdout>,
+) -> Result<Vec<JsonValue>, Box<dyn Error>> {
+    let mut messages = Vec::new();
+    loop {
+        let mut line = String::new();
+        let bytes =
+            timeout(Duration::from_secs(10), stdout.read_line(&mut line))
+                .await??;
+        if bytes == 0 {
+            return Ok(messages);
+        }
+        messages.push(parse_stdout_json_line(&line)?);
+    }
+}
+
+fn parse_stdout_json_line(line: &str) -> Result<JsonValue, Box<dyn Error>> {
+    serde_json::from_str(line.trim_end_matches(['\r', '\n'])).map_err(|error| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("deixis stdout line was not JSON: {line:?}: {error}"),
+        )) as Box<dyn Error>
+    })
 }

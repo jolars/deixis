@@ -11,9 +11,9 @@ memory, indexing, or agent framework around them.
 
 > [!NOTE]
 > The project is still pre-tooling. The binary parses startup root and
-> configuration options, completes an MCP handshake over stdio, and advertises
-> no public tools. Internally, it now has a tested lazy lifecycle manager for one
-> configured language server, but semantic MCP operations are not exposed yet.
+> configuration options and completes an MCP handshake over stdio. When a
+> configuration is present, it exposes one lifecycle probe tool for the first
+> configured language server. Semantic MCP operations are not exposed yet.
 
 ## Direction
 
@@ -86,11 +86,13 @@ shutdown_ms = 5000
 ```
 
 The internal lifecycle manager starts the configured server only when an
-internal LSP operation needs it. Startup sends `initialize` and `initialized`,
-records reported capabilities, correlates request IDs, forwards timeout
-cancellation with `$/cancelRequest`, handles common server-to-client workspace
-messages, and shuts down with `shutdown`, `exit`, and a bounded forced-kill
-fallback.
+internal LSP operation needs it. In configured sessions, Deixis advertises the
+read-only `deixis_server_status` tool; calling it with `{ "start": true }`
+starts the first configured server and returns its recorded lifecycle status.
+Startup sends `initialize` and `initialized`, records reported capabilities,
+correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,
+handles common server-to-client workspace messages, and shuts down with
+`shutdown`, `exit`, and a bounded forced-kill fallback.
 
 The process reserves stdout for MCP messages. Set `RUST_LOG` to control logs,
 which are always written to stderr. Child-process stderr is drained to Deixis
