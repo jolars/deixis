@@ -27,6 +27,7 @@ use crate::{
     documents::{
         DocumentStore, DocumentStoreError, DocumentUpdate, SynchronizedDocument,
     },
+    positions::{PositionConverter, PositionEncoding, PositionError},
     project::{Project, ProjectFile, ProjectPathError},
 };
 
@@ -155,7 +156,7 @@ pub struct ServerSnapshot {
     server_version: Option<String>,
     capabilities: JsonValue,
     text_document_sync: Option<JsonValue>,
-    position_encoding: Option<String>,
+    position_encoding: Option<PositionEncoding>,
 }
 
 impl ServerSnapshot {
@@ -174,7 +175,7 @@ impl ServerSnapshot {
     fn initialized(
         configured_name: &str,
         initialize_result: &JsonValue,
-    ) -> Self {
+    ) -> Result<Self, LspError> {
         let capabilities = initialize_result
             .get("capabilities")
             .cloned()
@@ -189,20 +190,31 @@ impl ServerSnapshot {
             .and_then(JsonValue::as_str)
             .map(str::to_owned);
         let text_document_sync = capabilities.get("textDocumentSync").cloned();
-        let position_encoding = capabilities
-            .get("positionEncoding")
-            .and_then(JsonValue::as_str)
-            .map(str::to_owned);
+        let position_encoding = match capabilities.get("positionEncoding") {
+            None => PositionEncoding::default(),
+            Some(JsonValue::String(value)) => value.parse().map_err(|_| {
+                LspError::UnsupportedPositionEncoding {
+                    server: configured_name.to_owned(),
+                    encoding: JsonValue::String(value.clone()),
+                }
+            })?,
+            Some(value) => {
+                return Err(LspError::UnsupportedPositionEncoding {
+                    server: configured_name.to_owned(),
+                    encoding: value.clone(),
+                });
+            }
+        };
 
-        Self {
+        Ok(Self {
             configured_name: configured_name.to_owned(),
             started: true,
             server_name,
             server_version,
             capabilities,
             text_document_sync,
-            position_encoding,
-        }
+            position_encoding: Some(position_encoding),
+        })
     }
 
     pub fn configured_name(&self) -> &str {
@@ -229,8 +241,8 @@ impl ServerSnapshot {
         self.text_document_sync.as_ref()
     }
 
-    pub fn position_encoding(&self) -> Option<&str> {
-        self.position_encoding.as_deref()
+    pub fn position_encoding(&self) -> Option<PositionEncoding> {
+        self.position_encoding
     }
 }
 
@@ -302,6 +314,15 @@ pub enum LspError {
     UnsupportedDocumentSynchronization {
         server: String,
         capability: Option<JsonValue>,
+    },
+    UnsupportedPositionEncoding {
+        server: String,
+        encoding: JsonValue,
+    },
+    PositionConversion {
+        server: String,
+        path: PathBuf,
+        source: PositionError,
     },
     DocumentSynchronizationClosed {
         server: String,
@@ -381,6 +402,19 @@ impl fmt::Display for LspError {
                 }
                 Ok(())
             }
+            Self::UnsupportedPositionEncoding { server, encoding } => write!(
+                formatter,
+                "language server `{server}` selected unsupported position encoding {encoding}"
+            ),
+            Self::PositionConversion {
+                server,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "language server `{server}` could not convert a position in `{}`: {source}",
+                path.display()
+            ),
             Self::DocumentSynchronizationClosed { server, path } => {
                 write!(
                     formatter,
@@ -455,12 +489,14 @@ impl Error for LspError {
             Self::Spawn { source, .. }
             | Self::ReadDocument { source, .. }
             | Self::Shutdown { source, .. } => Some(source),
+            Self::PositionConversion { source, .. } => Some(source),
             Self::DocumentPath(source) => Some(source),
             Self::EncodeMessage(source) | Self::DecodeResult(source) => {
                 Some(source)
             }
             Self::MissingPipe { .. }
             | Self::UnsupportedDocumentSynchronization { .. }
+            | Self::UnsupportedPositionEncoding { .. }
             | Self::DocumentSynchronizationClosed { .. }
             | Self::DocumentLanguageChanged { .. }
             | Self::DocumentVersionOverflow { .. }
@@ -557,7 +593,7 @@ impl RunningServer {
             )
             .await?;
         let snapshot =
-            ServerSnapshot::initialized(config.name(), &initialize_result);
+            ServerSnapshot::initialized(config.name(), &initialize_result)?;
         *self.active.status.lock().await = snapshot;
         self.active
             .send_notification("initialized", json!({}))
@@ -746,10 +782,21 @@ impl ActiveServer {
                     DocumentSyncKind::Incremental => json!({
                         "range": {
                             "start": { "line": 0, "character": 0 },
-                            "end": document_end_position(
-                                &previous_text,
-                                snapshot.position_encoding(),
-                            ),
+                            "end": PositionConverter::new(&previous_text)
+                                .end_position(
+                                    snapshot
+                                        .position_encoding()
+                                        .unwrap_or_default(),
+                                )
+                                .map_err(|source| {
+                                    LspError::PositionConversion {
+                                        server: self.name.clone(),
+                                        path: document
+                                            .absolute_path()
+                                            .to_path_buf(),
+                                        source,
+                                    }
+                                })?,
                         },
                         "text": document.text(),
                     }),
@@ -928,24 +975,6 @@ impl DocumentSyncKind {
             _ => None,
         }
     }
-}
-
-fn document_end_position(
-    text: &str,
-    position_encoding: Option<&str>,
-) -> JsonValue {
-    let line = text.bytes().filter(|byte| *byte == b'\n').count();
-    let final_line = text.rsplit_once('\n').map_or(text, |(_, line)| line);
-    let character = match position_encoding.unwrap_or("utf-16") {
-        "utf-8" => final_line.len(),
-        "utf-32" => final_line.chars().count(),
-        _ => final_line.encode_utf16().count(),
-    };
-
-    json!({
-        "line": line,
-        "character": character,
-    })
 }
 
 #[derive(Debug)]
@@ -1306,6 +1335,9 @@ fn initialize_params(
             "name": workspace_name,
         }],
         "capabilities": {
+            "general": {
+                "positionEncodings": ["utf-8", "utf-16", "utf-32"],
+            },
             "workspace": {
                 "configuration": true,
                 "workspaceFolders": true,

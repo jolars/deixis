@@ -55,7 +55,7 @@ Windows.
   escape tests. Permit external locations in results without reading them.
 - [x] Add lazy `didOpen`, content-hash change detection, monotonic versions,
   full-document replacement, and `didClose` on shutdown.
-- [ ] Convert positions between the MCP boundary's zero-based UTF-8 units and
+- [x] Convert positions between the MCP boundary's zero-based UTF-8 units and
   negotiated LSP UTF-8, UTF-16, and UTF-32 units. Test ASCII, combining
   marks, non-BMP characters, line endings, and invalid boundaries.
 - [ ] Add capability-gated `hover` with structured markup and a concise text

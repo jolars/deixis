@@ -163,7 +163,14 @@ Public positions use zero-based `line` and `character` fields. At the MCP
 boundary, `character` is a UTF-8 code-unit offset so the same request is stable
 regardless of the selected language server. The document layer translates
 positions to and from the server's negotiated UTF-8, UTF-16, or UTF-32 encoding
-and rejects offsets that split a code point.
+and rejects missing lines, offsets past a line end, reversed ranges, and offsets
+that split a code point. LF, CRLF, and CR are logical line endings and cannot be
+addressed from within a position.
+
+Deixis advertises UTF-8, UTF-16, and UTF-32 position support in that preference
+order. An omitted server selection defaults to UTF-16 as required for backward
+compatibility; a server that selects an encoding Deixis did not offer fails
+initialization.
 
 A generic `lsp_request(method, params)` tool is intentionally excluded. It would
 bypass capability checks, input validation, path containment, output

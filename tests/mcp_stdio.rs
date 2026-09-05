@@ -187,6 +187,10 @@ async fn configured_child_diagnostics_stay_on_stderr_with_server_name()
         tool_response["result"]["structuredContent"]["started"],
         true
     );
+    assert_eq!(
+        tool_response["result"]["structuredContent"]["positionEncoding"],
+        "utf-8"
+    );
 
     drop(stdin);
     let remaining_stdout = read_remaining_stdout(stdout).await?;

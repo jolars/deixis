@@ -74,19 +74,40 @@ fn handle_request<R: BufRead>(
         "initialize" => {
             eprintln!("mock-lsp initializing");
             state.lock().unwrap().initialize_params = Some(params);
-            let text_document_sync = match mode {
-                "document-incremental" => json_object([
+            let text_document_sync = if mode.starts_with("document-incremental") {
+                json_object([
                     ("openClose", Json::Bool(true)),
                     ("change", Json::Number(2)),
-                ]),
-                "document-none" => Json::Number(0),
-                _ => Json::Number(1),
-            };
-            let position_encoding = if mode == "document-incremental" {
-                "utf-16"
+                ])
+            } else if mode == "document-none" {
+                Json::Number(0)
             } else {
-                "utf-8"
+                Json::Number(1)
             };
+            let position_encoding = match mode {
+                "position-omitted" => None,
+                "position-unsupported" => {
+                    Some(Json::String("utf-7".to_owned()))
+                }
+                "position-malformed" => Some(Json::Number(8)),
+                "document-incremental-utf-16" => {
+                    Some(Json::String("utf-16".to_owned()))
+                }
+                "document-incremental-utf-32" => {
+                    Some(Json::String("utf-32".to_owned()))
+                }
+                _ => Some(Json::String("utf-8".to_owned())),
+            };
+            let mut capabilities = vec![
+                ("hoverProvider".to_owned(), Json::Bool(true)),
+                ("textDocumentSync".to_owned(), text_document_sync),
+            ];
+            if let Some(position_encoding) = position_encoding {
+                capabilities.push((
+                    "positionEncoding".to_owned(),
+                    position_encoding,
+                ));
+            }
             write_message(
                 output,
                 response(
@@ -94,14 +115,7 @@ fn handle_request<R: BufRead>(
                     json_object([
                         (
                             "capabilities",
-                            json_object([
-                                ("hoverProvider", Json::Bool(true)),
-                                ("textDocumentSync", text_document_sync),
-                                (
-                                    "positionEncoding",
-                                    Json::String(position_encoding.to_owned()),
-                                ),
-                            ]),
+                            Json::Object(capabilities),
                         ),
                         (
                             "serverInfo",
@@ -417,7 +431,18 @@ fn probe_client<R: BufRead>(
         ),
     )?;
 
-    state.lock().unwrap().client_probe_complete = true;
+    let position_encodings = {
+        let mut state = state.lock().unwrap();
+        state.client_probe_complete = true;
+        state
+            .initialize_params
+            .as_ref()
+            .and_then(|params| params.get("capabilities"))
+            .and_then(|capabilities| capabilities.get("general"))
+            .and_then(|general| general.get("positionEncodings"))
+            .cloned()
+            .unwrap_or(Json::Null)
+    };
     Ok(json_object([
         (
             "configuration_values",
@@ -496,6 +521,7 @@ fn probe_client<R: BufRead>(
                     .unwrap_or(0),
             ),
         ),
+        ("position_encodings", position_encodings),
     ]))
 }
 

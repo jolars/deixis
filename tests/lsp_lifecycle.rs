@@ -8,6 +8,7 @@ use std::{
 use deixis::{
     cli::CliOptions,
     lsp::{LazyLanguageServer, LspError},
+    positions::PositionEncoding,
     project::StartupState,
 };
 use serde::Deserialize;
@@ -33,7 +34,7 @@ async fn starts_lazily_initializes_and_shuts_down() -> Result<(), Box<dyn Error>
     assert_eq!(status.configured_name(), "mock-lsp");
     assert_eq!(status.server_name(), Some("deixis-mock-lsp"));
     assert_eq!(status.server_version(), Some("0.1.0"));
-    assert_eq!(status.position_encoding(), Some("utf-8"));
+    assert_eq!(status.position_encoding(), Some(PositionEncoding::Utf8));
     assert_eq!(status.text_document_sync(), Some(&json!(1)));
     assert!(status.capabilities().get("hoverProvider").is_some());
 
@@ -123,6 +124,7 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     );
     assert_eq!(probe.show_message_request_result, JsonValue::Null);
     assert_eq!(probe.unknown_error_code, -32601);
+    assert_eq!(probe.position_encodings, ["utf-8", "utf-16", "utf-32"]);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
     assert!(manager.dynamic_registrations().await.is_empty());
@@ -201,32 +203,72 @@ async fn synchronizes_full_documents_lazily_and_closes_them()
 #[tokio::test]
 async fn replaces_incrementally_synchronized_documents_as_one_range()
 -> Result<(), Box<dyn Error>> {
-    let (manager, root) =
-        configured_manager_with_root("document-incremental", 1_000, 1_000)?;
-    let source = root.join("unicode.rs");
-    fs::write(&source, "first line\n🦀x")?;
+    for (mode, expected_character) in [
+        ("document-incremental-utf-8", 5),
+        ("document-incremental-utf-16", 3),
+        ("document-incremental-utf-32", 2),
+    ] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        let source = root.join("unicode.rs");
+        fs::write(&source, "first line\r\nsecond\r🦀x")?;
 
-    manager.synchronize_document(&source, "rust").await?;
-    fs::write(&source, "replacement\n")?;
-    manager.synchronize_document(&source, "rust").await?;
+        manager.synchronize_document(&source, "rust").await?;
+        fs::write(&source, "replacement\n")?;
+        manager.synchronize_document(&source, "rust").await?;
 
-    let probe: DocumentEventsResponse = manager
-        .request("mock/documentEvents", JsonValue::Null)
-        .await?;
-    assert_eq!(probe.events.len(), 2);
-    assert_eq!(probe.events[1]["method"], "textDocument/didChange");
-    assert_eq!(
-        probe.events[1]["params"]["contentChanges"],
-        json!([{
-            "range": {
-                "start": { "line": 0, "character": 0 },
-                "end": { "line": 1, "character": 3 },
-            },
-            "text": "replacement\n",
-        }])
-    );
+        let probe: DocumentEventsResponse = manager
+            .request("mock/documentEvents", JsonValue::Null)
+            .await?;
+        assert_eq!(probe.events.len(), 2, "{mode}");
+        assert_eq!(
+            probe.events[1]["method"], "textDocument/didChange",
+            "{mode}"
+        );
+        assert_eq!(
+            probe.events[1]["params"]["contentChanges"],
+            json!([{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": {
+                        "line": 2,
+                        "character": expected_character,
+                    },
+                },
+                "text": "replacement\n",
+            }]),
+            "{mode}"
+        );
 
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn defaults_an_omitted_position_encoding_to_utf16()
+-> Result<(), Box<dyn Error>> {
+    let manager = configured_manager("position-omitted", 1_000, 1_000)?;
+
+    let status = manager.ensure_started().await?;
+
+    assert_eq!(status.position_encoding(), Some(PositionEncoding::Utf16));
     manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_unsupported_and_malformed_position_encodings()
+-> Result<(), Box<dyn Error>> {
+    for mode in ["position-unsupported", "position-malformed"] {
+        let manager = configured_manager(mode, 50, 50)?;
+
+        let error = manager.ensure_started().await.unwrap_err();
+
+        assert!(
+            matches!(error, LspError::UnsupportedPositionEncoding { .. }),
+            "{mode}: {error}"
+        );
+    }
     Ok(())
 }
 
@@ -434,6 +476,7 @@ struct ProbeResponse {
     apply_edit_failure_reason: Option<String>,
     show_message_request_result: JsonValue,
     unknown_error_code: i64,
+    position_encodings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

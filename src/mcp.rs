@@ -171,7 +171,9 @@ fn status_json(status: &ServerSnapshot) -> JsonValue {
         "started": status.started(),
         "serverName": status.server_name(),
         "serverVersion": status.server_version(),
-        "positionEncoding": status.position_encoding(),
+        "positionEncoding": status
+            .position_encoding()
+            .map(|encoding| encoding.as_str()),
         "textDocumentSync": status.text_document_sync(),
         "capabilities": status.capabilities(),
     })

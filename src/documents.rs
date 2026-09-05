@@ -4,6 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::positions::{
+    Position, PositionConverter, PositionEncoding, PositionError, Range,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SynchronizedDocument {
     absolute_path: PathBuf,
@@ -37,6 +41,38 @@ impl SynchronizedDocument {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub fn to_lsp_position(
+        &self,
+        position: Position,
+        encoding: PositionEncoding,
+    ) -> Result<Position, PositionError> {
+        PositionConverter::new(&self.text).to_lsp_position(position, encoding)
+    }
+
+    pub fn from_lsp_position(
+        &self,
+        position: Position,
+        encoding: PositionEncoding,
+    ) -> Result<Position, PositionError> {
+        PositionConverter::new(&self.text).from_lsp_position(position, encoding)
+    }
+
+    pub fn to_lsp_range(
+        &self,
+        range: Range,
+        encoding: PositionEncoding,
+    ) -> Result<Range, PositionError> {
+        PositionConverter::new(&self.text).to_lsp_range(range, encoding)
+    }
+
+    pub fn from_lsp_range(
+        &self,
+        range: Range,
+        encoding: PositionEncoding,
+    ) -> Result<Range, PositionError> {
+        PositionConverter::new(&self.text).from_lsp_range(range, encoding)
     }
 }
 
