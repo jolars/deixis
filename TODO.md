@@ -24,7 +24,7 @@ and Windows.
 
 ## 1. LSP vertical slice
 
-- [~] Add a portable mock language-server binary used only by integration tests.
+- [x] Add a portable mock language-server binary used only by integration tests.
   It must exercise initialization, notifications, requests, cancellation,
   diagnostics, shutdown, malformed messages, and forced termination.
 - [x] Spike `async-lsp` against the mock server. Record the result in
@@ -45,7 +45,9 @@ and Windows.
 
 Acceptance: an integration test starts `deixis`, routes through the mock LSP,
 observes a typed response, cancels a pending request, and leaves no child
-process running.
+process running. The final phase-1 repository gate passes locally on Linux;
+the configured CI matrix runs the locked test suite on Linux, macOS, and
+Windows.
 
 ## 2. Documents, positions, and first tools
 

@@ -7,14 +7,16 @@ This document records the intended architecture and the reasons behind it.
 
 The repository currently contains the project infrastructure, strict
 language-server configuration parsing, immutable project-root startup handling,
-a valid, capability-free MCP server, and an internal lazy lifecycle manager for
-one configured language server. It can parse explicit startup inputs, negotiate
-an MCP session over stdio, report its name and version, start the configured
-server on internal demand, and shut that server down with a bounded forced-kill
-fallback. A configured session exposes one read-only lifecycle probe tool,
-`deixis_server_status`, for status and startup proof. It still exposes no
-public semantic MCP tools. Nothing in this document should be read as already
-implemented unless it is also marked complete in `TODO.md`.
+a portable mock language-server fixture, a valid MCP stdio server, and an
+internal lazy lifecycle manager for one configured language server. It can parse
+explicit startup inputs, negotiate an MCP session over stdio, report its name
+and version, start the configured server on internal demand, handle common
+server-to-client messages, continue after malformed server output, and shut
+that server down with a bounded forced-kill fallback. A configured session
+exposes one read-only lifecycle probe tool, `deixis_server_status`, for status
+and startup proof. It still exposes no public semantic MCP tools. Nothing in
+this document should be read as already implemented unless it is also marked
+complete in `TODO.md`.
 
 ## Purpose
 
@@ -98,8 +100,8 @@ Deixis will not silently load an executable command from a cloned repository.
 CLI options may override process-wide settings, but language-server definitions
 remain declarative TOML.
 
-Configuration parsing will reject unknown fields. A server entry will contain at
-least the following concepts:
+Configuration parsing rejects unknown fields. A server entry contains the
+following explicit concepts:
 
 ```toml
 [[servers]]
@@ -112,12 +114,18 @@ initialization_options = {}
 
 [servers.environment]
 RUST_LOG = "info"
+
+[servers.timeouts]
+request_ms = 30000
+shutdown_ms = 5000
 ```
 
-Entries are ordered. For a file-scoped request, the first matching server that
+The current lifecycle probe starts only the first configured server. Later
+file-scoped routing will use ordered entries: the first matching server that
 advertises the required capability wins unless the caller supplies an explicit
-server name. Workspace-wide operations fan out to all capable configured servers
-and merge results in configuration order, retaining the originating server name.
+server name. Workspace-wide operations will fan out to all capable configured
+servers and merge results in configuration order, retaining the originating
+server name.
 
 Commands run directly, without a shell. They inherit the Deixis environment plus
 explicit overrides. Configuration never causes package installation, network
@@ -213,6 +221,9 @@ The client side handles the common requests language servers initiate:
 
 Unknown requests receive the correct method-not-found response. Notifications
 that are not relevant may be ignored, but they must not stall the reader loop.
+Malformed JSON-RPC bodies from the server are logged with the configured server
+name, and the reader loop continues so later valid responses can complete their
+requests.
 
 ## Documents and filesystem consistency
 
@@ -275,6 +286,32 @@ the LSP client.
 
 No stable Rust library API is promised. The public contract is the executable's
 CLI, configuration schema, MCP capability declaration, and tool schemas.
+
+## Platform behavior
+
+Deixis uses Rust and Tokio process APIs for Linux, macOS, and Windows rather
+than platform-specific shell behavior. Configured commands are passed directly
+to `tokio::process::Command`, with arguments and environment overrides supplied
+as structured values. The project root and configuration path are canonicalized
+with the host filesystem rules before MCP serving begins.
+
+Language-server stdin, stdout, and stderr are separate child pipes on every
+platform. MCP stdout remains reserved for MCP frames, while Deixis logs and
+child stderr are written to the parent process's stderr. The LSP layer writes
+Content-Length-framed messages to child stdin, reads child stdout, and joins the
+I/O tasks after shutdown or forced termination.
+
+Path-to-URI conversion normalizes Windows backslashes to forward slashes,
+preserves drive-letter paths, and percent-encodes bytes that are not valid URI
+path characters. The test fixture compiles its mock language-server executable
+with `rustc` and appends `std::env::consts::EXE_SUFFIX`, so Windows uses `.exe`
+while Unix-like systems use no suffix.
+
+The shutdown contract is the same on Linux, macOS, and Windows: send
+`shutdown`, send `exit`, wait for the child, and use Tokio's platform-specific
+kill primitive after the configured timeout. The GitHub Actions test matrix runs
+`cargo test --all-targets --locked` on Ubuntu, macOS, and Windows; formatting,
+Clippy, and rustdoc checks run on Ubuntu.
 
 ## Testing strategy
 

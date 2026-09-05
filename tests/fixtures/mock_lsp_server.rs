@@ -117,6 +117,21 @@ fn handle_request<R: BufRead>(
                 ),
             )?;
         }
+        "mock/malformedThenEcho" => {
+            eprintln!("mock-lsp emitting malformed output");
+            write_raw_message(output, b"{\"jsonrpc\":\"2.0\",\"id\":999,")?;
+            let initialized = state.lock().unwrap().initialized;
+            write_message(
+                output,
+                response(
+                    id,
+                    json_object([
+                        ("echo", params),
+                        ("initialized", Json::Bool(initialized)),
+                    ]),
+                ),
+            )?;
+        }
         "mock/initialized" => {
             let initialized = state.lock().unwrap().initialized;
             write_message(
@@ -489,12 +504,19 @@ fn write_message(
     message: Json,
 ) -> Result<(), Box<dyn Error>> {
     let body = message.to_string();
+    write_raw_message(output, body.as_bytes())
+}
+
+fn write_raw_message(
+    output: &Arc<Mutex<io::Stdout>>,
+    body: &[u8],
+) -> Result<(), Box<dyn Error>> {
     let mut output = output.lock().unwrap();
     write!(
         output,
         "Content-Length: {}\r\n\r\n{}",
         body.len(),
-        body
+        String::from_utf8_lossy(body),
     )?;
     output.flush()?;
     Ok(())

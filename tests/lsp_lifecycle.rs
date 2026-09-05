@@ -131,6 +131,25 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
 }
 
 #[tokio::test]
+async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
+{
+    let manager = configured_manager("malformed", 1_000, 1_000)?;
+
+    let echo: EchoResponse = manager
+        .request(
+            "mock/malformedThenEcho",
+            json!({ "message": "after malformed output" }),
+        )
+        .await?;
+
+    assert_eq!(echo.echo, json!({ "message": "after malformed output" }));
+    assert!(echo.initialized);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn force_kills_an_unresponsive_server_on_shutdown()
 -> Result<(), Box<dyn Error>> {
     let manager = configured_manager("ignore-shutdown", 1_000, 100)?;

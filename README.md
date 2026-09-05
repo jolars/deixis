@@ -77,6 +77,9 @@ args = []
 language_ids = ["rust"]
 file_patterns = ["**/*.rs"]
 
+[servers.initialization_options]
+checkOnSave = true
+
 [servers.environment]
 RUST_LOG = "info"
 
@@ -89,16 +92,34 @@ The internal lifecycle manager starts the configured server only when an
 internal LSP operation needs it. In configured sessions, Deixis advertises the
 read-only `deixis_server_status` tool; calling it with `{ "start": true }`
 starts the first configured server and returns its recorded lifecycle status.
+This probe is the only public tool in the configured phase-1 surface; hover,
+definition, references, symbols, diagnostics, and other semantic tools remain
+unshipped.
+
 Startup sends `initialize` and `initialized`, records reported capabilities,
 correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,
 handles common server-to-client workspace messages, tracks dynamic registration
-state, rejects `workspace/applyEdit` while read-only, and shuts down with
-`shutdown`, `exit`, and a bounded forced-kill fallback.
+state, logs malformed server output without stopping the reader loop, rejects
+`workspace/applyEdit` while read-only, and shuts down with `shutdown`, `exit`,
+and a bounded forced-kill fallback.
 
 The process reserves stdout for MCP messages. Set `RUST_LOG` to control logs,
 which are always written to stderr. Child-process stderr is drained to Deixis
 stderr with the configured server name attached, and startup validation failures
 are written to stderr before MCP serving begins.
+
+### Platform Notes
+
+On Linux, macOS, and Windows, configured commands run directly rather than
+through a shell. Root and configuration paths are canonicalized with the host
+filesystem rules, and file URIs normalize Windows backslashes while preserving
+drive-letter paths. Tests compile the portable mock language-server fixture with
+the platform executable suffix, including `.exe` on Windows.
+
+The shutdown sequence is platform-neutral at the protocol level: Deixis sends
+`shutdown`, sends `exit`, waits for the child, and uses Tokio's platform
+termination primitive if the configured timeout expires. The CI test matrix runs
+`cargo test --all-targets --locked` on Ubuntu, macOS, and Windows.
 
 ## Nix
 
