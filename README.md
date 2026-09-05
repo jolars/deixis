@@ -10,9 +10,10 @@ expose their semantic capabilities; it will not grow a second filesystem, shell,
 memory, indexing, or agent framework around them.
 
 > [!NOTE]
-> The project is at the bootstrap stage. The binary currently completes an MCP
-> handshake over stdio and advertises no tools. It does not start or communicate
-> with a language server yet.
+> The project is at the bootstrap stage. The binary currently parses startup
+> root and configuration options, completes an MCP handshake over stdio, and
+> advertises no tools. It does not start or communicate with a language server
+> yet.
 
 ## Direction
 
@@ -48,14 +49,40 @@ cargo test --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-To run the current handshake-only server:
+To run the current server with the current directory as the immutable project
+root:
 
 ```console
 cargo run
 ```
 
+To select a different project root or parse an explicit language-server
+configuration before serving MCP traffic:
+
+```console
+cargo run -- --root /path/to/project --config /path/to/deixis.toml
+```
+
+`--root` defaults to the current directory and is canonicalized once at startup.
+When `--config` is omitted, Deixis preserves the current capability-free MCP
+bootstrap. When `--config` is present, the file must already exist and must use
+the strict TOML server schema:
+
+```toml
+[[servers]]
+name = "rust-analyzer"
+command = "rust-analyzer"
+args = []
+language_ids = ["rust"]
+file_patterns = ["**/*.rs"]
+
+[servers.environment]
+RUST_LOG = "info"
+```
+
 The process reserves stdout for MCP messages. Set `RUST_LOG` to control logs,
-which are always written to stderr.
+which are always written to stderr. Startup validation failures are also written
+to stderr before MCP serving begins.
 
 ## Nix
 

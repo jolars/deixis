@@ -1,40 +1,50 @@
 use std::error::Error;
+use std::process::ExitCode;
 
-use rmcp::{
-    ServerHandler, ServiceExt,
-    model::{Implementation, ServerCapabilities, ServerInfo},
-    transport::stdio,
-};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Clone, Copy, Default)]
-struct DeixisServer;
+use deixis::{cli::CliOptions, mcp, project::StartupState};
 
-impl ServerHandler for DeixisServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::default()).with_server_info(
-            Implementation::new(
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION"),
-            ),
-        )
+#[tokio::main]
+async fn main() -> ExitCode {
+    init_tracing();
+
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("deixis: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<(), Box<dyn Error>> {
+    let options = CliOptions::parse_env()?;
+    let startup = StartupState::from_options(options)?;
+    {
+        let project = startup.project();
+        let configured_servers =
+            startup.config().map_or(0, |config| config.servers().len());
+        let config_path =
+            project.config_path().map(|path| path.display().to_string());
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            root = %project.root().display(),
+            config = ?config_path,
+            configured_servers,
+            "starting deixis"
+        );
+    }
+
+    mcp::serve_stdio(startup).await
+}
+
+fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("deixis=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
-
-    info!(version = env!("CARGO_PKG_VERSION"), "starting deixis");
-    let service = DeixisServer.serve(stdio()).await?;
-    let reason = service.waiting().await?;
-    info!(?reason, "stopping deixis");
-
-    Ok(())
 }

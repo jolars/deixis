@@ -30,10 +30,10 @@ and Windows.
 - [ ] Spike `async-lsp` against the mock server. Record the result in
   `DESIGN.md`; adopt it behind a small internal client boundary or document
   why a different transport is required.
-- [ ] Add strict TOML configuration with explicit server commands, arguments,
+- [x] Add strict TOML configuration with explicit server commands, arguments,
   environment overrides, language IDs, file patterns, and initialization
   options. Reject unknown and ambiguous fields.
-- [ ] Add `--config` and `--root`; default the root to the current directory,
+- [x] Add `--config` and `--root`; default the root to the current directory,
   canonicalize it at startup, and keep it immutable.
 - [ ] Start one configured server lazily and implement `initialize`,
   `initialized`, `shutdown`, `exit`, timeout, and forced-kill behavior.

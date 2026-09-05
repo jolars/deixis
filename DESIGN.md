@@ -5,10 +5,12 @@ This document records the intended architecture and the reasons behind it.
 
 ## Status
 
-The repository currently contains only the project infrastructure and a valid,
-capability-free MCP server. It can negotiate an MCP session over stdio, report
-its name and version, and shut down. Nothing in this document should be read as
-already implemented unless it is also marked complete in `TODO.md`.
+The repository currently contains the project infrastructure, strict
+language-server configuration parsing, immutable project-root startup handling,
+and a valid, capability-free MCP server. It can parse explicit startup inputs,
+negotiate an MCP session over stdio, report its name and version, and shut down.
+It does not start language servers yet. Nothing in this document should be read
+as already implemented unless it is also marked complete in `TODO.md`.
 
 ## Purpose
 
@@ -80,7 +82,7 @@ layer. It is not part of the first functional release.
 
 ## Startup and configuration
 
-The planned invocation is:
+The current invocation is:
 
 ```console
 deixis --root <project> --config <config.toml>
