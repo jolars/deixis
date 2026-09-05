@@ -30,3 +30,5 @@ devenv.local.yaml
 /.codex
 /.gc
 /.beads
+/plans/
+/worktrees/
