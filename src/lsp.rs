@@ -545,6 +545,9 @@ impl RunningServer {
     }
 
     async fn join_io_tasks(&mut self, shutdown_timeout: Duration) {
+        // RunningServer owns a Sender until it is dropped, so the writer may be
+        // waiting for receiver EOF even after the child process has exited.
+        self.writer_task.abort();
         let _ = timeout(shutdown_timeout, &mut self.reader_task).await;
         let _ = timeout(shutdown_timeout, &mut self.stderr_task).await;
         let _ = timeout(shutdown_timeout, &mut self.writer_task).await;

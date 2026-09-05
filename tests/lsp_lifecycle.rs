@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use deixis::{
@@ -146,6 +147,29 @@ async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
     assert!(echo.initialized);
 
     manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clean_shutdown_does_not_wait_for_full_timeout()
+-> Result<(), Box<dyn Error>> {
+    let manager = configured_manager("normal", 1_000, 5_000)?;
+
+    let _: EchoResponse = manager
+        .request("mock/echo", json!({ "message": "started" }))
+        .await?;
+
+    let started = Instant::now();
+    let outcome = manager.shutdown().await?;
+
+    assert!(outcome.started());
+    assert!(outcome.shutdown_response_received());
+    assert!(!outcome.forced());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "clean shutdown waited for {:?}",
+        started.elapsed()
+    );
     Ok(())
 }
 
