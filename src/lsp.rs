@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value as JsonValue, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -27,7 +27,9 @@ use crate::{
     documents::{
         DocumentStore, DocumentStoreError, DocumentUpdate, SynchronizedDocument,
     },
-    positions::{PositionConverter, PositionEncoding, PositionError},
+    positions::{
+        Position, PositionConverter, PositionEncoding, PositionError, Range,
+    },
     project::{Project, ProjectFile, ProjectPathError},
 };
 
@@ -80,6 +82,69 @@ impl LazyLanguageServer {
             .map_err(LspError::DocumentPath)?;
         let active = self.active_server().await?;
         active.synchronize_document(file, language_id).await
+    }
+
+    pub async fn hover(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+    ) -> Result<Option<Hover>, LspError> {
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server().await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_method(
+                "textDocument/hover",
+                snapshot.capabilities().get("hoverProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: "textDocument/hover",
+            });
+        }
+
+        let document = active.synchronize_document(file, language_id).await?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+        let lsp_position = document
+            .to_lsp_position(position, encoding)
+            .map_err(|source| LspError::PositionConversion {
+                server: self.config.name().to_owned(),
+                path: document.absolute_path().to_path_buf(),
+                source,
+            })?;
+        let value = active
+            .request_value(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": document.uri() },
+                    "position": lsp_position,
+                }),
+                self.config.timeouts().request(),
+            )
+            .await?;
+        let mut hover: Option<Hover> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+
+        if let Some(hover) = hover.as_mut()
+            && let Some(range) = hover.range
+        {
+            hover.range =
+                Some(document.from_lsp_range(range, encoding).map_err(
+                    |source| LspError::PositionConversion {
+                        server: self.config.name().to_owned(),
+                        path: document.absolute_path().to_path_buf(),
+                        source,
+                    },
+                )?);
+        }
+
+        Ok(hover)
     }
 
     pub async fn status(&self) -> ServerSnapshot {
@@ -145,6 +210,71 @@ impl LazyLanguageServer {
         let active = running.active.clone();
         *state = Some(running);
         Ok(active)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hover {
+    pub contents: HoverContents,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
+}
+
+impl Hover {
+    pub fn text(&self) -> String {
+        self.contents.text()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HoverContents {
+    Markup(MarkupContent),
+    MarkedStrings(Vec<MarkedString>),
+    MarkedString(MarkedString),
+}
+
+impl HoverContents {
+    fn text(&self) -> String {
+        match self {
+            Self::Markup(content) => content.value.trim().to_owned(),
+            Self::MarkedStrings(contents) => contents
+                .iter()
+                .map(MarkedString::value)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            Self::MarkedString(content) => content.value().trim().to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkupContent {
+    pub kind: MarkupKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkupKind {
+    Plaintext,
+    Markdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MarkedString {
+    String(String),
+    LanguageString { language: String, value: String },
+}
+
+impl MarkedString {
+    fn value(&self) -> &str {
+        match self {
+            Self::String(value) | Self::LanguageString { value, .. } => value,
+        }
     }
 }
 
@@ -319,6 +449,10 @@ pub enum LspError {
         server: String,
         encoding: JsonValue,
     },
+    UnsupportedCapability {
+        server: String,
+        method: &'static str,
+    },
     PositionConversion {
         server: String,
         path: PathBuf,
@@ -405,6 +539,10 @@ impl fmt::Display for LspError {
             Self::UnsupportedPositionEncoding { server, encoding } => write!(
                 formatter,
                 "language server `{server}` selected unsupported position encoding {encoding}"
+            ),
+            Self::UnsupportedCapability { server, method } => write!(
+                formatter,
+                "language server `{server}` does not support `{method}`"
             ),
             Self::PositionConversion {
                 server,
@@ -497,6 +635,7 @@ impl Error for LspError {
             Self::MissingPipe { .. }
             | Self::UnsupportedDocumentSynchronization { .. }
             | Self::UnsupportedPositionEncoding { .. }
+            | Self::UnsupportedCapability { .. }
             | Self::DocumentSynchronizationClosed { .. }
             | Self::DocumentLanguageChanged { .. }
             | Self::DocumentVersionOverflow { .. }
@@ -722,6 +861,25 @@ impl ActiveServer {
         }
     }
 
+    async fn supports_method(
+        &self,
+        method: &str,
+        static_capability: Option<&JsonValue>,
+    ) -> bool {
+        if static_capability.is_some_and(capability_is_enabled) {
+            return true;
+        }
+
+        self.registrations
+            .lock()
+            .await
+            .values()
+            .any(|registration| {
+                registration.get("method").and_then(JsonValue::as_str)
+                    == Some(method)
+            })
+    }
+
     async fn synchronize_document(
         &self,
         file: ProjectFile,
@@ -936,6 +1094,12 @@ impl ActiveServer {
 struct DocumentSync {
     open_close: bool,
     kind: DocumentSyncKind,
+}
+
+fn capability_is_enabled(capability: &JsonValue) -> bool {
+    capability
+        .as_bool()
+        .unwrap_or_else(|| capability.is_object())
 }
 
 impl DocumentSync {
@@ -1345,7 +1509,12 @@ fn initialize_params(
                     "dynamicRegistration": true,
                 },
             },
-            "textDocument": {},
+            "textDocument": {
+                "hover": {
+                    "dynamicRegistration": true,
+                    "contentFormat": ["markdown", "plaintext"],
+                },
+            },
         },
         "initializationOptions": config.initialization_options(),
     })
@@ -1453,4 +1622,50 @@ async fn read_lsp_message(
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(ReadError::Json)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::Hover;
+
+    #[test]
+    fn preserves_structured_hover_markup_and_renders_its_text() {
+        let value = json!({
+            "contents": {
+                "kind": "markdown",
+                "value": "  `answer`: the ultimate value\n",
+            },
+        });
+
+        let hover: Hover = serde_json::from_value(value).unwrap();
+
+        assert_eq!(hover.text(), "`answer`: the ultimate value");
+        assert_eq!(
+            serde_json::to_value(hover).unwrap(),
+            json!({
+                "contents": {
+                    "kind": "markdown",
+                    "value": "  `answer`: the ultimate value\n",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn renders_legacy_marked_strings_without_json_noise() {
+        let hover: Hover = serde_json::from_value(json!({
+            "contents": [
+                { "language": "rust", "value": "fn answer() -> u8" },
+                "Returns the ultimate value.",
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            hover.text(),
+            "fn answer() -> u8\n\nReturns the ultimate value."
+        );
+    }
 }

@@ -8,7 +8,9 @@ use std::{
 };
 
 use rmcp::{
-    ServiceExt, model::ServerCapabilities, transport::TokioChildProcess,
+    ServiceExt,
+    model::{CallToolRequestParams, ServerCapabilities},
+    transport::TokioChildProcess,
 };
 use serde_json::{Value as JsonValue, json};
 use tokio::{
@@ -211,6 +213,139 @@ async fn configured_child_diagnostics_stay_on_stderr_with_server_name()
     Ok(())
 }
 
+#[tokio::test]
+async fn hover_returns_structured_markup_across_position_encodings()
+-> Result<(), Box<dyn Error>> {
+    for mode in [
+        "hover-utf-8",
+        "hover-utf-16",
+        "hover-utf-32",
+        "hover-options",
+    ] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+        let tools =
+            timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+        let hover_tool = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == "hover")
+            .expect("configured servers should expose hover");
+        assert_eq!(
+            hover_tool.input_schema.get("required"),
+            Some(&json!(["path", "languageId", "position"])),
+            "{mode}"
+        );
+        assert!(hover_tool.output_schema.is_some(), "{mode}");
+
+        let arguments = json!({
+            "path": "main.rs",
+            "languageId": "rust",
+            "position": {
+                "line": 0,
+                "character": 8,
+            },
+        })
+        .as_object()
+        .expect("hover arguments should be an object")
+        .clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("hover").with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(false), "{mode}");
+        assert_eq!(
+            result.structured_content,
+            Some(json!({
+                "contents": {
+                    "kind": "markdown",
+                    "value": "`answer`: the ultimate value",
+                },
+                "range": {
+                    "start": { "line": 0, "character": 8 },
+                    "end": { "line": 0, "character": 14 },
+                },
+            })),
+            "{mode}"
+        );
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .map(|content| content.text.as_str()),
+            Some("`answer`: the ultimate value"),
+            "{mode}"
+        );
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn hover_rejects_a_server_without_the_capability()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("hover-unsupported")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config_path = write_mock_config_for_mode(&root, "hover-unsupported")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({
+        "path": "main.rs",
+        "languageId": "rust",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .expect("hover arguments should be an object")
+    .clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("hover").with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(true));
+    let message = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .expect("capability errors should have a text fallback");
+    assert!(
+        message
+            .text
+            .contains("does not support `textDocument/hover`")
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
 fn unique_dir(name: &str) -> Result<PathBuf, std::io::Error> {
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -230,6 +365,13 @@ fn unique_dir(name: &str) -> Result<PathBuf, std::io::Error> {
 fn write_mock_config(
     root: &std::path::Path,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    write_mock_config_for_mode(root, "normal")
+}
+
+fn write_mock_config_for_mode(
+    root: &std::path::Path,
+    mode: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
     let server = support::mock_lsp_server()?;
     let config_path = root.join("deixis.toml");
     fs::write(
@@ -239,7 +381,7 @@ fn write_mock_config(
 [[servers]]
 name = "mock-lsp"
 command = {}
-args = ["--mode", "normal"]
+args = ["--mode", {}]
 language_ids = ["rust"]
 
 [servers.timeouts]
@@ -247,6 +389,7 @@ request_ms = 1000
 shutdown_ms = 1000
 "#,
             support::toml_string(&server),
+            serde_json::to_string(mode)?,
         ),
     )?;
     Ok(config_path)

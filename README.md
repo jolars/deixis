@@ -10,10 +10,10 @@ expose their semantic capabilities; it will not grow a second filesystem, shell,
 memory, indexing, or agent framework around them.
 
 > [!NOTE]
-> The project is still pre-tooling. The binary parses startup root and
-> configuration options and completes an MCP handshake over stdio. When a
-> configuration is present, it exposes one lifecycle probe tool for the first
-> configured language server. Semantic MCP operations are not exposed yet.
+> The project is under active development. The binary parses startup root and
+> configuration options, completes an MCP handshake over stdio, and exposes
+> capability-gated hover information through the first configured language
+> server.
 
 ## Direction
 
@@ -88,13 +88,15 @@ request_ms = 30000
 shutdown_ms = 5000
 ```
 
-The internal lifecycle manager starts the configured server only when an
-internal LSP operation needs it. In configured sessions, Deixis advertises the
-read-only `deixis_server_status` tool; calling it with `{ "start": true }`
-starts the first configured server and returns its recorded lifecycle status.
-This probe is the only public tool in the configured phase-1 surface; hover,
-definition, references, symbols, diagnostics, and other semantic tools remain
-unshipped.
+The internal lifecycle manager starts the configured server only when an LSP
+operation needs it. In configured sessions, Deixis advertises two read-only
+tools: `deixis_server_status` and `hover`. Calling the lifecycle probe with
+`{ "start": true }` starts the first configured server and returns its recorded
+status. The `hover` tool accepts a project-contained `path`, an LSP
+`languageId`, and a zero-based UTF-8 `position`; it synchronizes the document,
+checks the server's negotiated hover capability, and returns structured LSP
+markup with a concise text fallback. Definition, references, symbols,
+diagnostics, and other semantic tools remain unshipped.
 
 Startup sends `initialize` and `initialized`, records reported capabilities,
 correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,

@@ -96,10 +96,20 @@ fn handle_request<R: BufRead>(
                 "document-incremental-utf-32" => {
                     Some(Json::String("utf-32".to_owned()))
                 }
+                "hover-utf-16" => Some(Json::String("utf-16".to_owned())),
+                "hover-utf-32" => Some(Json::String("utf-32".to_owned())),
                 _ => Some(Json::String("utf-8".to_owned())),
             };
+            let hover_provider = match mode {
+                "hover-unsupported" => Json::Bool(false),
+                "hover-options" => json_object([(
+                    "workDoneProgress",
+                    Json::Bool(true),
+                )]),
+                _ => Json::Bool(true),
+            };
             let mut capabilities = vec![
-                ("hoverProvider".to_owned(), Json::Bool(true)),
+                ("hoverProvider".to_owned(), hover_provider),
                 ("textDocumentSync".to_owned(), text_document_sync),
             ];
             if let Some(position_encoding) = position_encoding {
@@ -205,6 +215,91 @@ fn handle_request<R: BufRead>(
             ]);
             drop(state);
             write_message(output, response(id, report))?;
+        }
+        "textDocument/hover" => {
+            if mode == "hover-unsupported" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "hover request bypassed capability gate".to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let expected_character = match mode {
+                "hover-utf-16" => 6,
+                "hover-utf-32" => 5,
+                _ => 8,
+            };
+            let position = params.get("position");
+            let line = position
+                .and_then(|position| position.get("line"))
+                .and_then(Json::as_i64);
+            let character = position
+                .and_then(|position| position.get("character"))
+                .and_then(Json::as_i64);
+            if line != Some(0) || character != Some(expected_character) {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32602,
+                        format!(
+                            "expected hover position 0:{expected_character}, got {line:?}:{character:?}"
+                        ),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            write_message(
+                output,
+                response(
+                    id,
+                    json_object([
+                        (
+                            "contents",
+                            json_object([
+                                ("kind", Json::String("markdown".to_owned())),
+                                (
+                                    "value",
+                                    Json::String(
+                                        "`answer`: the ultimate value".to_owned(),
+                                    ),
+                                ),
+                            ]),
+                        ),
+                        (
+                            "range",
+                            json_object([
+                                (
+                                    "start",
+                                    json_object([
+                                        ("line", Json::Number(0)),
+                                        (
+                                            "character",
+                                            Json::Number(expected_character),
+                                        ),
+                                    ]),
+                                ),
+                                (
+                                    "end",
+                                    json_object([
+                                        ("line", Json::Number(0)),
+                                        (
+                                            "character",
+                                            Json::Number(expected_character + 6),
+                                        ),
+                                    ]),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                ),
+            )?;
         }
         "shutdown" => {
             if mode == "ignore-shutdown" {
@@ -431,17 +526,40 @@ fn probe_client<R: BufRead>(
         ),
     )?;
 
-    let position_encodings = {
+    let (
+        position_encodings,
+        hover_dynamic_registration,
+        hover_content_formats,
+    ) = {
         let mut state = state.lock().unwrap();
         state.client_probe_complete = true;
-        state
+        let capabilities = state
             .initialize_params
             .as_ref()
             .and_then(|params| params.get("capabilities"))
-            .and_then(|capabilities| capabilities.get("general"))
+            .cloned()
+            .unwrap_or(Json::Null);
+        let position_encodings = capabilities
+            .get("general")
             .and_then(|general| general.get("positionEncodings"))
             .cloned()
-            .unwrap_or(Json::Null)
+            .unwrap_or(Json::Null);
+        let hover = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("hover"));
+        let dynamic_registration = hover
+            .and_then(|hover| hover.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let content_formats = hover
+            .and_then(|hover| hover.get("contentFormat"))
+            .cloned()
+            .unwrap_or(Json::Null);
+        (
+            position_encodings,
+            dynamic_registration,
+            content_formats,
+        )
     };
     Ok(json_object([
         (
@@ -522,6 +640,11 @@ fn probe_client<R: BufRead>(
             ),
         ),
         ("position_encodings", position_encodings),
+        (
+            "hover_dynamic_registration",
+            Json::Bool(hover_dynamic_registration),
+        ),
+        ("hover_content_formats", hover_content_formats),
     ]))
 }
 

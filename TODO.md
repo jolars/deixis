@@ -58,7 +58,7 @@ Windows.
 - [x] Convert positions between the MCP boundary's zero-based UTF-8 units and
   negotiated LSP UTF-8, UTF-16, and UTF-32 units. Test ASCII, combining
   marks, non-BMP characters, line endings, and invalid boundaries.
-- [ ] Add capability-gated `hover` with structured markup and a concise text
+- [x] Add capability-gated `hover` with structured markup and a concise text
   fallback.
 - [ ] Add capability-gated `definition`, normalize `Location` and
   `LocationLink`, and retain source-server provenance.

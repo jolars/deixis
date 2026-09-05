@@ -8,7 +8,7 @@ use std::{
 use deixis::{
     cli::CliOptions,
     lsp::{LazyLanguageServer, LspError},
-    positions::PositionEncoding,
+    positions::{Position, PositionEncoding},
     project::StartupState,
 };
 use serde::Deserialize;
@@ -125,6 +125,8 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert_eq!(probe.show_message_request_result, JsonValue::Null);
     assert_eq!(probe.unknown_error_code, -32601);
     assert_eq!(probe.position_encodings, ["utf-8", "utf-16", "utf-32"]);
+    assert!(probe.hover_dynamic_registration);
+    assert_eq!(probe.hover_content_formats, ["markdown", "plaintext"]);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
     assert!(manager.dynamic_registrations().await.is_empty());
@@ -321,6 +323,29 @@ async fn rejects_document_sync_when_the_server_does_not_support_it()
 }
 
 #[tokio::test]
+async fn rejects_hover_before_synchronizing_when_capability_is_disabled()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("hover-unsupported", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let error = manager
+        .hover("main.rs", "rust", Position::new(0, 8))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::UnsupportedCapability { .. }));
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert!(probe.events.is_empty());
+    assert_eq!(probe.open_documents, 0);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
 {
     let manager = configured_manager("malformed", 1_000, 1_000)?;
@@ -477,6 +502,8 @@ struct ProbeResponse {
     show_message_request_result: JsonValue,
     unknown_error_code: i64,
     position_encodings: Vec<String>,
+    hover_dynamic_registration: bool,
+    hover_content_formats: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

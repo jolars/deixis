@@ -1,5 +1,8 @@
-use std::error::Error;
-use std::process::ExitCode;
+use std::{
+    error::Error,
+    io::{self, IsTerminal},
+    process::ExitCode,
+};
 
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -45,6 +48,7 @@ fn init_tracing() {
         .unwrap_or_else(|_| EnvFilter::new("deixis=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .with_writer(io::stderr)
         .init();
 }

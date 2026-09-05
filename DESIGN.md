@@ -13,10 +13,11 @@ explicit startup inputs, negotiate an MCP session over stdio, report its name
 and version, start the configured server on internal demand, handle common
 server-to-client messages, continue after malformed server output, and shut
 that server down with a bounded forced-kill fallback. A configured session
-exposes one read-only lifecycle probe tool, `deixis_server_status`, for status
-and startup proof. It still exposes no public semantic MCP tools. Nothing in
-this document should be read as already implemented unless it is also marked
-complete in `TODO.md`.
+exposes the read-only `deixis_server_status` lifecycle probe and a
+capability-gated `hover` tool. Hover synchronizes project-contained documents,
+translates negotiated position encodings, and returns structured markup plus a
+text fallback. Nothing in this document should be read as already implemented
+unless it is also marked complete in `TODO.md`.
 
 ## Purpose
 
@@ -134,15 +135,19 @@ access, or command interpolation.
 ## MCP surface
 
 Without `--config`, the current server advertises no tools. With `--config`, it
-advertises the read-only `deixis_server_status` lifecycle probe. Calling the
-tool with `{ "start": true }` starts the first configured language server,
-returns the recorded server status, and gives black-box tests a narrow route for
-proving child-process stdout/stderr isolation. It is not a semantic LSP
-operation and does not forward arbitrary JSON-RPC.
+advertises the read-only `deixis_server_status` lifecycle probe and `hover`.
+Calling the probe with `{ "start": true }` starts the first configured language
+server, returns the recorded server status, and gives black-box tests a narrow
+route for proving child-process stdout/stderr isolation. The `hover` tool takes
+a root-contained path, a language ID, and a zero-based UTF-8 position. It
+synchronizes the document, verifies `hoverProvider`, converts the request and
+optional response range through the negotiated position encoding, and returns
+the LSP hover contents as structured JSON with readable text content. Neither
+tool forwards arbitrary JSON-RPC.
 
-The planned semantic tool set remains read-only:
+The semantic tool set remains read-only. It starts with `hover`; planned
+additions are:
 
-- `hover`;
 - `definition` and `declaration`;
 - `type_definition` and `implementation`;
 - `references`;
