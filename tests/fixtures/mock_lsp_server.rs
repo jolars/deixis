@@ -207,8 +207,19 @@ fn probe_client<R: BufRead>(
             json_object([(
                 "items",
                 Json::Array(vec![
-                    json_object([("section", Json::String("mock.one".to_owned()))]),
-                    json_object([("section", Json::String("mock.two".to_owned()))]),
+                    json_object([(
+                        "section",
+                        Json::String("mock.one".to_owned()),
+                    )]),
+                    json_object([(
+                        "section",
+                        Json::String("mock.two".to_owned()),
+                    )]),
+                    json_object([(
+                        "section",
+                        Json::String("mock.missing".to_owned()),
+                    )]),
+                    json_object([]),
                 ]),
             )]),
         ),
@@ -242,18 +253,74 @@ fn probe_client<R: BufRead>(
 
     write_message(
         output,
-        request(13, "workspace/applyEdit", json_object([])),
+        request(
+            13,
+            "client/unregisterCapability",
+            json_object([(
+                "unregisterations",
+                Json::Array(vec![json_object([
+                    ("id", Json::String("mock-registration".to_owned())),
+                    (
+                        "method",
+                        Json::String("textDocument/hover".to_owned()),
+                    ),
+                ])]),
+            )]),
+        ),
     )?;
-    let apply_edit = read_response(input, 13)?;
+    let unregistration = read_response(input, 13)?;
 
-    write_message(output, request(14, "mock/unknownClientRequest", Json::Null))?;
-    let unknown = read_response(input, 14)?;
+    write_message(
+        output,
+        request(14, "workspace/applyEdit", json_object([])),
+    )?;
+    let apply_edit = read_response(input, 14)?;
+
+    write_message(
+        output,
+        request(
+            15,
+            "window/showMessageRequest",
+            json_object([
+                ("type", Json::Number(3)),
+                (
+                    "message",
+                    Json::String("choose an action from mock".to_owned()),
+                ),
+                (
+                    "actions",
+                    Json::Array(vec![json_object([(
+                        "title",
+                        Json::String("Ignore".to_owned()),
+                    )])]),
+                ),
+            ]),
+        ),
+    )?;
+    let show_message = read_response(input, 15)?;
+
+    write_message(output, request(16, "mock/unknownClientRequest", Json::Null))?;
+    let unknown = read_response(input, 16)?;
 
     write_message(
         output,
         notification(
             "window/logMessage",
             json_object([("message", Json::String("hello from mock".to_owned()))]),
+        ),
+    )?;
+    write_message(
+        output,
+        notification(
+            "window/showMessage",
+            json_object([("message", Json::String("show from mock".to_owned()))]),
+        ),
+    )?;
+    write_message(
+        output,
+        notification(
+            "window/logTrace",
+            json_object([("message", Json::String("trace from mock".to_owned()))]),
         ),
     )?;
     write_message(
@@ -270,14 +337,11 @@ fn probe_client<R: BufRead>(
     state.lock().unwrap().client_probe_complete = true;
     Ok(json_object([
         (
-            "configuration_items",
-            Json::Number(
-                configuration
-                    .get("result")
-                    .and_then(Json::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0) as i64,
-            ),
+            "configuration_values",
+            configuration
+                .get("result")
+                .cloned()
+                .unwrap_or(Json::Null),
         ),
         (
             "workspace_folders",
@@ -290,8 +354,32 @@ fn probe_client<R: BufRead>(
             ),
         ),
         (
+            "workspace_folder_uri",
+            workspace_folders
+                .get("result")
+                .and_then(Json::as_array)
+                .and_then(|folders| folders.first())
+                .and_then(|folder| folder.get("uri"))
+                .cloned()
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "workspace_folder_name",
+            workspace_folders
+                .get("result")
+                .and_then(Json::as_array)
+                .and_then(|folders| folders.first())
+                .and_then(|folder| folder.get("name"))
+                .cloned()
+                .unwrap_or(Json::Null),
+        ),
+        (
             "registered",
             Json::Bool(registration.get("result") == Some(&Json::Null)),
+        ),
+        (
+            "unregistered",
+            Json::Bool(unregistration.get("result") == Some(&Json::Null)),
         ),
         (
             "apply_edit_applied",
@@ -302,6 +390,18 @@ fn probe_client<R: BufRead>(
                     .and_then(Json::as_bool)
                     .unwrap_or(true),
             ),
+        ),
+        (
+            "apply_edit_failure_reason",
+            apply_edit
+                .get("result")
+                .and_then(|value| value.get("failureReason"))
+                .cloned()
+                .unwrap_or(Json::Null),
+        ),
+        (
+            "show_message_request_result",
+            show_message.get("result").cloned().unwrap_or(Json::Null),
         ),
         (
             "unknown_error_code",

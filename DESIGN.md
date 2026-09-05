@@ -204,10 +204,11 @@ there will be no unbounded crash loop.
 The client side handles the common requests language servers initiate:
 
 - `workspace/configuration` returns values derived from the resolved, immutable
-  configuration;
+  configuration, using dotted section paths when the server supplies them;
 - workspace-folder queries return the single project root;
-- dynamic capability registration updates in-memory state;
-- log and show-message notifications are represented in tracing output; and
+- dynamic capability registration and unregistration maintain in-memory state;
+- log-message, show-message, and show-message request traffic is represented in
+  tracing output; and
 - `workspace/applyEdit` is rejected while the project is read-only.
 
 Unknown requests receive the correct method-not-found response. Notifications

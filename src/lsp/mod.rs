@@ -93,7 +93,13 @@ impl LazyLanguageServer {
         };
 
         match active {
-            Some(active) => active.registrations.lock().await.clone(),
+            Some(active) => active
+                .registrations
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -555,7 +561,7 @@ struct ActiveServer {
     configuration: JsonValue,
     status: Arc<Mutex<ServerSnapshot>>,
     diagnostics: Arc<Mutex<Vec<JsonValue>>>,
-    registrations: Arc<Mutex<Vec<JsonValue>>>,
+    registrations: Arc<Mutex<BTreeMap<String, JsonValue>>>,
 }
 
 impl ActiveServer {
@@ -575,7 +581,7 @@ impl ActiveServer {
                 config.name(),
             ))),
             diagnostics: Arc::new(Mutex::new(Vec::new())),
-            registrations: Arc::new(Mutex::new(Vec::new())),
+            registrations: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -772,7 +778,7 @@ async fn handle_incoming_message(
         if let Some(id) = message.get("id").cloned() {
             let params =
                 message.get("params").cloned().unwrap_or(JsonValue::Null);
-            handle_server_request(active, id, method, params).await;
+            handle_server_request(server, active, id, method, params).await;
         } else {
             let params =
                 message.get("params").cloned().unwrap_or(JsonValue::Null);
@@ -808,6 +814,7 @@ async fn handle_incoming_message(
 }
 
 async fn handle_server_request(
+    server: &str,
     active: &ActiveServer,
     id: JsonValue,
     method: &str,
@@ -815,14 +822,7 @@ async fn handle_server_request(
 ) {
     match method {
         "workspace/configuration" => {
-            let items = params
-                .get("items")
-                .and_then(JsonValue::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            let result = JsonValue::Array(
-                (0..items).map(|_| active.configuration.clone()).collect(),
-            );
+            let result = configuration_response(&active.configuration, &params);
             let _ = active.send_message(success_response(id, result)).await;
         }
         "workspace/workspaceFolders" => {
@@ -836,13 +836,29 @@ async fn handle_server_request(
                 .await;
         }
         "client/registerCapability" => {
-            active.registrations.lock().await.push(params);
+            let mut registrations = active.registrations.lock().await;
+            for registration in capability_items(&params, "registrations") {
+                if let Some(id) = capability_id(registration) {
+                    registrations.insert(id.to_owned(), registration.clone());
+                }
+            }
             let _ = active
                 .send_message(success_response(id, JsonValue::Null))
                 .await;
         }
         "client/unregisterCapability" => {
-            active.registrations.lock().await.push(params);
+            let mut registrations = active.registrations.lock().await;
+            for registration in capability_items(&params, "unregisterations") {
+                if let Some(id) = capability_id(registration) {
+                    registrations.remove(id);
+                }
+            }
+            let _ = active
+                .send_message(success_response(id, JsonValue::Null))
+                .await;
+        }
+        "window/showMessageRequest" => {
+            trace_server_message(server, method, &params);
             let _ = active
                 .send_message(success_response(id, JsonValue::Null))
                 .await;
@@ -880,16 +896,75 @@ async fn handle_server_notification(
         "textDocument/publishDiagnostics" => {
             active.diagnostics.lock().await.push(params);
         }
-        "window/logMessage" | "window/showMessage" => {
-            if let Some(message) =
-                params.get("message").and_then(JsonValue::as_str)
-            {
-                info!(server = %server, method, message, "language server message");
-            }
+        "window/logMessage" | "window/showMessage" | "window/logTrace" => {
+            trace_server_message(server, method, &params);
+        }
+        "$/progress" | "telemetry/event" => {
+            debug!(server = %server, method, "ignored language server notification");
         }
         _ => {
             debug!(server = %server, method, "ignored language server notification");
         }
+    }
+}
+
+fn configuration_response(
+    configuration: &JsonValue,
+    params: &JsonValue,
+) -> JsonValue {
+    let values = params
+        .get("items")
+        .and_then(JsonValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("section").and_then(JsonValue::as_str).map_or_else(
+                        || configuration.clone(),
+                        |section| configuration_section(configuration, section),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    JsonValue::Array(values)
+}
+
+fn configuration_section(
+    configuration: &JsonValue,
+    section: &str,
+) -> JsonValue {
+    let mut value = configuration;
+    for part in section.split('.') {
+        if part.is_empty() {
+            return JsonValue::Null;
+        }
+        let Some(next) = value.get(part) else {
+            return JsonValue::Null;
+        };
+        value = next;
+    }
+    value.clone()
+}
+
+fn capability_items<'a>(params: &'a JsonValue, field: &str) -> &'a [JsonValue] {
+    params
+        .get(field)
+        .and_then(JsonValue::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn capability_id(value: &JsonValue) -> Option<&str> {
+    value.get("id").and_then(JsonValue::as_str)
+}
+
+fn trace_server_message(server: &str, method: &str, params: &JsonValue) {
+    if let Some(message) = params.get("message").and_then(JsonValue::as_str) {
+        info!(server = %server, method, message, "language server message");
+    } else {
+        info!(server = %server, method, "language server message");
     }
 }
 

@@ -91,7 +91,8 @@ read-only `deixis_server_status` tool; calling it with `{ "start": true }`
 starts the first configured server and returns its recorded lifecycle status.
 Startup sends `initialize` and `initialized`, records reported capabilities,
 correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,
-handles common server-to-client workspace messages, and shuts down with
+handles common server-to-client workspace messages, tracks dynamic registration
+state, rejects `workspace/applyEdit` while read-only, and shuts down with
 `shutdown`, `exit`, and a bounded forced-kill fallback.
 
 The process reserves stdout for MCP messages. Set `RUST_LOG` to control logs,

@@ -74,19 +74,57 @@ async fn request_timeout_cancels_only_the_pending_request()
 #[tokio::test]
 async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>>
 {
-    let manager = configured_manager("normal", 1_000, 1_000)?;
+    let (manager, root) = configured_manager_with_root("normal", 1_000, 1_000)?;
 
     let probe: ProbeResponse =
         manager.request("mock/probeClient", JsonValue::Null).await?;
 
-    assert_eq!(probe.configuration_items, 2);
+    assert_eq!(
+        probe.configuration_values,
+        json!([
+            "alpha",
+            2,
+            null,
+            {
+                "answer": 42,
+                "mock": {
+                    "one": "alpha",
+                    "two": 2,
+                },
+            },
+        ])
+    );
     assert_eq!(probe.workspace_folders, 1);
+    assert_eq!(
+        probe.workspace_folder_name,
+        root.file_name()
+            .expect("test root should have a file name")
+            .to_string_lossy()
+    );
+    assert!(
+        probe.workspace_folder_uri.starts_with("file://"),
+        "{}",
+        probe.workspace_folder_uri
+    );
+    assert!(
+        probe
+            .workspace_folder_uri
+            .ends_with(&probe.workspace_folder_name),
+        "{}",
+        probe.workspace_folder_uri
+    );
     assert!(probe.registered);
+    assert!(probe.unregistered);
     assert!(!probe.apply_edit_applied);
+    assert_eq!(
+        probe.apply_edit_failure_reason,
+        Some("Deixis is read-only".to_owned())
+    );
+    assert_eq!(probe.show_message_request_result, JsonValue::Null);
     assert_eq!(probe.unknown_error_code, -32601);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
-    assert_eq!(manager.dynamic_registrations().await.len(), 1);
+    assert!(manager.dynamic_registrations().await.is_empty());
 
     manager.shutdown().await?;
     Ok(())
@@ -114,6 +152,15 @@ fn configured_manager(
     request_timeout_ms: u64,
     shutdown_timeout_ms: u64,
 ) -> Result<LazyLanguageServer, Box<dyn Error>> {
+    configured_manager_with_root(mode, request_timeout_ms, shutdown_timeout_ms)
+        .map(|(manager, _root)| manager)
+}
+
+fn configured_manager_with_root(
+    mode: &str,
+    request_timeout_ms: u64,
+    shutdown_timeout_ms: u64,
+) -> Result<(LazyLanguageServer, PathBuf), Box<dyn Error>> {
     let root = support::unique_dir(mode)?;
     let config_path =
         write_config(&root, mode, request_timeout_ms, shutdown_timeout_ms)?;
@@ -125,7 +172,10 @@ fn configured_manager(
         .servers()[0]
         .clone();
 
-    Ok(LazyLanguageServer::new(config, startup.project().clone()))
+    Ok((
+        LazyLanguageServer::new(config, startup.project().clone()),
+        root,
+    ))
 }
 
 fn write_config(
@@ -152,6 +202,10 @@ shutdown_ms = {}
 
 [servers.initialization_options]
 answer = 42
+
+[servers.initialization_options.mock]
+one = "alpha"
+two = 2
 "#,
             support::toml_string(&server),
             mode,
@@ -180,9 +234,14 @@ struct CancellationResponse {
 
 #[derive(Debug, Deserialize)]
 struct ProbeResponse {
-    configuration_items: usize,
+    configuration_values: JsonValue,
     workspace_folders: usize,
+    workspace_folder_uri: String,
+    workspace_folder_name: String,
     registered: bool,
+    unregistered: bool,
     apply_edit_applied: bool,
+    apply_edit_failure_reason: Option<String>,
+    show_message_request_result: JsonValue,
     unknown_error_code: i64,
 }
