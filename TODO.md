@@ -51,7 +51,7 @@ Windows.
 
 ## 2. Documents, positions, and first tools
 
-- [ ] Add root-contained path normalization, including traversal and symlink
+- [x] Add root-contained path normalization, including traversal and symlink
   escape tests. Permit external locations in results without reading them.
 - [ ] Add lazy `didOpen`, content-hash change detection, monotonic versions,
   full-document replacement, and `didClose` on shutdown.

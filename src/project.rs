@@ -24,6 +24,103 @@ impl Project {
     pub fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
     }
+
+    pub fn resolve_file(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<ProjectFile, ProjectPathError> {
+        let path = path.as_ref();
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        let absolute = fs::canonicalize(&candidate).map_err(|source| {
+            ProjectPathError::Resolve {
+                path: candidate,
+                source,
+            }
+        })?;
+        let relative = absolute
+            .strip_prefix(&self.root)
+            .map(Path::to_path_buf)
+            .map_err(|_| ProjectPathError::OutsideRoot {
+                path: absolute.clone(),
+                root: self.root.clone(),
+            })?;
+        let metadata = fs::metadata(&absolute).map_err(|source| {
+            ProjectPathError::Resolve {
+                path: absolute.clone(),
+                source,
+            }
+        })?;
+        if !metadata.is_file() {
+            return Err(ProjectPathError::NotFile { path: absolute });
+        }
+
+        Ok(ProjectFile { absolute, relative })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFile {
+    absolute: PathBuf,
+    relative: PathBuf,
+}
+
+impl ProjectFile {
+    pub fn absolute(&self) -> &Path {
+        &self.absolute
+    }
+
+    pub fn relative(&self) -> &Path {
+        &self.relative
+    }
+}
+
+#[derive(Debug)]
+pub enum ProjectPathError {
+    Resolve { path: PathBuf, source: io::Error },
+    OutsideRoot { path: PathBuf, root: PathBuf },
+    NotFile { path: PathBuf },
+}
+
+impl fmt::Display for ProjectPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resolve { path, source } => {
+                write!(
+                    formatter,
+                    "failed to resolve project file `{}`: {source}",
+                    path.display()
+                )
+            }
+            Self::OutsideRoot { path, root } => {
+                write!(
+                    formatter,
+                    "project file `{}` is outside project root `{}`",
+                    path.display(),
+                    root.display()
+                )
+            }
+            Self::NotFile { path } => {
+                write!(
+                    formatter,
+                    "project path `{}` is not a regular file",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl Error for ProjectPathError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Resolve { source, .. } => Some(source),
+            Self::OutsideRoot { .. } | Self::NotFile { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,14 +240,14 @@ fn canonicalize_config(path: PathBuf) -> Result<PathBuf, ProjectError> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::{Path, PathBuf},
         process,
         sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::StartupState;
+    use super::{Project, ProjectPathError, StartupState};
     use crate::cli::CliOptions;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -223,6 +320,115 @@ language_ids = ["rust"]
         assert!(error.to_string().contains("failed to parse config TOML"));
     }
 
+    #[test]
+    fn resolves_relative_and_absolute_project_files() {
+        let root = unique_dir("resolve-project-file");
+        let source = root.join("src").join("lib.rs");
+        fs::create_dir(source.parent().unwrap()).unwrap();
+        fs::write(&source, "pub fn answer() -> u8 { 42 }").unwrap();
+        let project = project(&root);
+
+        let relative = project.resolve_file("src/lib.rs").unwrap();
+        let absolute = project.resolve_file(&source).unwrap();
+
+        assert_eq!(relative.absolute(), canonical(&source));
+        assert_eq!(relative.relative(), Path::new("src").join("lib.rs"));
+        assert_eq!(absolute, relative);
+    }
+
+    #[test]
+    fn normalizes_parent_components_that_remain_inside_the_root() {
+        let root = unique_dir("normalize-project-file");
+        let source = root.join("lib.rs");
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(&source, "pub fn answer() -> u8 { 42 }").unwrap();
+        let project = project(&root);
+
+        let resolved = project.resolve_file("src/../lib.rs").unwrap();
+
+        assert_eq!(resolved.absolute(), canonical(&source));
+        assert_eq!(resolved.relative(), Path::new("lib.rs"));
+    }
+
+    #[test]
+    fn rejects_relative_traversal_and_absolute_external_paths() {
+        let parent = unique_dir("external-project-file");
+        let root = parent.join("project");
+        let external = parent.join("external.rs");
+        fs::create_dir(&root).unwrap();
+        fs::write(&external, "secret").unwrap();
+        let project = project(&root);
+
+        let traversal = project.resolve_file("../external.rs").unwrap_err();
+        let absolute = project.resolve_file(&external).unwrap_err();
+
+        assert!(matches!(traversal, ProjectPathError::OutsideRoot { .. }));
+        assert!(matches!(absolute, ProjectPathError::OutsideRoot { .. }));
+    }
+
+    #[test]
+    fn rejects_a_sibling_with_the_same_textual_prefix_as_the_root() {
+        let parent = unique_dir("prefix-project-file");
+        let root = parent.join("project");
+        let sibling = parent.join("project-sibling");
+        let external = sibling.join("lib.rs");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        fs::write(&external, "secret").unwrap();
+        let project = project(&root);
+
+        let error = project.resolve_file(&external).unwrap_err();
+
+        assert!(matches!(error, ProjectPathError::OutsideRoot { .. }));
+    }
+
+    #[test]
+    fn rejects_missing_paths_and_non_file_targets() {
+        let root = unique_dir("invalid-project-file");
+        let project = project(&root);
+
+        let missing = project.resolve_file("missing.rs").unwrap_err();
+        let directory = project.resolve_file(".").unwrap_err();
+
+        assert!(matches!(missing, ProjectPathError::Resolve { .. }));
+        assert!(matches!(directory, ProjectPathError::NotFile { .. }));
+    }
+
+    #[test]
+    fn accepts_an_internal_file_symlink_as_its_canonical_target() {
+        let root = unique_dir("internal-symlink");
+        let source = root.join("source.rs");
+        let alias = root.join("alias.rs");
+        fs::write(&source, "pub fn answer() -> u8 { 42 }").unwrap();
+        if !create_file_symlink_or_skip(&source, &alias) {
+            return;
+        }
+        let project = project(&root);
+
+        let resolved = project.resolve_file("alias.rs").unwrap();
+
+        assert_eq!(resolved.absolute(), canonical(&source));
+        assert_eq!(resolved.relative(), Path::new("source.rs"));
+    }
+
+    #[test]
+    fn rejects_an_external_target_through_a_directory_symlink() {
+        let parent = unique_dir("external-symlink");
+        let root = parent.join("project");
+        let external = parent.join("external");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("secret.rs"), "secret").unwrap();
+        if !create_directory_symlink_or_skip(&external, &root.join("link")) {
+            return;
+        }
+        let project = project(&root);
+
+        let error = project.resolve_file("link/secret.rs").unwrap_err();
+
+        assert!(matches!(error, ProjectPathError::OutsideRoot { .. }));
+    }
+
     fn unique_dir(name: &str) -> PathBuf {
         let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
@@ -239,5 +445,64 @@ language_ids = ["rust"]
 
     fn canonical(path: &Path) -> PathBuf {
         fs::canonicalize(path).unwrap()
+    }
+
+    fn project(root: &Path) -> Project {
+        Project {
+            root: canonical(root),
+            config_path: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        std::os::unix::fs::symlink(source, destination)
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        std::os::windows::fs::symlink_file(source, destination)
+    }
+
+    #[cfg(unix)]
+    fn create_directory_symlink(
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        std::os::unix::fs::symlink(source, destination)
+    }
+
+    #[cfg(windows)]
+    fn create_directory_symlink(
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        std::os::windows::fs::symlink_dir(source, destination)
+    }
+
+    fn create_file_symlink_or_skip(source: &Path, destination: &Path) -> bool {
+        symlink_or_skip(create_file_symlink(source, destination))
+    }
+
+    fn create_directory_symlink_or_skip(
+        source: &Path,
+        destination: &Path,
+    ) -> bool {
+        symlink_or_skip(create_directory_symlink(source, destination))
+    }
+
+    fn symlink_or_skip(result: io::Result<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(1314) => false,
+            Err(error) => panic!("failed to create test symlink: {error}"),
+        }
     }
 }
