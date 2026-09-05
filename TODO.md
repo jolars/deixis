@@ -24,10 +24,10 @@ and Windows.
 
 ## 1. LSP vertical slice
 
-- [ ] Add a portable mock language-server binary used only by integration tests.
+- [~] Add a portable mock language-server binary used only by integration tests.
   It must exercise initialization, notifications, requests, cancellation,
   diagnostics, shutdown, malformed messages, and forced termination.
-- [ ] Spike `async-lsp` against the mock server. Record the result in
+- [x] Spike `async-lsp` against the mock server. Record the result in
   `DESIGN.md`; adopt it behind a small internal client boundary or document
   why a different transport is required.
 - [x] Add strict TOML configuration with explicit server commands, arguments,
@@ -35,11 +35,11 @@ and Windows.
   options. Reject unknown and ambiguous fields.
 - [x] Add `--config` and `--root`; default the root to the current directory,
   canonicalize it at startup, and keep it immutable.
-- [ ] Start one configured server lazily and implement `initialize`,
+- [x] Start one configured server lazily and implement `initialize`,
   `initialized`, `shutdown`, `exit`, timeout, and forced-kill behavior.
-- [ ] Handle server stderr without touching MCP stdout and attach the server
+- [x] Handle server stderr without touching MCP stdout and attach the server
   name to every child-process log event.
-- [ ] Implement server-to-client configuration, workspace-folder, dynamic
+- [x] Implement server-to-client configuration, workspace-folder, dynamic
   registration, log-message, and unknown-method handling. Reject
   `workspace/applyEdit` while read-only.
 

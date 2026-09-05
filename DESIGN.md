@@ -7,10 +7,13 @@ This document records the intended architecture and the reasons behind it.
 
 The repository currently contains the project infrastructure, strict
 language-server configuration parsing, immutable project-root startup handling,
-and a valid, capability-free MCP server. It can parse explicit startup inputs,
-negotiate an MCP session over stdio, report its name and version, and shut down.
-It does not start language servers yet. Nothing in this document should be read
-as already implemented unless it is also marked complete in `TODO.md`.
+a valid, capability-free MCP server, and an internal lazy lifecycle manager for
+one configured language server. It can parse explicit startup inputs, negotiate
+an MCP session over stdio, report its name and version, start the configured
+server on internal demand, and shut that server down with a bounded forced-kill
+fallback. It still exposes no public semantic MCP tools. Nothing in this
+document should be read as already implemented unless it is also marked complete
+in `TODO.md`.
 
 ## Purpose
 
@@ -154,16 +157,18 @@ normalization, and the auditability of a finite tool surface.
 ## Language-server client
 
 The LSP layer owns process startup, JSON-RPC correlation, incoming requests and
-notifications, capability state, cancellation, and shutdown. The first LSP
-milestone will test `async-lsp` as the client framework. It supports both sides
-of LSP, executes state-changing notifications in order, and leaves the wire
-types close to `lsp-types`.
+notifications, capability state, cancellation, and shutdown. The first
+vertical-slice spike kept `async-lsp` out of the production dependency graph and
+implemented a small JSON-RPC stdio transport behind an internal boundary
+instead. That choice keeps this phase focused on Deixis's required process
+semantics: direct configured command execution, ordered child-stdin writes,
+request ID correlation, per-request timeout and cancellation, server-to-client
+requests, stderr draining, and bounded shutdown with forced termination.
 
-That dependency is not added during bootstrap. A mock-server vertical slice must
-first prove initialization, request correlation, notification handling,
-cancellation, and portable child cleanup. The rest of the application will
-depend on a small internal client boundary so the transport can be replaced if
-the spike exposes a mismatch.
+`async-lsp` remains a candidate once document synchronization and the first
+semantic tools need broader typed LSP coverage. The rest of the application
+depends on the internal client boundary so the transport can still be replaced
+without changing MCP handlers.
 
 ### Lifecycle
 
@@ -174,12 +179,14 @@ Servers start lazily when routing selects them. Startup proceeds as follows:
 2. Send `initialize` with the immutable project root, one workspace folder,
    client identity, client capabilities, and configured initialization options.
 3. Record server identity, capabilities, text synchronization mode, and position
-   encoding.
+   encoding when the server reports them.
 4. Send `initialized`, then allow routed requests.
 
 Shutdown sends `shutdown`, waits for its response, sends `exit`, closes the
 pipes, and waits for the child. A bounded timeout ends in forced termination so
-an unresponsive language server cannot keep the MCP process alive.
+an unresponsive language server cannot keep the MCP process alive. If the
+shutdown response itself times out, Deixis still sends `exit`, waits for the
+child, and force-kills it when needed.
 
 An unexpected exit fails outstanding calls for that server and records the
 failure. Automatic restart will be bounded and opt-in to the relevant request;
@@ -187,11 +194,12 @@ there will be no unbounded crash loop.
 
 ### Server-to-client messages
 
-The client side must handle the common requests language servers initiate:
+The client side handles the common requests language servers initiate:
 
-- `workspace/configuration` reads the resolved, immutable configuration;
+- `workspace/configuration` returns values derived from the resolved, immutable
+  configuration;
 - workspace-folder queries return the single project root;
-- dynamic capability registration updates routing state;
+- dynamic capability registration updates in-memory state;
 - log and show-message notifications are represented in tracing output; and
 - `workspace/applyEdit` is rejected while the project is read-only.
 

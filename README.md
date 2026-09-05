@@ -10,10 +10,10 @@ expose their semantic capabilities; it will not grow a second filesystem, shell,
 memory, indexing, or agent framework around them.
 
 > [!NOTE]
-> The project is at the bootstrap stage. The binary currently parses startup
-> root and configuration options, completes an MCP handshake over stdio, and
-> advertises no tools. It does not start or communicate with a language server
-> yet.
+> The project is still pre-tooling. The binary parses startup root and
+> configuration options, completes an MCP handshake over stdio, and advertises
+> no public tools. Internally, it now has a tested lazy lifecycle manager for one
+> configured language server, but semantic MCP operations are not exposed yet.
 
 ## Direction
 
@@ -66,7 +66,8 @@ cargo run -- --root /path/to/project --config /path/to/deixis.toml
 `--root` defaults to the current directory and is canonicalized once at startup.
 When `--config` is omitted, Deixis preserves the current capability-free MCP
 bootstrap. When `--config` is present, the file must already exist and must use
-the strict TOML server schema:
+the strict TOML server schema. Configured commands are executed directly, never
+through a shell, and no command is inferred from project contents:
 
 ```toml
 [[servers]]
@@ -78,11 +79,23 @@ file_patterns = ["**/*.rs"]
 
 [servers.environment]
 RUST_LOG = "info"
+
+[servers.timeouts]
+request_ms = 30000
+shutdown_ms = 5000
 ```
 
+The internal lifecycle manager starts the configured server only when an
+internal LSP operation needs it. Startup sends `initialize` and `initialized`,
+records reported capabilities, correlates request IDs, forwards timeout
+cancellation with `$/cancelRequest`, handles common server-to-client workspace
+messages, and shuts down with `shutdown`, `exit`, and a bounded forced-kill
+fallback.
+
 The process reserves stdout for MCP messages. Set `RUST_LOG` to control logs,
-which are always written to stderr. Startup validation failures are also written
-to stderr before MCP serving begins.
+which are always written to stderr. Child-process stderr is drained to Deixis
+stderr with the configured server name attached, and startup validation failures
+are written to stderr before MCP serving begins.
 
 ## Nix
 
