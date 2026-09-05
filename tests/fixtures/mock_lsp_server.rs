@@ -74,6 +74,19 @@ fn handle_request<R: BufRead>(
         "initialize" => {
             eprintln!("mock-lsp initializing");
             state.lock().unwrap().initialize_params = Some(params);
+            let text_document_sync = match mode {
+                "document-incremental" => json_object([
+                    ("openClose", Json::Bool(true)),
+                    ("change", Json::Number(2)),
+                ]),
+                "document-none" => Json::Number(0),
+                _ => Json::Number(1),
+            };
+            let position_encoding = if mode == "document-incremental" {
+                "utf-16"
+            } else {
+                "utf-8"
+            };
             write_message(
                 output,
                 response(
@@ -83,10 +96,10 @@ fn handle_request<R: BufRead>(
                             "capabilities",
                             json_object([
                                 ("hoverProvider", Json::Bool(true)),
-                                ("textDocumentSync", Json::Number(1)),
+                                ("textDocumentSync", text_document_sync),
                                 (
                                     "positionEncoding",
-                                    Json::String("utf-8".to_owned()),
+                                    Json::String(position_encoding.to_owned()),
                                 ),
                             ]),
                         ),
@@ -167,13 +180,39 @@ fn handle_request<R: BufRead>(
             let report = probe_client(output, input, state)?;
             write_message(output, response(id, report))?;
         }
+        "mock/documentEvents" => {
+            let state = state.lock().unwrap();
+            let report = json_object([
+                ("events", Json::Array(state.document_events.clone())),
+                (
+                    "open_documents",
+                    Json::Number(state.open_documents.len() as i64),
+                ),
+            ]);
+            drop(state);
+            write_message(output, response(id, report))?;
+        }
         "shutdown" => {
             if mode == "ignore-shutdown" {
                 loop {
                     thread::sleep(Duration::from_secs(60));
                 }
             }
-            state.lock().unwrap().shutdown_requested = true;
+            let mut state = state.lock().unwrap();
+            if !state.open_documents.is_empty() {
+                drop(state);
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32000,
+                        "documents remained open during shutdown".to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+            state.shutdown_requested = true;
+            drop(state);
             write_message(output, response(id, Json::Null))?;
         }
         _ => {
@@ -201,6 +240,35 @@ fn handle_notification(
             if let Some(id) = params.get("id").cloned() {
                 state.lock().unwrap().cancellations.insert(id.to_string());
             }
+        }
+        "textDocument/didOpen" => {
+            let mut state = state.lock().unwrap();
+            if let Some(uri) = params
+                .get("textDocument")
+                .and_then(|document| document.get("uri"))
+                .and_then(Json::as_str)
+            {
+                state.open_documents.insert(uri.to_owned());
+            }
+            state.document_events.push(notification(method, params));
+        }
+        "textDocument/didChange" => {
+            state
+                .lock()
+                .unwrap()
+                .document_events
+                .push(notification(method, params));
+        }
+        "textDocument/didClose" => {
+            let mut state = state.lock().unwrap();
+            if let Some(uri) = params
+                .get("textDocument")
+                .and_then(|document| document.get("uri"))
+                .and_then(Json::as_str)
+            {
+                state.open_documents.remove(uri);
+            }
+            state.document_events.push(notification(method, params));
         }
         "exit" if mode == "ignore-shutdown" => loop {
             thread::sleep(Duration::from_secs(60));
@@ -552,6 +620,8 @@ struct MockState {
     client_probe_complete: bool,
     initialize_params: Option<Json>,
     cancellations: BTreeSet<String>,
+    document_events: Vec<Json>,
+    open_documents: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

@@ -53,7 +53,7 @@ Windows.
 
 - [x] Add root-contained path normalization, including traversal and symlink
   escape tests. Permit external locations in results without reading them.
-- [ ] Add lazy `didOpen`, content-hash change detection, monotonic versions,
+- [x] Add lazy `didOpen`, content-hash change detection, monotonic versions,
   full-document replacement, and `didClose` on shutdown.
 - [ ] Convert positions between the MCP boundary's zero-based UTF-8 units and
   negotiated LSP UTF-8, UTF-16, and UTF-32 units. Test ASCII, combining

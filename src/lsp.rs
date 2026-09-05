@@ -22,7 +22,13 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{config::LanguageServerConfig, project::Project};
+use crate::{
+    config::LanguageServerConfig,
+    documents::{
+        DocumentStore, DocumentStoreError, DocumentUpdate, SynchronizedDocument,
+    },
+    project::{Project, ProjectFile, ProjectPathError},
+};
 
 const JSONRPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -60,6 +66,19 @@ impl LazyLanguageServer {
     pub async fn ensure_started(&self) -> Result<ServerSnapshot, LspError> {
         let active = self.active_server().await?;
         Ok(active.status.lock().await.clone())
+    }
+
+    pub async fn synchronize_document(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+    ) -> Result<SynchronizedDocument, LspError> {
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server().await?;
+        active.synchronize_document(file, language_id).await
     }
 
     pub async fn status(&self) -> ServerSnapshot {
@@ -275,6 +294,29 @@ pub enum LspError {
     },
     EncodeMessage(serde_json::Error),
     DecodeResult(serde_json::Error),
+    DocumentPath(ProjectPathError),
+    ReadDocument {
+        path: PathBuf,
+        source: io::Error,
+    },
+    UnsupportedDocumentSynchronization {
+        server: String,
+        capability: Option<JsonValue>,
+    },
+    DocumentSynchronizationClosed {
+        server: String,
+        path: PathBuf,
+    },
+    DocumentLanguageChanged {
+        server: String,
+        path: PathBuf,
+        previous: String,
+        requested: String,
+    },
+    DocumentVersionOverflow {
+        server: String,
+        path: PathBuf,
+    },
     TransportClosed {
         server: String,
     },
@@ -321,6 +363,50 @@ impl fmt::Display for LspError {
             Self::DecodeResult(source) => {
                 write!(formatter, "failed to decode LSP response: {source}")
             }
+            Self::DocumentPath(source) => write!(formatter, "{source}"),
+            Self::ReadDocument { path, source } => {
+                write!(
+                    formatter,
+                    "failed to read project file `{}` as UTF-8 text: {source}",
+                    path.display()
+                )
+            }
+            Self::UnsupportedDocumentSynchronization { server, capability } => {
+                write!(
+                    formatter,
+                    "language server `{server}` does not support full or incremental document synchronization"
+                )?;
+                if let Some(capability) = capability {
+                    write!(formatter, ": {capability}")?;
+                }
+                Ok(())
+            }
+            Self::DocumentSynchronizationClosed { server, path } => {
+                write!(
+                    formatter,
+                    "language server `{server}` is shutting down and cannot synchronize `{}`",
+                    path.display()
+                )
+            }
+            Self::DocumentLanguageChanged {
+                server,
+                path,
+                previous,
+                requested,
+            } => {
+                write!(
+                    formatter,
+                    "language server `{server}` already opened `{}` as `{previous}`, not `{requested}`",
+                    path.display()
+                )
+            }
+            Self::DocumentVersionOverflow { server, path } => {
+                write!(
+                    formatter,
+                    "language server `{server}` exhausted document versions for `{}`",
+                    path.display()
+                )
+            }
             Self::TransportClosed { server } => {
                 write!(formatter, "language server `{server}` transport closed")
             }
@@ -366,13 +452,18 @@ impl fmt::Display for LspError {
 impl Error for LspError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Spawn { source, .. } | Self::Shutdown { source, .. } => {
-                Some(source)
-            }
+            Self::Spawn { source, .. }
+            | Self::ReadDocument { source, .. }
+            | Self::Shutdown { source, .. } => Some(source),
+            Self::DocumentPath(source) => Some(source),
             Self::EncodeMessage(source) | Self::DecodeResult(source) => {
                 Some(source)
             }
             Self::MissingPipe { .. }
+            | Self::UnsupportedDocumentSynchronization { .. }
+            | Self::DocumentSynchronizationClosed { .. }
+            | Self::DocumentLanguageChanged { .. }
+            | Self::DocumentVersionOverflow { .. }
             | Self::TransportClosed { .. }
             | Self::RequestCanceled { .. }
             | Self::RequestTimeout { .. }
@@ -478,6 +569,11 @@ impl RunningServer {
         mut self,
         shutdown_timeout: Duration,
     ) -> Result<ShutdownOutcome, LspError> {
+        if let Err(error) = self.active.close_documents().await {
+            let _ = self.force_stop(shutdown_timeout).await;
+            return Err(error);
+        }
+
         let shutdown_response_received = match self
             .active
             .request_value("shutdown", JsonValue::Null, shutdown_timeout)
@@ -565,6 +661,7 @@ struct ActiveServer {
     status: Arc<Mutex<ServerSnapshot>>,
     diagnostics: Arc<Mutex<Vec<JsonValue>>>,
     registrations: Arc<Mutex<BTreeMap<String, JsonValue>>>,
+    documents: Arc<Mutex<DocumentStore>>,
 }
 
 impl ActiveServer {
@@ -585,6 +682,138 @@ impl ActiveServer {
             ))),
             diagnostics: Arc::new(Mutex::new(Vec::new())),
             registrations: Arc::new(Mutex::new(BTreeMap::new())),
+            documents: Arc::new(Mutex::new(DocumentStore::default())),
+        }
+    }
+
+    async fn synchronize_document(
+        &self,
+        file: ProjectFile,
+        language_id: &str,
+    ) -> Result<SynchronizedDocument, LspError> {
+        let snapshot = self.status.lock().await.clone();
+        let sync = DocumentSync::from_capability(snapshot.text_document_sync())
+            .ok_or_else(|| LspError::UnsupportedDocumentSynchronization {
+                server: self.name.clone(),
+                capability: snapshot.text_document_sync().cloned(),
+            })?;
+        let uri = path_to_file_uri(file.absolute());
+        let mut documents = self.documents.lock().await;
+        let text = tokio::fs::read_to_string(file.absolute()).await.map_err(
+            |source| LspError::ReadDocument {
+                path: file.absolute().to_path_buf(),
+                source,
+            },
+        )?;
+        let update = documents
+            .synchronize(
+                file.absolute(),
+                file.relative(),
+                uri,
+                language_id,
+                text,
+                sync.open_close,
+            )
+            .map_err(|error| self.document_store_error(error))?;
+        let document = update.document().clone();
+
+        match update {
+            DocumentUpdate::Opened {
+                document,
+                notify: true,
+            } => {
+                self.send_notification(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": document.uri(),
+                            "languageId": document.language_id(),
+                            "version": document.version(),
+                            "text": document.text(),
+                        },
+                    }),
+                )
+                .await?;
+            }
+            DocumentUpdate::Changed {
+                document,
+                previous_text,
+            } => {
+                let content_change = match sync.kind {
+                    DocumentSyncKind::Full => json!({
+                        "text": document.text(),
+                    }),
+                    DocumentSyncKind::Incremental => json!({
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": document_end_position(
+                                &previous_text,
+                                snapshot.position_encoding(),
+                            ),
+                        },
+                        "text": document.text(),
+                    }),
+                };
+                self.send_notification(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {
+                            "uri": document.uri(),
+                            "version": document.version(),
+                        },
+                        "contentChanges": [content_change],
+                    }),
+                )
+                .await?;
+            }
+            DocumentUpdate::Opened { notify: false, .. }
+            | DocumentUpdate::Unchanged(_) => {}
+        }
+        drop(documents);
+
+        Ok(document)
+    }
+
+    async fn close_documents(&self) -> Result<(), LspError> {
+        let documents = self.documents.lock().await.close_all();
+        for document in documents {
+            self.send_notification(
+                "textDocument/didClose",
+                json!({
+                    "textDocument": {
+                        "uri": document.uri(),
+                    },
+                }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn document_store_error(&self, error: DocumentStoreError) -> LspError {
+        match error {
+            DocumentStoreError::Closed { path } => {
+                LspError::DocumentSynchronizationClosed {
+                    server: self.name.clone(),
+                    path,
+                }
+            }
+            DocumentStoreError::LanguageChanged {
+                path,
+                previous,
+                requested,
+            } => LspError::DocumentLanguageChanged {
+                server: self.name.clone(),
+                path,
+                previous,
+                requested,
+            },
+            DocumentStoreError::VersionOverflow { path } => {
+                LspError::DocumentVersionOverflow {
+                    server: self.name.clone(),
+                    path,
+                }
+            }
         }
     }
 
@@ -654,6 +883,69 @@ impl ActiveServer {
                 server: self.name.clone(),
             })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DocumentSync {
+    open_close: bool,
+    kind: DocumentSyncKind,
+}
+
+impl DocumentSync {
+    fn from_capability(capability: Option<&JsonValue>) -> Option<Self> {
+        let capability = capability?;
+        if let Some(kind) = capability.as_u64() {
+            return DocumentSyncKind::from_number(kind).map(|kind| Self {
+                open_close: true,
+                kind,
+            });
+        }
+
+        let options = capability.as_object()?;
+        let kind = options
+            .get("change")
+            .and_then(JsonValue::as_u64)
+            .and_then(DocumentSyncKind::from_number)?;
+        let open_close = options
+            .get("openClose")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        Some(Self { open_close, kind })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DocumentSyncKind {
+    Full,
+    Incremental,
+}
+
+impl DocumentSyncKind {
+    fn from_number(value: u64) -> Option<Self> {
+        match value {
+            1 => Some(Self::Full),
+            2 => Some(Self::Incremental),
+            _ => None,
+        }
+    }
+}
+
+fn document_end_position(
+    text: &str,
+    position_encoding: Option<&str>,
+) -> JsonValue {
+    let line = text.bytes().filter(|byte| *byte == b'\n').count();
+    let final_line = text.rsplit_once('\n').map_or(text, |(_, line)| line);
+    let character = match position_encoding.unwrap_or("utf-16") {
+        "utf-8" => final_line.len(),
+        "utf-32" => final_line.chars().count(),
+        _ => final_line.encode_utf16().count(),
+    };
+
+    json!({
+        "line": line,
+        "character": character,
+    })
 }
 
 #[derive(Debug)]

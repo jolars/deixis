@@ -132,6 +132,153 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
 }
 
 #[tokio::test]
+async fn synchronizes_full_documents_lazily_and_closes_them()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("document-full", 1_000, 1_000)?;
+    let source = root.join("main.rs");
+    fs::write(&source, "fn answer() -> u8 { 42 }\n")?;
+
+    assert!(!manager.status().await.started());
+    let opened = manager.synchronize_document("main.rs", "rust").await?;
+    assert_eq!(opened.version(), 1);
+    assert!(manager.status().await.started());
+
+    fs::write(&source, "fn answer() -> u8 { 42 }\n")?;
+    manager.synchronize_document(&source, "rust").await?;
+
+    fs::write(&source, "fn answer() -> u8 { 43 }\n")?;
+    manager.synchronize_document("main.rs", "rust").await?;
+    manager.synchronize_document("main.rs", "rust").await?;
+
+    fs::write(&source, "fn answer() -> u8 { 42 }\n")?;
+    manager.synchronize_document("main.rs", "rust").await?;
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert_eq!(probe.open_documents, 1);
+    assert_eq!(probe.events.len(), 3);
+
+    let open = &probe.events[0];
+    assert_eq!(open["method"], "textDocument/didOpen");
+    assert_eq!(open["params"]["textDocument"]["languageId"], "rust");
+    assert_eq!(open["params"]["textDocument"]["version"], 1);
+    assert_eq!(
+        open["params"]["textDocument"]["text"],
+        "fn answer() -> u8 { 42 }\n"
+    );
+    assert!(
+        open["params"]["textDocument"]["uri"]
+            .as_str()
+            .is_some_and(|uri| uri.ends_with("/main.rs"))
+    );
+
+    let first_change = &probe.events[1];
+    assert_eq!(first_change["method"], "textDocument/didChange");
+    assert_eq!(first_change["params"]["textDocument"]["version"], 2);
+    assert_eq!(
+        first_change["params"]["contentChanges"],
+        json!([{ "text": "fn answer() -> u8 { 43 }\n" }])
+    );
+
+    let second_change = &probe.events[2];
+    assert_eq!(second_change["method"], "textDocument/didChange");
+    assert_eq!(second_change["params"]["textDocument"]["version"], 3);
+    assert_eq!(
+        second_change["params"]["contentChanges"],
+        json!([{ "text": "fn answer() -> u8 { 42 }\n" }])
+    );
+
+    fs::write(root.join("helper.rs"), "pub fn helper() {}\n")?;
+    manager.synchronize_document("helper.rs", "rust").await?;
+
+    // The mock rejects shutdown while any synchronized document remains open.
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replaces_incrementally_synchronized_documents_as_one_range()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("document-incremental", 1_000, 1_000)?;
+    let source = root.join("unicode.rs");
+    fs::write(&source, "first line\n🦀x")?;
+
+    manager.synchronize_document(&source, "rust").await?;
+    fs::write(&source, "replacement\n")?;
+    manager.synchronize_document(&source, "rust").await?;
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert_eq!(probe.events.len(), 2);
+    assert_eq!(probe.events[1]["method"], "textDocument/didChange");
+    assert_eq!(
+        probe.events[1]["params"]["contentChanges"],
+        json!([{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 3 },
+            },
+            "text": "replacement\n",
+        }])
+    );
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_non_utf8_documents_without_opening_them()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("document-full", 1_000, 1_000)?;
+    fs::write(root.join("binary.rs"), [0xff, 0xfe])?;
+
+    let error = manager
+        .synchronize_document("binary.rs", "rust")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::ReadDocument { .. }));
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert!(probe.events.is_empty());
+    assert_eq!(probe.open_documents, 0);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_document_sync_when_the_server_does_not_support_it()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("document-none", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "fn main() {}\n")?;
+
+    let error = manager
+        .synchronize_document("main.rs", "rust")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LspError::UnsupportedDocumentSynchronization { .. }
+    ));
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert!(probe.events.is_empty());
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
 {
     let manager = configured_manager("malformed", 1_000, 1_000)?;
@@ -287,4 +434,10 @@ struct ProbeResponse {
     apply_edit_failure_reason: Option<String>,
     show_message_request_result: JsonValue,
     unknown_error_code: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DocumentEventsResponse {
+    events: Vec<JsonValue>,
+    open_documents: usize,
 }
