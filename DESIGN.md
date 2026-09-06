@@ -143,13 +143,18 @@ shutdown_ms = 5000
 outbound_queue_capacity = 64
 max_concurrent_requests = 16
 max_response_bytes = 16777216
+
+[servers.rust.restart]
+max_restarts = 3
+window_ms = 60000
 ```
 
 Bounds apply independently to each configured server. Initialization and
 ordinary requests default to 30 seconds, while graceful shutdown defaults to 5
 seconds. Each server admits at most 16 concurrent requests, buffers at most 64
 outbound messages, and accepts an LSP message body no larger than 16 MiB. Every
-value is configurable and must be greater than zero.
+value is configurable and must be greater than zero. A server may start at most
+three replacement processes within a sliding 60-second window by default.
 
 Extension and glob values are the LSP language IDs used for document
 synchronization. Within one server, a matching glob takes precedence over an
@@ -305,9 +310,16 @@ an unresponsive language server cannot keep the MCP process alive. If the
 shutdown response itself times out, Deixis still sends `exit`, waits for the
 child, and force-kills it when needed.
 
-An unexpected exit fails outstanding calls for that server and records the
-failure. Automatic restart will be bounded and opt-in to the relevant request;
-there will be no unbounded crash loop.
+An unexpected exit fails outstanding calls for that server; those calls are not
+replayed. The next operation routed to the failed server retires and reaps that
+generation before starting a replacement. Document, diagnostic, registration,
+progress, and request state belong to one generation, so the replacement starts
+clean and resynchronizes documents from disk on demand. A per-server sliding
+window admits three replacements in 60 seconds by default. Once exhausted,
+operations fail without spawning another child until an attempt ages out of the
+window. A bounded tail of eight child-stderr lines accompanies server-exit and
+restart-limit errors and appears in restart logs with the configured server
+name.
 
 ### Server-to-client messages
 
@@ -398,7 +410,8 @@ MCP `invalid_params` protocol errors because tool execution has not begun.
 
 When a language server closes stdout, the reader resolves every pending request
 immediately as a server-exit failure. Those calls do not wait for their
-individual request deadlines.
+individual request deadlines. A later request may replace that server within
+its restart budget; it never retries a request whose outcome became uncertain.
 
 ## Repository shape
 

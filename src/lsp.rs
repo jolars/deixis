@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt, io,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -16,10 +16,11 @@ use serde_json::{Value as JsonValue, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdout},
-    sync::{Mutex, Semaphore, mpsc, oneshot},
+    sync::{Mutex, Notify, Semaphore, mpsc, oneshot},
     task::JoinHandle,
     time::{Instant, timeout_at},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -37,11 +38,21 @@ use crate::{
 const JSONRPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+const STDERR_CONTEXT_LINES: usize = 8;
+const STDERR_CLOSE_GRACE: Duration = Duration::from_millis(25);
 
 pub struct LazyLanguageServer {
     config: LanguageServerConfig,
     project: Project,
-    state: Mutex<Option<RunningServer>>,
+    state: Mutex<LifecycleState>,
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    running: Option<RunningServer>,
+    start_attempted: bool,
+    stopped: bool,
+    restart_attempts: VecDeque<Instant>,
 }
 
 impl LazyLanguageServer {
@@ -49,7 +60,7 @@ impl LazyLanguageServer {
         Self {
             config,
             project,
-            state: Mutex::new(None),
+            state: Mutex::new(LifecycleState::default()),
         }
     }
 
@@ -61,15 +72,42 @@ impl LazyLanguageServer {
     where
         T: DeserializeOwned,
     {
-        let active = self.active_server().await?;
+        let cancellation = CancellationToken::new();
+        self.request_with_cancellation(method, params, &cancellation)
+            .await
+    }
+
+    pub(crate) async fn request_with_cancellation<T>(
+        &self,
+        method: &str,
+        params: JsonValue,
+        cancellation: &CancellationToken,
+    ) -> Result<T, LspError>
+    where
+        T: DeserializeOwned,
+    {
+        let active = self.active_server_with_cancellation(cancellation).await?;
         let value = active
-            .request_value(method, params, self.config.timeouts().request())
+            .request_value(
+                method,
+                params,
+                self.config.timeouts().request(),
+                cancellation,
+            )
             .await?;
         serde_json::from_value(value).map_err(LspError::DecodeResult)
     }
 
     pub async fn ensure_started(&self) -> Result<ServerSnapshot, LspError> {
-        let active = self.active_server().await?;
+        let cancellation = CancellationToken::new();
+        self.ensure_started_with_cancellation(&cancellation).await
+    }
+
+    pub(crate) async fn ensure_started_with_cancellation(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<ServerSnapshot, LspError> {
+        let active = self.active_server_with_cancellation(cancellation).await?;
         Ok(active.snapshot().await)
     }
 
@@ -92,11 +130,23 @@ impl LazyLanguageServer {
         language_id: &str,
         position: Position,
     ) -> Result<Option<Hover>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.hover_with_cancellation(path, language_id, position, &cancellation)
+            .await
+    }
+
+    pub(crate) async fn hover_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Hover>, LspError> {
         let file = self
             .project
             .resolve_file(path)
             .map_err(LspError::DocumentPath)?;
-        let active = self.active_server().await?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
         let snapshot = active.status.lock().await.clone();
         if !active
             .supports_method(
@@ -128,6 +178,7 @@ impl LazyLanguageServer {
                     "position": lsp_position,
                 }),
                 self.config.timeouts().request(),
+                cancellation,
             )
             .await?;
         let mut hover: Option<Hover> =
@@ -155,12 +206,30 @@ impl LazyLanguageServer {
         language_id: &str,
         position: Position,
     ) -> Result<Vec<DefinitionLocation>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.definition_with_cancellation(
+            path,
+            language_id,
+            position,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn definition_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
         self.location_request(
             path,
             language_id,
             position,
             "textDocument/definition",
             "definitionProvider",
+            cancellation,
         )
         .await
     }
@@ -171,12 +240,30 @@ impl LazyLanguageServer {
         language_id: &str,
         position: Position,
     ) -> Result<Vec<DefinitionLocation>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.declaration_with_cancellation(
+            path,
+            language_id,
+            position,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn declaration_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
         self.location_request(
             path,
             language_id,
             position,
             "textDocument/declaration",
             "declarationProvider",
+            cancellation,
         )
         .await
     }
@@ -187,12 +274,30 @@ impl LazyLanguageServer {
         language_id: &str,
         position: Position,
     ) -> Result<Vec<DefinitionLocation>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.type_definition_with_cancellation(
+            path,
+            language_id,
+            position,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn type_definition_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
         self.location_request(
             path,
             language_id,
             position,
             "textDocument/typeDefinition",
             "typeDefinitionProvider",
+            cancellation,
         )
         .await
     }
@@ -203,12 +308,30 @@ impl LazyLanguageServer {
         language_id: &str,
         position: Position,
     ) -> Result<Vec<DefinitionLocation>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.implementation_with_cancellation(
+            path,
+            language_id,
+            position,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn implementation_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
         self.location_request(
             path,
             language_id,
             position,
             "textDocument/implementation",
             "implementationProvider",
+            cancellation,
         )
         .await
     }
@@ -220,11 +343,30 @@ impl LazyLanguageServer {
         position: Position,
         include_declaration: bool,
     ) -> Result<Vec<ReferenceLocation>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.references_with_cancellation(
+            path,
+            language_id,
+            position,
+            include_declaration,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn references_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        include_declaration: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ReferenceLocation>, LspError> {
         let file = self
             .project
             .resolve_file(path)
             .map_err(LspError::DocumentPath)?;
-        let active = self.active_server().await?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
         let snapshot = active.status.lock().await.clone();
         if !active
             .supports_method(
@@ -259,6 +401,7 @@ impl LazyLanguageServer {
                     },
                 }),
                 self.config.timeouts().request(),
+                cancellation,
             )
             .await?;
         let response: Option<Vec<Location>> =
@@ -291,13 +434,28 @@ impl LazyLanguageServer {
         path: impl AsRef<Path>,
         language_id: &str,
     ) -> Result<Vec<DocumentSymbol>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.document_symbols_with_cancellation(
+            path,
+            language_id,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn document_symbols_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DocumentSymbol>, LspError> {
         const METHOD: &str = "textDocument/documentSymbol";
 
         let file = self
             .project
             .resolve_file(path)
             .map_err(LspError::DocumentPath)?;
-        let active = self.active_server().await?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
         let snapshot = active.status.lock().await.clone();
         if !active
             .supports_method(
@@ -318,6 +476,7 @@ impl LazyLanguageServer {
                 METHOD,
                 json!({ "textDocument": { "uri": document.uri() } }),
                 self.config.timeouts().request(),
+                cancellation,
             )
             .await?;
         let response: Option<RawDocumentSymbolResponse> =
@@ -369,11 +528,26 @@ impl LazyLanguageServer {
         path: impl AsRef<Path>,
         language_id: &str,
     ) -> Result<DiagnosticReport, LspError> {
+        let cancellation = CancellationToken::new();
+        self.document_diagnostics_with_cancellation(
+            path,
+            language_id,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn document_diagnostics_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<DiagnosticReport, LspError> {
         let file = self
             .project
             .resolve_file(path)
             .map_err(LspError::DocumentPath)?;
-        let active = self.active_server().await?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
         let snapshot = active.status.lock().await.clone();
         let pull_provider = active
             .diagnostic_provider(
@@ -391,6 +565,7 @@ impl LazyLanguageServer {
                     encoding,
                     provider.identifier.as_deref(),
                     self.config.timeouts().request(),
+                    cancellation,
                 )
                 .await
         } else {
@@ -402,9 +577,19 @@ impl LazyLanguageServer {
         &self,
         query: &str,
     ) -> Result<Vec<WorkspaceSymbol>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.workspace_symbols_with_cancellation(query, &cancellation)
+            .await
+    }
+
+    pub(crate) async fn workspace_symbols_with_cancellation(
+        &self,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<WorkspaceSymbol>, LspError> {
         const METHOD: &str = "workspace/symbol";
 
-        let active = self.active_server().await?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
         let snapshot = active.status.lock().await.clone();
         if !active
             .supports_method(
@@ -424,6 +609,7 @@ impl LazyLanguageServer {
                 METHOD,
                 json!({ "query": query }),
                 self.config.timeouts().request(),
+                cancellation,
             )
             .await?;
         let response: Option<Vec<RawWorkspaceSymbol>> =
@@ -466,12 +652,13 @@ impl LazyLanguageServer {
         position: Position,
         method: &'static str,
         capability: &'static str,
+        cancellation: &CancellationToken,
     ) -> Result<Vec<DefinitionLocation>, LspError> {
         let file = self
             .project
             .resolve_file(path)
             .map_err(LspError::DocumentPath)?;
-        let active = self.active_server().await?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
         let snapshot = active.status.lock().await.clone();
         if !active
             .supports_method(method, snapshot.capabilities().get(capability))
@@ -500,6 +687,7 @@ impl LazyLanguageServer {
                     "position": lsp_position,
                 }),
                 self.config.timeouts().request(),
+                cancellation,
             )
             .await?;
         let response: Option<LocationResponse> =
@@ -628,7 +816,7 @@ impl LazyLanguageServer {
     pub async fn status(&self) -> ServerSnapshot {
         let active = {
             let state = self.state.lock().await;
-            state.as_ref().map(|running| running.active.clone())
+            state.running.as_ref().map(|running| running.active.clone())
         };
 
         match active {
@@ -640,7 +828,7 @@ impl LazyLanguageServer {
     pub async fn diagnostics(&self) -> Vec<JsonValue> {
         let active = {
             let state = self.state.lock().await;
-            state.as_ref().map(|running| running.active.clone())
+            state.running.as_ref().map(|running| running.active.clone())
         };
 
         match active {
@@ -652,7 +840,7 @@ impl LazyLanguageServer {
     pub async fn dynamic_registrations(&self) -> Vec<JsonValue> {
         let active = {
             let state = self.state.lock().await;
-            state.as_ref().map(|running| running.active.clone())
+            state.running.as_ref().map(|running| running.active.clone())
         };
 
         match active {
@@ -668,9 +856,20 @@ impl LazyLanguageServer {
     }
 
     pub async fn shutdown(&self) -> Result<ShutdownOutcome, LspError> {
-        let running = self.state.lock().await.take();
+        let running = {
+            let mut state = self.state.lock().await;
+            state.stopped = true;
+            state.running.take()
+        };
 
         match running {
+            Some(running)
+                if running.active.transport_failure().await.is_some() =>
+            {
+                running
+                    .stop_after_failure(self.config.timeouts().shutdown())
+                    .await
+            }
             Some(running) => {
                 running.shutdown(self.config.timeouts().shutdown()).await
             }
@@ -679,14 +878,82 @@ impl LazyLanguageServer {
     }
 
     async fn active_server(&self) -> Result<ActiveServer, LspError> {
+        let cancellation = CancellationToken::new();
+        self.active_server_with_cancellation(&cancellation).await
+    }
+
+    async fn active_server_with_cancellation(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<ActiveServer, LspError> {
         let mut state = self.state.lock().await;
-        if let Some(running) = state.as_ref() {
+        if state.stopped {
+            return Err(LspError::TransportClosed {
+                server: self.config.name().to_owned(),
+            });
+        }
+
+        let failure = match state.running.as_ref() {
+            Some(running) => running.active.transport_failure().await,
+            None => None,
+        };
+        if failure.is_none()
+            && let Some(running) = state.running.as_ref()
+        {
             return Ok(running.active.clone());
         }
 
-        let running = RunningServer::spawn(&self.config, &self.project).await?;
+        let restarting = state.start_attempted;
+        if restarting {
+            let now = Instant::now();
+            let restart = self.config.restart();
+            while state.restart_attempts.front().is_some_and(|attempt| {
+                now.duration_since(*attempt) >= restart.window()
+            }) {
+                state.restart_attempts.pop_front();
+            }
+            if state.restart_attempts.len() >= restart.max_restarts() {
+                let stderr = match state.running.as_ref() {
+                    Some(running) => running.active.stderr_context().await,
+                    None => None,
+                };
+                warn!(
+                    server = %self.config.name(),
+                    max_restarts = restart.max_restarts(),
+                    window_ms = restart.window().as_millis(),
+                    stderr = stderr.as_deref().unwrap_or("<none>"),
+                    "language server restart limit reached"
+                );
+                return Err(LspError::RestartLimitReached {
+                    server: self.config.name().to_owned(),
+                    max_restarts: restart.max_restarts(),
+                    window: restart.window(),
+                    stderr,
+                });
+            }
+            state.restart_attempts.push_back(now);
+        }
+
+        if let Some(running) = state.running.take() {
+            let stderr = running.active.stderr_context().await;
+            warn!(
+                server = %self.config.name(),
+                restart_attempt = state.restart_attempts.len(),
+                failure = ?failure,
+                stderr = stderr.as_deref().unwrap_or("<none>"),
+                "restarting language server after transport failure"
+            );
+            running
+                .stop_after_failure(self.config.timeouts().shutdown())
+                .await?;
+        }
+
+        state.start_attempted = true;
+        let running =
+            RunningServer::spawn(&self.config, &self.project, cancellation)
+                .await?;
         let active = running.active.clone();
-        *state = Some(running);
+        state.running = Some(running);
         Ok(active)
     }
 }
@@ -1665,6 +1932,13 @@ pub enum LspError {
     ServerExited {
         server: String,
         method: String,
+        stderr: Option<String>,
+    },
+    RestartLimitReached {
+        server: String,
+        max_restarts: usize,
+        window: Duration,
+        stderr: Option<String>,
     },
     ResponseTooLarge {
         server: String,
@@ -1787,10 +2061,30 @@ impl fmt::Display for LspError {
                 formatter,
                 "language server `{server}` outbound queue reached its capacity of {capacity} messages"
             ),
-            Self::ServerExited { server, method } => write!(
-                formatter,
-                "language server `{server}` exited while request `{method}` was pending"
-            ),
+            Self::ServerExited {
+                server,
+                method,
+                stderr,
+            } => {
+                write!(
+                    formatter,
+                    "language server `{server}` exited while request `{method}` was pending"
+                )?;
+                write_stderr_context(formatter, stderr)
+            }
+            Self::RestartLimitReached {
+                server,
+                max_restarts,
+                window,
+                stderr,
+            } => {
+                write!(
+                    formatter,
+                    "language server `{server}` reached its limit of {max_restarts} restarts within {} ms",
+                    window.as_millis()
+                )?;
+                write_stderr_context(formatter, stderr)
+            }
             Self::ResponseTooLarge {
                 server,
                 method,
@@ -1861,11 +2155,66 @@ impl Error for LspError {
             | Self::TransportClosed { .. }
             | Self::OutboundQueueFull { .. }
             | Self::ServerExited { .. }
+            | Self::RestartLimitReached { .. }
             | Self::ResponseTooLarge { .. }
             | Self::RequestCanceled { .. }
             | Self::RequestTimeout { .. }
             | Self::ResponseError { .. } => None,
         }
+    }
+}
+
+fn write_stderr_context(
+    formatter: &mut fmt::Formatter<'_>,
+    stderr: &Option<String>,
+) -> fmt::Result {
+    if let Some(stderr) = stderr {
+        write!(formatter, "; recent stderr: {stderr}")?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    lines: Mutex<VecDeque<String>>,
+    closed: AtomicBool,
+    closed_notify: Notify,
+}
+
+impl StderrCapture {
+    async fn push(&self, line: String) {
+        let mut lines = self.lines.lock().await;
+        if lines.len() == STDERR_CONTEXT_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.closed_notify.notify_waiters();
+    }
+
+    async fn wait_closed(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.closed_notify.notified();
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = tokio::time::timeout(STDERR_CLOSE_GRACE, notified).await;
+    }
+
+    async fn recent(&self) -> Option<String> {
+        let lines = self.lines.lock().await;
+        (!lines.is_empty()).then(|| {
+            lines
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
     }
 }
 
@@ -1881,6 +2230,7 @@ impl RunningServer {
     async fn spawn(
         config: &LanguageServerConfig,
         project: &Project,
+        cancellation: &CancellationToken,
     ) -> Result<Self, LspError> {
         let mut command = config.to_command();
         command
@@ -1912,7 +2262,13 @@ impl RunningServer {
 
         let (sender, receiver) =
             mpsc::channel(config.limits().outbound_queue_capacity());
-        let active = ActiveServer::new(config, project.root(), sender);
+        let stderr_capture = Arc::new(StderrCapture::default());
+        let active = ActiveServer::new(
+            config,
+            project.root(),
+            sender,
+            Arc::clone(&stderr_capture),
+        );
         let writer_task = tokio::spawn(writer_loop(
             config.name().to_owned(),
             stdin,
@@ -1923,9 +2279,13 @@ impl RunningServer {
             stdout,
             active.clone(),
             config.limits().max_response_bytes(),
+            Arc::clone(&stderr_capture),
         ));
-        let stderr_task =
-            tokio::spawn(stderr_loop(config.name().to_owned(), stderr));
+        let stderr_task = tokio::spawn(stderr_loop(
+            config.name().to_owned(),
+            stderr,
+            stderr_capture,
+        ));
 
         let mut running = Self {
             active,
@@ -1935,8 +2295,17 @@ impl RunningServer {
             writer_task,
         };
 
-        if let Err(error) = running.initialize(config, project).await {
+        if let Err(error) =
+            running.initialize(config, project, cancellation).await
+        {
             let _ = running.force_stop(config.timeouts().shutdown()).await;
+            let stderr = running.active.stderr_context().await;
+            warn!(
+                server = %config.name(),
+                %error,
+                stderr = stderr.as_deref().unwrap_or("<none>"),
+                "language server startup failed"
+            );
             return Err(error);
         }
 
@@ -1947,13 +2316,14 @@ impl RunningServer {
         &mut self,
         config: &LanguageServerConfig,
         project: &Project,
+        cancellation: &CancellationToken,
     ) -> Result<(), LspError> {
         let startup_timeout = config.timeouts().startup();
         let params = initialize_params(config, project);
         let deadline = Instant::now() + startup_timeout;
         let initialize_result = self
             .active
-            .request_value("initialize", params, startup_timeout)
+            .request_value("initialize", params, startup_timeout, cancellation)
             .await?;
         let snapshot =
             ServerSnapshot::initialized(config.name(), &initialize_result)?;
@@ -1992,7 +2362,12 @@ impl RunningServer {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let shutdown_response_received = match self
             .active
-            .request_value("shutdown", JsonValue::Null, remaining)
+            .request_value(
+                "shutdown",
+                JsonValue::Null,
+                remaining,
+                &CancellationToken::new(),
+            )
             .await
         {
             Ok(_) => true,
@@ -2013,6 +2388,16 @@ impl RunningServer {
             forced,
             exit_status,
         ))
+    }
+
+    async fn stop_after_failure(
+        mut self,
+        shutdown_timeout: Duration,
+    ) -> Result<ShutdownOutcome, LspError> {
+        let outcome = self.force_stop(shutdown_timeout).await?;
+        *self.active.status.lock().await =
+            ServerSnapshot::not_started(&self.active.name);
+        Ok(outcome)
     }
 
     async fn force_stop(
@@ -2110,6 +2495,7 @@ struct ActiveServer {
     diagnostics: Arc<Mutex<DiagnosticCache>>,
     registrations: Arc<Mutex<BTreeMap<String, JsonValue>>>,
     documents: Arc<Mutex<DocumentStore>>,
+    stderr_capture: Arc<StderrCapture>,
 }
 
 type PendingRequestSender =
@@ -2127,6 +2513,7 @@ impl ActiveServer {
         config: &LanguageServerConfig,
         project_root: &Path,
         sender: mpsc::Sender<Vec<u8>>,
+        stderr_capture: Arc<StderrCapture>,
     ) -> Self {
         Self {
             name: config.name().to_owned(),
@@ -2146,7 +2533,16 @@ impl ActiveServer {
             diagnostics: Arc::new(Mutex::new(DiagnosticCache::default())),
             registrations: Arc::new(Mutex::new(BTreeMap::new())),
             documents: Arc::new(Mutex::new(DocumentStore::default())),
+            stderr_capture,
         }
+    }
+
+    async fn transport_failure(&self) -> Option<PendingRequestError> {
+        self.requests.lock().await.failure
+    }
+
+    async fn stderr_context(&self) -> Option<String> {
+        self.stderr_capture.recent().await
     }
 
     async fn snapshot(&self) -> ServerSnapshot {
@@ -2310,6 +2706,7 @@ impl ActiveServer {
         encoding: PositionEncoding,
         identifier: Option<&str>,
         request_timeout: Duration,
+        cancellation: &CancellationToken,
     ) -> Result<DiagnosticReport, LspError> {
         let previous_result_id = self
             .diagnostics
@@ -2329,7 +2726,12 @@ impl ActiveServer {
         }
 
         let response = self
-            .request_value("textDocument/diagnostic", params, request_timeout)
+            .request_value(
+                "textDocument/diagnostic",
+                params,
+                request_timeout,
+                cancellation,
+            )
             .await?;
         let response: DocumentDiagnosticReport =
             serde_json::from_value(response).map_err(LspError::DecodeResult)?;
@@ -2490,31 +2892,49 @@ impl ActiveServer {
         method: &str,
         params: JsonValue,
         request_timeout: Duration,
+        cancellation: &CancellationToken,
     ) -> Result<JsonValue, LspError> {
+        if cancellation.is_cancelled() {
+            return Err(LspError::RequestCanceled {
+                server: self.name.clone(),
+                method: method.to_owned(),
+            });
+        }
         let deadline = Instant::now() + request_timeout;
-        let _permit =
-            match timeout_at(deadline, self.request_permits.acquire()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => {
-                    return Err(LspError::TransportClosed {
-                        server: self.name.clone(),
-                    });
+        let _permit = tokio::select! {
+            biased;
+            permit = self.request_permits.acquire() => {
+                match permit {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return Err(LspError::TransportClosed {
+                            server: self.name.clone(),
+                        });
+                    }
                 }
-                Err(_) => {
-                    return Err(LspError::RequestTimeout {
-                        server: self.name.clone(),
-                        method: method.to_owned(),
-                        timeout: request_timeout,
-                    });
-                }
-            };
+            }
+            _ = cancellation.cancelled() => {
+                return Err(LspError::RequestCanceled {
+                    server: self.name.clone(),
+                    method: method.to_owned(),
+                });
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(LspError::RequestTimeout {
+                    server: self.name.clone(),
+                    method: method.to_owned(),
+                    timeout: request_timeout,
+                });
+            }
+        };
 
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let (sender, receiver) = oneshot::channel();
+        let (sender, mut receiver) = oneshot::channel();
         {
             let mut requests = self.requests.lock().await;
             if let Some(failure) = requests.failure {
-                return Err(failure.into_lsp_error(&self.name, method));
+                drop(requests);
+                return Err(self.pending_error(failure, method).await);
             }
             requests.pending.insert(id, sender);
         }
@@ -2530,26 +2950,67 @@ impl ActiveServer {
             return Err(error);
         }
 
-        match timeout_at(deadline, receiver).await {
-            Ok(Ok(Ok(response))) => {
-                response.into_result(&self.name, method.to_owned())
+        tokio::select! {
+            biased;
+            response = &mut receiver => match response {
+                Ok(Ok(response)) => {
+                    response.into_result(&self.name, method.to_owned())
+                }
+                Ok(Err(error)) => {
+                    Err(self.pending_error(error, method).await)
+                }
+                Err(_) => Err(LspError::RequestCanceled {
+                    server: self.name.clone(),
+                    method: method.to_owned(),
+                }),
+            },
+            _ = cancellation.cancelled() => {
+                self.cancel_pending_request(id, method).await;
+                Err(LspError::RequestCanceled {
+                    server: self.name.clone(),
+                    method: method.to_owned(),
+                })
             }
-            Ok(Ok(Err(error))) => Err(error.into_lsp_error(&self.name, method)),
-            Ok(Err(_)) => Err(LspError::RequestCanceled {
-                server: self.name.clone(),
-                method: method.to_owned(),
-            }),
-            Err(_) => {
-                self.requests.lock().await.pending.remove(&id);
-                let _ = self
-                    .send_notification("$/cancelRequest", json!({ "id": id }))
-                    .await;
+            _ = tokio::time::sleep_until(deadline) => {
+                self.cancel_pending_request(id, method).await;
                 Err(LspError::RequestTimeout {
                     server: self.name.clone(),
                     method: method.to_owned(),
                     timeout: request_timeout,
                 })
             }
+        }
+    }
+
+    async fn pending_error(
+        &self,
+        error: PendingRequestError,
+        method: &str,
+    ) -> LspError {
+        let stderr = match error {
+            PendingRequestError::ServerExited => {
+                self.stderr_capture.wait_closed().await;
+                self.stderr_context().await
+            }
+            PendingRequestError::ResponseTooLarge { .. } => None,
+        };
+        error.into_lsp_error(&self.name, method, stderr)
+    }
+
+    async fn cancel_pending_request(&self, id: u64, method: &str) {
+        let pending = self.requests.lock().await.pending.remove(&id);
+        if pending.is_some()
+            && let Err(error) = self
+                .send_notification("$/cancelRequest", json!({ "id": id }))
+                .await
+        {
+            warn!(
+                server = %self.name,
+                request_id = id,
+                method,
+                %error,
+                "failed to forward LSP request cancellation"
+            );
         }
     }
 
@@ -2653,11 +3114,17 @@ enum PendingRequestError {
 }
 
 impl PendingRequestError {
-    fn into_lsp_error(self, server: &str, method: &str) -> LspError {
+    fn into_lsp_error(
+        self,
+        server: &str,
+        method: &str,
+        stderr: Option<String>,
+    ) -> LspError {
         match self {
             Self::ServerExited => LspError::ServerExited {
                 server: server.to_owned(),
                 method: method.to_owned(),
+                stderr,
             },
             Self::ResponseTooLarge {
                 response_bytes,
@@ -2732,6 +3199,7 @@ async fn reader_loop(
     stdout: ChildStdout,
     active: ActiveServer,
     max_response_bytes: usize,
+    stderr_capture: Arc<StderrCapture>,
 ) {
     let mut reader = BufReader::new(stdout);
 
@@ -2774,6 +3242,8 @@ async fn reader_loop(
         }
     };
 
+    stderr_capture.wait_closed().await;
+
     let pending = {
         let mut requests = active.requests.lock().await;
         requests.failure = Some(failure);
@@ -2784,7 +3254,11 @@ async fn reader_loop(
     }
 }
 
-async fn stderr_loop(server: String, stderr: ChildStderr) {
+async fn stderr_loop(
+    server: String,
+    stderr: ChildStderr,
+    capture: Arc<StderrCapture>,
+) {
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
 
@@ -2793,9 +3267,11 @@ async fn stderr_loop(server: String, stderr: ChildStderr) {
         match reader.read_line(&mut line).await {
             Ok(0) => break,
             Ok(_) => {
+                let message = line.trim_end().to_owned();
+                capture.push(message.clone()).await;
                 info!(
                     server = %server,
-                    message = %line.trim_end(),
+                    message,
                     "language server stderr"
                 );
             }
@@ -2805,6 +3281,7 @@ async fn stderr_loop(server: String, stderr: ChildStderr) {
             }
         }
     }
+    capture.close();
 }
 
 async fn handle_incoming_message(
@@ -3372,7 +3849,7 @@ async fn read_lsp_message(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{path::Path, sync::Arc};
 
     use serde_json::{Value as JsonValue, json};
     use tokio::sync::mpsc;
@@ -3381,7 +3858,7 @@ mod tests {
 
     use super::{
         ActiveServer, Hover, LspError, ReadinessSource, ReadinessState,
-        ReadinessTracker, ServerStatus,
+        ReadinessTracker, ServerStatus, StderrCapture,
     };
 
     #[tokio::test]
@@ -3401,7 +3878,12 @@ max_concurrent_requests = 2
         let server = config.server("test").unwrap();
         let (sender, _receiver) =
             mpsc::channel(server.limits().outbound_queue_capacity());
-        let active = ActiveServer::new(server, Path::new("/project"), sender);
+        let active = ActiveServer::new(
+            server,
+            Path::new("/project"),
+            sender,
+            Arc::new(StderrCapture::default()),
+        );
 
         assert_eq!(active.request_permits.available_permits(), 2);
         active

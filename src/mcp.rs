@@ -14,6 +14,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::{
@@ -179,28 +180,38 @@ impl ServerHandler for DeixisServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         match request.name.as_ref() {
-            SERVER_STATUS_TOOL => self.call_server_status(&request).await,
-            HOVER_TOOL => self.call_hover(request).await,
+            SERVER_STATUS_TOOL => {
+                self.call_server_status(&request, &context.ct).await
+            }
+            HOVER_TOOL => self.call_hover(request, &context.ct).await,
             DECLARATION_TOOL => {
-                self.call_location(request, DECLARATION_SPEC).await
+                self.call_location(request, DECLARATION_SPEC, &context.ct)
+                    .await
             }
             DEFINITION_TOOL => {
-                self.call_location(request, DEFINITION_SPEC).await
+                self.call_location(request, DEFINITION_SPEC, &context.ct)
+                    .await
             }
             TYPE_DEFINITION_TOOL => {
-                self.call_location(request, TYPE_DEFINITION_SPEC).await
+                self.call_location(request, TYPE_DEFINITION_SPEC, &context.ct)
+                    .await
             }
             IMPLEMENTATION_TOOL => {
-                self.call_location(request, IMPLEMENTATION_SPEC).await
+                self.call_location(request, IMPLEMENTATION_SPEC, &context.ct)
+                    .await
             }
-            REFERENCES_TOOL => self.call_references(request).await,
-            DIAGNOSTICS_TOOL => self.call_diagnostics(request).await,
-            DOCUMENT_SYMBOLS_TOOL => self.call_document_symbols(request).await,
+            REFERENCES_TOOL => self.call_references(request, &context.ct).await,
+            DIAGNOSTICS_TOOL => {
+                self.call_diagnostics(request, &context.ct).await
+            }
+            DOCUMENT_SYMBOLS_TOOL => {
+                self.call_document_symbols(request, &context.ct).await
+            }
             WORKSPACE_SYMBOLS_TOOL => {
-                self.call_workspace_symbols(request).await
+                self.call_workspace_symbols(request, &context.ct).await
             }
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
@@ -211,6 +222,7 @@ impl DeixisServer {
     async fn call_server_status(
         &self,
         request: &CallToolRequestParams,
+        cancellation: &CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         let arguments = serde_json::from_value::<ServerStatusArguments>(
             JsonValue::Object(request.arguments.clone().unwrap_or_default()),
@@ -249,7 +261,10 @@ impl DeixisServer {
         };
 
         let status = if arguments.start {
-            match language_server.ensure_started().await {
+            match language_server
+                .ensure_started_with_cancellation(cancellation)
+                .await
+            {
                 Ok(status) => status,
                 Err(error) => {
                     return Ok(error_result(ToolError::from_lsp(
@@ -273,6 +288,7 @@ impl DeixisServer {
     async fn call_hover(
         &self,
         request: CallToolRequestParams,
+        cancellation: &CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         let arguments = request.arguments.unwrap_or_default();
         let arguments = serde_json::from_value::<HoverArguments>(
@@ -327,7 +343,12 @@ impl DeixisServer {
             .expect("every validated server should have a lifecycle manager");
 
         let hover = match language_server
-            .hover(file.absolute(), route.language_id(), arguments.position)
+            .hover_with_cancellation(
+                file.absolute(),
+                route.language_id(),
+                arguments.position,
+                cancellation,
+            )
             .await
         {
             Ok(hover) => hover,
@@ -377,6 +398,7 @@ impl DeixisServer {
         &self,
         request: CallToolRequestParams,
         spec: LocationToolSpec,
+        cancellation: &CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         let arguments = request.arguments.unwrap_or_default();
         let arguments = serde_json::from_value::<LocationArguments>(
@@ -433,37 +455,41 @@ impl DeixisServer {
         let locations = match spec.operation {
             LocationOperation::Declaration => {
                 language_server
-                    .declaration(
+                    .declaration_with_cancellation(
                         file.absolute(),
                         route.language_id(),
                         arguments.position,
+                        cancellation,
                     )
                     .await
             }
             LocationOperation::Definition => {
                 language_server
-                    .definition(
+                    .definition_with_cancellation(
                         file.absolute(),
                         route.language_id(),
                         arguments.position,
+                        cancellation,
                     )
                     .await
             }
             LocationOperation::TypeDefinition => {
                 language_server
-                    .type_definition(
+                    .type_definition_with_cancellation(
                         file.absolute(),
                         route.language_id(),
                         arguments.position,
+                        cancellation,
                     )
                     .await
             }
             LocationOperation::Implementation => {
                 language_server
-                    .implementation(
+                    .implementation_with_cancellation(
                         file.absolute(),
                         route.language_id(),
                         arguments.position,
+                        cancellation,
                     )
                     .await
             }
@@ -512,6 +538,7 @@ impl DeixisServer {
     async fn call_references(
         &self,
         request: CallToolRequestParams,
+        cancellation: &CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         const METHOD: &str = "textDocument/references";
 
@@ -568,11 +595,12 @@ impl DeixisServer {
             .expect("every validated server should have a lifecycle manager");
 
         let references = match language_server
-            .references(
+            .references_with_cancellation(
                 file.absolute(),
                 route.language_id(),
                 arguments.position,
                 arguments.include_declaration,
+                cancellation,
             )
             .await
         {
@@ -621,6 +649,7 @@ impl DeixisServer {
     async fn call_diagnostics(
         &self,
         request: CallToolRequestParams,
+        cancellation: &CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         const METHOD: &str = "textDocument/diagnostic";
 
@@ -676,7 +705,11 @@ impl DeixisServer {
             .get(route.server().name())
             .expect("every validated server should have a lifecycle manager");
         let report = match language_server
-            .document_diagnostics(file.absolute(), route.language_id())
+            .document_diagnostics_with_cancellation(
+                file.absolute(),
+                route.language_id(),
+                cancellation,
+            )
             .await
         {
             Ok(report) => report,
@@ -755,6 +788,7 @@ impl DeixisServer {
     async fn call_document_symbols(
         &self,
         request: CallToolRequestParams,
+        cancellation: &CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         const METHOD: &str = "textDocument/documentSymbol";
 
@@ -810,7 +844,11 @@ impl DeixisServer {
             .expect("every validated server should have a lifecycle manager");
 
         let symbols = match language_server
-            .document_symbols(file.absolute(), route.language_id())
+            .document_symbols_with_cancellation(
+                file.absolute(),
+                route.language_id(),
+                cancellation,
+            )
             .await
         {
             Ok(symbols) => symbols,
@@ -856,6 +894,7 @@ impl DeixisServer {
     async fn call_workspace_symbols(
         &self,
         request: CallToolRequestParams,
+        cancellation: &CancellationToken,
     ) -> Result<CallToolResponse, McpError> {
         const METHOD: &str = "workspace/symbol";
 
@@ -884,8 +923,11 @@ impl DeixisServer {
             let name = name.clone();
             let language_server = Arc::clone(language_server);
             let query = arguments.query.clone();
+            let cancellation = cancellation.clone();
             tasks.spawn(async move {
-                let result = language_server.workspace_symbols(&query).await;
+                let result = language_server
+                    .workspace_symbols_with_cancellation(&query, &cancellation)
+                    .await;
                 (name, result)
             });
         }
@@ -1090,6 +1132,7 @@ impl ToolError {
             | LspError::DocumentVersionOverflow { server, .. }
             | LspError::TransportClosed { server }
             | LspError::OutboundQueueFull { server, .. }
+            | LspError::RestartLimitReached { server, .. }
             | LspError::Shutdown { server, .. } => {
                 result.server = Some(server.clone());
             }
@@ -1097,7 +1140,7 @@ impl ToolError {
                 result.server = Some(server.clone());
                 result.method = Some((*method).to_owned());
             }
-            LspError::ServerExited { server, method }
+            LspError::ServerExited { server, method, .. }
             | LspError::ResponseTooLarge { server, method, .. }
             | LspError::RequestCanceled { server, method } => {
                 result.server = Some(server.clone());
@@ -1147,9 +1190,9 @@ fn lsp_error_code(error: &LspError) -> &'static str {
         | LspError::UnsupportedPositionEncoding { .. }
         | LspError::UnsupportedCapability { .. } => "unsupported_capability",
         LspError::RequestTimeout { .. } => "request_timeout",
-        LspError::TransportClosed { .. } | LspError::ServerExited { .. } => {
-            "server_exited"
-        }
+        LspError::TransportClosed { .. }
+        | LspError::ServerExited { .. }
+        | LspError::RestartLimitReached { .. } => "server_exited",
         LspError::OutboundQueueFull { .. } => "server_busy",
         LspError::ResponseError { .. } => "lsp_error",
         LspError::Spawn { .. } | LspError::MissingPipe { .. } => {

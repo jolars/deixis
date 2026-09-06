@@ -102,6 +102,10 @@ shutdown_ms = 5000
 outbound_queue_capacity = 64
 max_concurrent_requests = 16
 max_response_bytes = 16777216
+
+[servers.rust.restart]
+max_restarts = 3
+window_ms = 60000
 ```
 
 Every bound is per language server. The defaults are:
@@ -114,11 +118,22 @@ Every bound is per language server. The defaults are:
 | `limits.outbound_queue_capacity` | 64 messages | Buffered messages waiting for child stdin. |
 | `limits.max_concurrent_requests` | 16 requests | In-flight requests, including requests waiting for responses. |
 | `limits.max_response_bytes` | 16 MiB | Largest accepted LSP `Content-Length` body. |
+| `restart.max_restarts` | 3 restarts | Replacement processes allowed within the restart window. |
+| `restart.window_ms` | 60,000 ms | Sliding window used to detect a crash loop. |
 
 All values must be greater than zero. A full outbound queue fails the operation
 instead of accumulating more memory. A response over the configured limit is a
 protocol error and makes that language-server transport unusable; shutdown then
 terminates the child within its configured bound.
+
+An unexpected exit fails requests that were already in flight; Deixis does not
+replay them. The next operation routed to that server retires the failed child
+and starts a fresh generation. At most three replacement processes start in any
+60-second window by default. Once that limit is reached, later operations fail
+without spawning another child until the window advances. Restarted servers
+reopen documents from disk as each operation needs them. Failure messages retain
+the last eight child-stderr lines, and restart diagnostics write the same bounded
+context to Deixis stderr with the configured server name.
 
 Configured commands are executed directly, never through a shell, and no
 command is inferred from project contents. Each server starts only when a routed
@@ -186,7 +201,7 @@ protocol errors.
 
 Startup sends `initialize` and `initialized` within the configured startup
 deadline, records reported capabilities, correlates request IDs, forwards
-timeout cancellation with `$/cancelRequest`,
+MCP client and timeout cancellation with `$/cancelRequest`,
 handles common server-to-client workspace messages, tracks dynamic registration
 state, tracks work-done progress and rust-analyzer server status, fails pending
 requests when a server exits, logs malformed server output without stopping the

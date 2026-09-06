@@ -9,14 +9,18 @@ use std::{
 
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, CallToolResult, ServerCapabilities},
+    model::{
+        CallToolRequestParams, CallToolResult, ClientRequest, Request,
+        ServerCapabilities,
+    },
+    service::PeerRequestOptions,
     transport::TokioChildProcess,
 };
 use serde_json::{Value as JsonValue, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout, Command},
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 mod support;
@@ -619,6 +623,79 @@ async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
 }
 
 #[tokio::test]
+async fn one_server_failure_does_not_block_or_corrupt_another_server()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("workspace-symbol-failure-isolation")?;
+    fs::write(root.join("main.py"), "let 🦀answer = 42;\n")?;
+    let completed = root.join("healthy-server-completed");
+    let config_path = write_failure_isolation_config(&root, &completed)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let arguments = json!({ "query": "answer" }).as_object().unwrap().clone();
+    let failed_fanout = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(failed_fanout.is_error, Some(true));
+    assert_eq!(
+        failed_fanout
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/error/code")),
+        Some(&json!("server_exited"))
+    );
+    assert_eq!(
+        failed_fanout
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/error/server")),
+        Some(&json!("alpha"))
+    );
+    assert!(
+        completed.exists(),
+        "the healthy server should have completed"
+    );
+
+    let hover_arguments = json!({
+        "path": "main.py",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let hover = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("hover").with_arguments(hover_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(hover.is_error, Some(false));
+    assert_eq!(
+        hover
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/contents/value")),
+        Some(&json!("`answer`: the ultimate value"))
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_symbols_reports_when_no_server_supports_the_method()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("workspace-symbol-unsupported")?;
@@ -897,6 +974,105 @@ async fn hover_returns_structured_markup_across_position_encodings()
 
         timeout(Duration::from_secs(10), client.cancel()).await??;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwards_mcp_cancellation_during_an_lsp_response_race()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("hover-cancellation-race")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config_path = write_mock_config_for_mode_with_timeout(
+        &root,
+        "hover-cancellation-race",
+        10_000,
+    )?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let start_arguments = json!({ "start": true }).as_object().unwrap().clone();
+    timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("deixis_server_status")
+                .with_arguments(start_arguments),
+        ),
+    )
+    .await??;
+
+    let hover_arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let handle = client
+        .peer()
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(Request::new(
+                CallToolRequestParams::new("hover")
+                    .with_arguments(hover_arguments.clone()),
+            )),
+            PeerRequestOptions::no_options(),
+        )
+        .await?;
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client
+                .call_tool(CallToolRequestParams::new("deixis_server_status"))
+                .await?;
+            if status
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/readiness/message"))
+                == Some(&json!("hover pending"))
+            {
+                return Ok::<(), rmcp::ServiceError>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+
+    handle.cancel(Some("test cancellation".to_owned())).await?;
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let status = client
+                .call_tool(CallToolRequestParams::new("deixis_server_status"))
+                .await?;
+            if status
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/readiness/message"))
+                == Some(&json!("cancellation received"))
+            {
+                return Ok::<(), rmcp::ServiceError>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+
+    let hover = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("hover").with_arguments(hover_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(hover.is_error, Some(false));
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())
 }
 
@@ -2134,6 +2310,39 @@ DEIXIS_MOCK_WORKSPACE_NAME = "zetaSymbol"
 "#,
             support::toml_string(&server),
             support::toml_string(&server),
+        ),
+    )?;
+    Ok(config_path)
+}
+
+fn write_failure_isolation_config(
+    root: &std::path::Path,
+    completed: &std::path::Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let config_path = root.join("deixis.toml");
+    let server = support::mock_lsp_server()?;
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[servers.alpha]
+command = {}
+args = ["--mode", "workspace-symbol-exit"]
+file_extensions = {{ ".rs" = "rust" }}
+
+[servers.zeta]
+command = {}
+args = ["--mode", "hover-utf-8"]
+file_extensions = {{ ".py" = "python" }}
+
+[servers.zeta.environment]
+DEIXIS_MOCK_WORKSPACE_ROLE = "release"
+DEIXIS_MOCK_WORKSPACE_BARRIER = {}
+DEIXIS_MOCK_WORKSPACE_NAME = "zetaSymbol"
+"#,
+            support::toml_string(&server),
+            support::toml_string(&server),
+            support::toml_string(completed),
         ),
     )?;
     Ok(config_path)

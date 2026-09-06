@@ -17,6 +17,8 @@ const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 16;
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_RESTARTS: usize = 3;
+const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -182,6 +184,7 @@ pub struct LanguageServerConfig {
     initialization_options: JsonValue,
     timeouts: TimeoutConfig,
     limits: LimitConfig,
+    restart: RestartConfig,
 }
 
 impl LanguageServerConfig {
@@ -219,6 +222,10 @@ impl LanguageServerConfig {
 
     pub fn limits(&self) -> LimitConfig {
         self.limits
+    }
+
+    pub fn restart(&self) -> RestartConfig {
+        self.restart
     }
 
     pub fn to_command(&self) -> Command {
@@ -295,6 +302,22 @@ pub struct LimitConfig {
     outbound_queue_capacity: usize,
     max_concurrent_requests: usize,
     max_response_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartConfig {
+    max_restarts: usize,
+    window: Duration,
+}
+
+impl RestartConfig {
+    pub fn max_restarts(self) -> usize {
+        self.max_restarts
+    }
+
+    pub fn window(self) -> Duration {
+        self.window
+    }
 }
 
 impl LimitConfig {
@@ -399,6 +422,7 @@ impl RawConfig {
                 initialization_options,
                 timeouts: server.timeouts.validate()?,
                 limits: server.limits.validate()?,
+                restart: server.restart.validate()?,
             });
         }
 
@@ -424,6 +448,8 @@ struct RawLanguageServerConfig {
     timeouts: RawTimeoutConfig,
     #[serde(default)]
     limits: RawLimitConfig,
+    #[serde(default)]
+    restart: RawRestartConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -481,6 +507,30 @@ impl RawLimitConfig {
                 "max_response_bytes",
                 self.max_response_bytes,
                 DEFAULT_MAX_RESPONSE_BYTES,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRestartConfig {
+    max_restarts: Option<usize>,
+    window_ms: Option<u64>,
+}
+
+impl RawRestartConfig {
+    fn validate(self) -> Result<RestartConfig, ConfigError> {
+        Ok(RestartConfig {
+            max_restarts: positive_or_default(
+                "max_restarts",
+                self.max_restarts,
+                DEFAULT_MAX_RESTARTS,
+            )?,
+            window: duration_or_default(
+                "window_ms",
+                self.window_ms,
+                DEFAULT_RESTART_WINDOW,
             )?,
         })
     }
@@ -698,6 +748,10 @@ shutdown_ms = 3000
 outbound_queue_capacity = 32
 max_concurrent_requests = 8
 max_response_bytes = 8388608
+
+[servers.rust.restart]
+max_restarts = 2
+window_ms = 45000
 "#;
 
     #[test]
@@ -743,6 +797,8 @@ max_response_bytes = 8388608
         assert_eq!(server.limits().outbound_queue_capacity(), 32);
         assert_eq!(server.limits().max_concurrent_requests(), 8);
         assert_eq!(server.limits().max_response_bytes(), 8_388_608);
+        assert_eq!(server.restart().max_restarts(), 2);
+        assert_eq!(server.restart().window(), Duration::from_secs(45));
     }
 
     #[test]
@@ -934,6 +990,27 @@ file_extensions = {{ ".rs" = "rust" }}
     }
 
     #[test]
+    fn rejects_invalid_restart_values() {
+        for (field, value) in [("max_restarts", 0), ("window_ms", 0)] {
+            let error = parse_error(&format!(
+                r#"
+[servers.rust]
+command = "rust-analyzer"
+file_extensions = {{ ".rs" = "rust" }}
+
+[servers.rust.restart]
+{field} = {value}
+"#,
+            ));
+
+            assert!(
+                error.contains(&format!("{field} must be greater than zero")),
+                "unexpected error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_initialization_options_that_are_not_json() {
         let error = parse_error(
             r#"
@@ -970,6 +1047,8 @@ file_extensions = { ".py" = "python" }
         assert_eq!(server.limits().outbound_queue_capacity(), 64);
         assert_eq!(server.limits().max_concurrent_requests(), 16);
         assert_eq!(server.limits().max_response_bytes(), 16 * 1024 * 1024);
+        assert_eq!(server.restart().max_restarts(), 3);
+        assert_eq!(server.restart().window(), Duration::from_secs(60));
         assert_eq!(server.initialization_options(), &json!({}));
     }
 

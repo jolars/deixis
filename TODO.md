@@ -99,11 +99,11 @@ support the corresponding LSP method.
   shutdown time with documented defaults.
 - [x] Track language-server readiness signals and distinguish transient startup
   empties from stable no-result responses.
-- [ ] Forward MCP cancellation to LSP.
+- [x] Forward MCP cancellation to LSP.
 - [x] Fail all outstanding requests when a child exits.
-- [ ] Add bounded restart behavior with crash-loop protection and useful stderr
+- [x] Add bounded restart behavior with crash-loop protection and useful stderr
   context.
-- [ ] Exercise concurrent requests, late responses, duplicate IDs, cancellation
+- [x] Exercise concurrent requests, late responses, duplicate IDs, cancellation
   races, notification floods, and one-server failure in a multi-server
   project.
 

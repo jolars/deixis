@@ -15,11 +15,15 @@ const JSONRPC_VERSION: &str = "2.0";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mode = parse_mode();
-    eprintln!("mock-lsp started in {mode} mode");
+    let generation = record_start()?;
+    eprintln!("mock-lsp started in {mode} mode (generation {generation})");
 
     let output = Arc::new(Mutex::new(io::stdout()));
     let mut input = io::stdin().lock();
-    let state = Arc::new(Mutex::new(MockState::default()));
+    let state = Arc::new(Mutex::new(MockState {
+        generation,
+        ..MockState::default()
+    }));
 
     loop {
         let Some(message) = read_message(&mut input)? else {
@@ -51,6 +55,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+}
+
+fn record_start() -> Result<usize, Box<dyn Error>> {
+    let Ok(path) = env::var("DEIXIS_MOCK_START_COUNT") else {
+        return Ok(1);
+    };
+    let generation = fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default()
+        + 1;
+    fs::write(path, generation.to_string())?;
+    Ok(generation)
 }
 
 fn parse_mode() -> String {
@@ -299,12 +316,31 @@ fn handle_request<R: BufRead>(
             }
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(delay_ms));
+                let token = params
+                    .get("token")
+                    .cloned()
+                    .unwrap_or(Json::Null);
                 let _ = write_message(
                     &output,
-                    response(id, json_object([("delayed", Json::Bool(true))])),
+                    response(
+                        id,
+                        json_object([
+                            ("delayed", Json::Bool(true)),
+                            ("token", token),
+                        ]),
+                    ),
                 );
                 state.lock().unwrap().active_delays -= 1;
             });
+        }
+        "mock/duplicateResponse" => {
+            let initialized = state.lock().unwrap().initialized;
+            let result = json_object([
+                ("echo", params),
+                ("initialized", Json::Bool(initialized)),
+            ]);
+            write_message(output, response(id.clone(), result.clone()))?;
+            write_message(output, response(id, result))?;
         }
         "mock/concurrency" => {
             let max_active_delays = state.lock().unwrap().max_active_delays;
@@ -357,6 +393,40 @@ fn handle_request<R: BufRead>(
                 output,
                 notification("textDocument/publishDiagnostics", params),
             )?;
+            write_message(output, response(id, Json::Null))?;
+        }
+        "mock/notificationFlood" => {
+            let count = params.get("count").and_then(Json::as_u64).unwrap_or(1);
+            let uri = params
+                .get("uri")
+                .and_then(Json::as_str)
+                .unwrap_or("file:///notification-flood.rs");
+            for sequence in 0..count {
+                write_message(
+                    output,
+                    notification(
+                        "textDocument/publishDiagnostics",
+                        json_object([
+                            ("uri", Json::String(uri.to_owned())),
+                            ("version", Json::Number(sequence as i64)),
+                            (
+                                "diagnostics",
+                                Json::Array(vec![json_object([
+                                    ("range", mock_range(0, 0)),
+                                    ("message", Json::String("flood".to_owned())),
+                                    (
+                                        "data",
+                                        json_object([(
+                                            "sequence",
+                                            Json::Number(sequence as i64),
+                                        )]),
+                                    ),
+                                ])]),
+                            ),
+                        ]),
+                    ),
+                )?;
+            }
             write_message(output, response(id, Json::Null))?;
         }
         "textDocument/diagnostic" => {
@@ -468,7 +538,29 @@ fn handle_request<R: BufRead>(
             if mode == "hover-timeout" {
                 return Ok(());
             }
-            if mode == "hover-exit" {
+            if mode.starts_with("hover-cancellation")
+                && state.lock().unwrap().cancellations.is_empty()
+            {
+                write_message(
+                    output,
+                    notification(
+                        "experimental/serverStatus",
+                        json_object([
+                            ("health", Json::String("ok".to_owned())),
+                            ("quiescent", Json::Bool(false)),
+                            (
+                                "message",
+                                Json::String("hover pending".to_owned()),
+                            ),
+                        ]),
+                    ),
+                )?;
+                return Ok(());
+            }
+            if mode == "hover-exit"
+                || (mode == "hover-exit-once"
+                    && state.lock().unwrap().generation == 1)
+            {
                 return Err(io::Error::other(
                     "mock language server exited during hover",
                 )
@@ -912,6 +1004,12 @@ fn handle_request<R: BufRead>(
                 )?;
                 return Ok(());
             }
+            if mode == "workspace-symbol-exit" {
+                return Err(io::Error::other(
+                    "mock language server exited during workspace symbol",
+                )
+                .into());
+            }
 
             let query = params
                 .get("query")
@@ -1062,8 +1160,30 @@ fn handle_notification(
             send_readiness_started(mode, output)?;
         }
         "$/cancelRequest" => {
-            if let Some(id) = params.get("id").cloned() {
+            let canceled_id = params.get("id").cloned();
+            if let Some(id) = canceled_id.as_ref() {
                 state.lock().unwrap().cancellations.insert(id.to_string());
+            }
+            if mode.starts_with("hover-cancellation") {
+                write_message(
+                    output,
+                    notification(
+                        "experimental/serverStatus",
+                        json_object([
+                            ("health", Json::String("ok".to_owned())),
+                            ("quiescent", Json::Bool(true)),
+                            (
+                                "message",
+                                Json::String("cancellation received".to_owned()),
+                            ),
+                        ]),
+                    ),
+                )?;
+                if mode == "hover-cancellation-race"
+                    && let Some(id) = canceled_id
+                {
+                    write_message(output, response(id, Json::Null))?;
+                }
             }
         }
         "textDocument/didOpen" => {
@@ -1900,6 +2020,7 @@ fn read_message<R: BufRead>(input: &mut R) -> Result<Option<Json>, Box<dyn Error
 
 #[derive(Debug, Default)]
 struct MockState {
+    generation: usize,
     initialized: bool,
     shutdown_requested: bool,
     client_probe_complete: bool,

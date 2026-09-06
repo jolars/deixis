@@ -80,6 +80,203 @@ async fn request_timeout_cancels_only_the_pending_request()
 }
 
 #[tokio::test]
+async fn correlates_concurrent_out_of_order_responses()
+-> Result<(), Box<dyn Error>> {
+    let manager = Arc::new(configured_manager("normal", 1_000, 1_000)?);
+    manager.ensure_started().await?;
+
+    let slow = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .request::<DelayResponse>(
+                    "mock/delay",
+                    json!({ "delay_ms": 80, "token": "slow" }),
+                )
+                .await
+        })
+    };
+    let fast = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .request::<DelayResponse>(
+                    "mock/delay",
+                    json!({ "delay_ms": 5, "token": "fast" }),
+                )
+                .await
+        })
+    };
+
+    let fast = fast.await??;
+    let slow = slow.await??;
+    assert!(fast.delayed);
+    assert_eq!(fast.token, "fast");
+    assert!(slow.delayed);
+    assert_eq!(slow.token, "slow");
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ignores_late_and_duplicate_responses_without_corrupting_later_calls()
+-> Result<(), Box<dyn Error>> {
+    let manager = configured_manager("normal", 30, 1_000)?;
+
+    let timeout_error = manager
+        .request::<JsonValue>(
+            "mock/delay",
+            json!({ "delay_ms": 80, "token": "late" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(timeout_error, LspError::RequestTimeout { .. }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let duplicate: EchoResponse = manager
+        .request("mock/duplicateResponse", json!({ "message": "first" }))
+        .await?;
+    assert_eq!(duplicate.echo, json!({ "message": "first" }));
+    tokio::task::yield_now().await;
+
+    let echo: EchoResponse = manager
+        .request("mock/echo", json!({ "message": "uncorrupted" }))
+        .await?;
+    assert_eq!(echo.echo, json!({ "message": "uncorrupted" }));
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn processes_notification_floods_in_order() -> Result<(), Box<dyn Error>>
+{
+    let manager = configured_manager("normal", 1_000, 1_000)?;
+    let uri = "file:///notification-flood.rs";
+
+    manager
+        .request::<JsonValue>(
+            "mock/notificationFlood",
+            json!({ "count": 500, "uri": uri }),
+        )
+        .await?;
+
+    let diagnostics = manager.diagnostics().await;
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["uri"], uri);
+    assert_eq!(diagnostics[0]["version"], 499);
+    assert_eq!(diagnostics[0]["diagnostics"][0]["data"]["sequence"], 499);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restarts_after_a_crash_and_rebuilds_document_state()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root_and_bounds(
+        "hover-exit-once",
+        TestBounds::default(),
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let error = manager
+        .hover("main.rs", "rust", Position::new(0, 8))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LspError::ServerExited {
+            ref stderr,
+            ..
+        } if stderr.as_deref().is_some_and(|stderr| {
+            stderr.contains("mock language server exited during hover")
+        })
+    ));
+
+    assert!(
+        manager
+            .hover("main.rs", "rust", Position::new(0, 8))
+            .await?
+            .is_some()
+    );
+    let events: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert_eq!(events.events.len(), 1);
+    assert_eq!(events.events[0]["method"], "textDocument/didOpen");
+    assert_eq!(fs::read_to_string(root.join("mock-start-count"))?, "2");
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stops_restarting_during_a_crash_loop() -> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root_and_bounds(
+        "hover-exit",
+        TestBounds {
+            max_restarts: 2,
+            ..TestBounds::default()
+        },
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    for _ in 0..3 {
+        assert!(matches!(
+            manager.hover("main.rs", "rust", Position::new(0, 8)).await,
+            Err(LspError::ServerExited { .. })
+        ));
+    }
+    for _ in 0..2 {
+        assert!(matches!(
+            manager.ensure_started().await,
+            Err(LspError::RestartLimitReached {
+                max_restarts: 2,
+                ..
+            })
+        ));
+    }
+    assert_eq!(fs::read_to_string(root.join("mock-start-count"))?, "3");
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn permits_restart_again_after_the_crash_window()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root_and_bounds(
+        "hover-exit",
+        TestBounds {
+            max_restarts: 1,
+            restart_window_ms: 40,
+            ..TestBounds::default()
+        },
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    for _ in 0..2 {
+        let _ = manager.hover("main.rs", "rust", Position::new(0, 8)).await;
+    }
+    assert!(matches!(
+        manager.ensure_started().await,
+        Err(LspError::RestartLimitReached { .. })
+    ));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(matches!(
+        manager.hover("main.rs", "rust", Position::new(0, 8)).await,
+        Err(LspError::ServerExited { .. })
+    ));
+    assert_eq!(fs::read_to_string(root.join("mock-start-count"))?, "3");
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn startup_uses_its_own_deadline() -> Result<(), Box<dyn Error>> {
     let manager = configured_manager_with_bounds(
         "initialize-timeout",
@@ -135,6 +332,38 @@ async fn rejects_an_lsp_response_over_the_configured_limit()
     ));
 
     let _ = manager.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_reaps_a_live_child_after_its_transport_fails()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root_and_bounds(
+        "normal",
+        TestBounds {
+            max_response_bytes: 4_096,
+            ..TestBounds::default()
+        },
+    )?;
+    manager.ensure_started().await?;
+
+    assert!(matches!(
+        manager
+            .request::<JsonValue>(
+                "mock/largeResponse",
+                json!({ "bytes": 8_192 })
+            )
+            .await,
+        Err(LspError::ResponseTooLarge { .. })
+    ));
+
+    let echo: EchoResponse = manager
+        .request("mock/echo", json!({ "message": "replacement" }))
+        .await?;
+    assert_eq!(echo.echo, json!({ "message": "replacement" }));
+    assert_eq!(fs::read_to_string(root.join("mock-start-count"))?, "2");
+
+    manager.shutdown().await?;
     Ok(())
 }
 
@@ -1385,6 +1614,9 @@ command = {}
 args = ["--mode", "{}"]
 file_extensions = {{ ".rs" = "rust" }}
 
+[servers.mock-lsp.environment]
+DEIXIS_MOCK_START_COUNT = {}
+
 [servers.mock-lsp.timeouts]
 startup_ms = {}
 request_ms = {}
@@ -1395,6 +1627,10 @@ outbound_queue_capacity = {}
 max_concurrent_requests = {}
 max_response_bytes = {}
 
+[servers.mock-lsp.restart]
+max_restarts = {}
+window_ms = {}
+
 [servers.mock-lsp.initialization_options]
 answer = 42
 
@@ -1404,12 +1640,15 @@ two = 2
 "#,
             support::toml_string(&server),
             mode,
+            support::toml_string(&root.join("mock-start-count")),
             bounds.startup_timeout_ms,
             bounds.request_timeout_ms,
             bounds.shutdown_timeout_ms,
             bounds.outbound_queue_capacity,
             bounds.max_concurrent_requests,
             bounds.max_response_bytes,
+            bounds.max_restarts,
+            bounds.restart_window_ms,
         ),
     )?;
     Ok(config_path)
@@ -1423,6 +1662,8 @@ struct TestBounds {
     outbound_queue_capacity: usize,
     max_concurrent_requests: usize,
     max_response_bytes: usize,
+    max_restarts: usize,
+    restart_window_ms: u64,
 }
 
 impl Default for TestBounds {
@@ -1434,6 +1675,8 @@ impl Default for TestBounds {
             outbound_queue_capacity: 64,
             max_concurrent_requests: 16,
             max_response_bytes: 16 * 1024 * 1024,
+            max_restarts: 3,
+            restart_window_ms: 60_000,
         }
     }
 }
@@ -1452,6 +1695,12 @@ struct InitializedResponse {
 #[derive(Debug, Deserialize)]
 struct CancellationResponse {
     cancelled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DelayResponse {
+    delayed: bool,
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
