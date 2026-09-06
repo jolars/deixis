@@ -285,6 +285,40 @@ impl LazyLanguageServer {
         Ok(references)
     }
 
+    pub async fn document_diagnostics(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+    ) -> Result<DiagnosticReport, LspError> {
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server().await?;
+        let snapshot = active.status.lock().await.clone();
+        let pull_provider = active
+            .diagnostic_provider(
+                "textDocument/diagnostic",
+                snapshot.capabilities().get("diagnosticProvider"),
+            )
+            .await;
+        let document = active.synchronize_document(file, language_id).await?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+
+        if let Some(provider) = pull_provider {
+            active
+                .pull_diagnostics(
+                    &document,
+                    encoding,
+                    provider.identifier.as_deref(),
+                    self.config.timeouts().request(),
+                )
+                .await
+        } else {
+            active.push_diagnostics(&document, encoding).await
+        }
+    }
+
     async fn location_request(
         &self,
         path: impl AsRef<Path>,
@@ -459,7 +493,7 @@ impl LazyLanguageServer {
         };
 
         match active {
-            Some(active) => active.diagnostics.lock().await.clone(),
+            Some(active) => active.diagnostics.lock().await.push_values(),
             None => Vec::new(),
         }
     }
@@ -723,6 +757,159 @@ impl MarkedString {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticSource {
+    Pull,
+    Push,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticAvailability {
+    Current,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticReport {
+    server: String,
+    uri: String,
+    source: DiagnosticSource,
+    availability: DiagnosticAvailability,
+    document_version: i32,
+    report_version: Option<i32>,
+    result_id: Option<String>,
+    position_encoding: PositionEncoding,
+    diagnostics: Vec<JsonValue>,
+}
+
+impl DiagnosticReport {
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn source(&self) -> DiagnosticSource {
+        self.source
+    }
+
+    pub fn availability(&self) -> DiagnosticAvailability {
+        self.availability
+    }
+
+    pub fn document_version(&self) -> i32 {
+        self.document_version
+    }
+
+    pub fn report_version(&self) -> Option<i32> {
+        self.report_version
+    }
+
+    pub fn result_id(&self) -> Option<&str> {
+        self.result_id.as_deref()
+    }
+
+    pub fn position_encoding(&self) -> PositionEncoding {
+        self.position_encoding
+    }
+
+    pub fn diagnostics(&self) -> &[JsonValue] {
+        &self.diagnostics
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Diagnostic {
+    range: Range,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishDiagnosticsParams {
+    uri: String,
+    version: Option<i32>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum DocumentDiagnosticReport {
+    Full {
+        #[serde(default, rename = "resultId")]
+        result_id: Option<String>,
+        items: Vec<Diagnostic>,
+    },
+    Unchanged {
+        #[serde(rename = "resultId")]
+        result_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct CachedPushDiagnostics {
+    version: Option<i32>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPullDiagnostics {
+    result_id: Option<String>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Default)]
+struct DiagnosticCache {
+    push: BTreeMap<String, CachedPushDiagnostics>,
+    pull: BTreeMap<String, CachedPullDiagnostics>,
+}
+
+#[derive(Debug)]
+struct DiagnosticProvider {
+    identifier: Option<String>,
+}
+
+impl DiagnosticCache {
+    fn record_push(&mut self, params: PublishDiagnosticsParams) {
+        let replace = self.push.get(&params.uri).is_none_or(|cached| {
+            match (cached.version, params.version) {
+                (Some(current), Some(incoming)) => incoming >= current,
+                (Some(_), None) => false,
+                (None, Some(_)) | (None, None) => true,
+            }
+        });
+        if replace {
+            self.push.insert(
+                params.uri,
+                CachedPushDiagnostics {
+                    version: params.version,
+                    diagnostics: params.diagnostics,
+                },
+            );
+        }
+    }
+
+    fn push_values(&self) -> Vec<JsonValue> {
+        self.push
+            .iter()
+            .map(|(uri, report)| {
+                json!({
+                    "uri": uri,
+                    "version": report.version,
+                    "diagnostics": report.diagnostics,
+                })
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerSnapshot {
     configured_name: String,
@@ -881,6 +1068,10 @@ pub enum LspError {
     },
     EncodeMessage(serde_json::Error),
     DecodeResult(serde_json::Error),
+    InvalidDiagnosticReport {
+        server: String,
+        message: String,
+    },
     DocumentPath(ProjectPathError),
     ReadDocument {
         path: PathBuf,
@@ -967,6 +1158,10 @@ impl fmt::Display for LspError {
             Self::DecodeResult(source) => {
                 write!(formatter, "failed to decode LSP response: {source}")
             }
+            Self::InvalidDiagnosticReport { server, message } => write!(
+                formatter,
+                "language server `{server}` returned an invalid diagnostic report: {message}"
+            ),
             Self::DocumentPath(source) => write!(formatter, "{source}"),
             Self::ReadDocument { path, source } => {
                 write!(
@@ -1086,6 +1281,7 @@ impl Error for LspError {
                 Some(source)
             }
             Self::MissingPipe { .. }
+            | Self::InvalidDiagnosticReport { .. }
             | Self::UnsupportedDocumentSynchronization { .. }
             | Self::UnsupportedPositionEncoding { .. }
             | Self::UnsupportedCapability { .. }
@@ -1288,7 +1484,7 @@ struct ActiveServer {
     project_root: PathBuf,
     configuration: JsonValue,
     status: Arc<Mutex<ServerSnapshot>>,
-    diagnostics: Arc<Mutex<Vec<JsonValue>>>,
+    diagnostics: Arc<Mutex<DiagnosticCache>>,
     registrations: Arc<Mutex<BTreeMap<String, JsonValue>>>,
     documents: Arc<Mutex<DocumentStore>>,
 }
@@ -1318,7 +1514,7 @@ impl ActiveServer {
             status: Arc::new(Mutex::new(ServerSnapshot::not_started(
                 config.name(),
             ))),
-            diagnostics: Arc::new(Mutex::new(Vec::new())),
+            diagnostics: Arc::new(Mutex::new(DiagnosticCache::default())),
             registrations: Arc::new(Mutex::new(BTreeMap::new())),
             documents: Arc::new(Mutex::new(DocumentStore::default())),
         }
@@ -1340,6 +1536,37 @@ impl ActiveServer {
             .any(|registration| {
                 registration.get("method").and_then(JsonValue::as_str)
                     == Some(method)
+            })
+    }
+
+    async fn diagnostic_provider(
+        &self,
+        method: &str,
+        static_capability: Option<&JsonValue>,
+    ) -> Option<DiagnosticProvider> {
+        if static_capability.is_some_and(capability_is_enabled) {
+            return Some(DiagnosticProvider {
+                identifier: static_capability
+                    .and_then(|capability| capability.get("identifier"))
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+            });
+        }
+
+        self.registrations
+            .lock()
+            .await
+            .values()
+            .find(|registration| {
+                registration.get("method").and_then(JsonValue::as_str)
+                    == Some(method)
+            })
+            .map(|registration| DiagnosticProvider {
+                identifier: registration
+                    .get("registerOptions")
+                    .and_then(|options| options.get("identifier"))
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
             })
     }
 
@@ -1440,6 +1667,144 @@ impl ActiveServer {
         drop(documents);
 
         Ok(document)
+    }
+
+    async fn pull_diagnostics(
+        &self,
+        document: &SynchronizedDocument,
+        encoding: PositionEncoding,
+        identifier: Option<&str>,
+        request_timeout: Duration,
+    ) -> Result<DiagnosticReport, LspError> {
+        let previous_result_id = self
+            .diagnostics
+            .lock()
+            .await
+            .pull
+            .get(document.uri())
+            .and_then(|report| report.result_id.clone());
+        let mut params = json!({
+            "textDocument": { "uri": document.uri() },
+        });
+        if let Some(previous_result_id) = previous_result_id {
+            params["previousResultId"] = JsonValue::String(previous_result_id);
+        }
+        if let Some(identifier) = identifier {
+            params["identifier"] = JsonValue::String(identifier.to_owned());
+        }
+
+        let response = self
+            .request_value("textDocument/diagnostic", params, request_timeout)
+            .await?;
+        let response: DocumentDiagnosticReport =
+            serde_json::from_value(response).map_err(LspError::DecodeResult)?;
+        let cached = match response {
+            DocumentDiagnosticReport::Full { result_id, items } => {
+                CachedPullDiagnostics {
+                    result_id,
+                    diagnostics: items,
+                }
+            }
+            DocumentDiagnosticReport::Unchanged { result_id } => {
+                let diagnostics = self.diagnostics.lock().await;
+                let Some(report) = diagnostics.pull.get(document.uri()) else {
+                    return Err(LspError::InvalidDiagnosticReport {
+                        server: self.name.clone(),
+                        message:
+                            "an unchanged report has no cached predecessor"
+                                .to_owned(),
+                    });
+                };
+                CachedPullDiagnostics {
+                    result_id: Some(result_id),
+                    diagnostics: report.diagnostics.clone(),
+                }
+            }
+        };
+        let diagnostics = normalize_diagnostics(
+            cached.diagnostics.clone(),
+            document,
+            encoding,
+            &self.name,
+        )?;
+        self.diagnostics
+            .lock()
+            .await
+            .pull
+            .insert(document.uri().to_owned(), cached.clone());
+
+        Ok(DiagnosticReport {
+            server: self.name.clone(),
+            uri: document.uri().to_owned(),
+            source: DiagnosticSource::Pull,
+            availability: DiagnosticAvailability::Current,
+            document_version: document.version(),
+            report_version: None,
+            result_id: cached.result_id,
+            position_encoding: PositionEncoding::Utf8,
+            diagnostics,
+        })
+    }
+
+    async fn push_diagnostics(
+        &self,
+        document: &SynchronizedDocument,
+        encoding: PositionEncoding,
+    ) -> Result<DiagnosticReport, LspError> {
+        let cached = self
+            .diagnostics
+            .lock()
+            .await
+            .push
+            .get(document.uri())
+            .cloned();
+        let Some(cached) = cached else {
+            return Ok(DiagnosticReport {
+                server: self.name.clone(),
+                uri: document.uri().to_owned(),
+                source: DiagnosticSource::Push,
+                availability: DiagnosticAvailability::Unavailable,
+                document_version: document.version(),
+                report_version: None,
+                result_id: None,
+                position_encoding: PositionEncoding::Utf8,
+                diagnostics: Vec::new(),
+            });
+        };
+        let is_current = cached.version == Some(document.version());
+        let (position_encoding, diagnostics) = if is_current {
+            (
+                PositionEncoding::Utf8,
+                normalize_diagnostics(
+                    cached.diagnostics,
+                    document,
+                    encoding,
+                    &self.name,
+                )?,
+            )
+        } else {
+            (
+                encoding,
+                diagnostics_to_values(cached.diagnostics)
+                    .map_err(LspError::DecodeResult)?,
+            )
+        };
+
+        Ok(DiagnosticReport {
+            server: self.name.clone(),
+            uri: document.uri().to_owned(),
+            source: DiagnosticSource::Push,
+            availability: if is_current {
+                DiagnosticAvailability::Current
+            } else {
+                DiagnosticAvailability::Stale
+            },
+            document_version: document.version(),
+            report_version: cached.version,
+            result_id: None,
+            position_encoding,
+            diagnostics,
+        })
     }
 
     async fn close_documents(&self) -> Result<(), LspError> {
@@ -1861,7 +2226,18 @@ async fn handle_server_notification(
 ) {
     match method {
         "textDocument/publishDiagnostics" => {
-            active.diagnostics.lock().await.push(params);
+            match serde_json::from_value::<PublishDiagnosticsParams>(params) {
+                Ok(params) => {
+                    active.diagnostics.lock().await.record_push(params);
+                }
+                Err(error) => {
+                    warn!(
+                        server = %server,
+                        %error,
+                        "ignored malformed publish-diagnostics notification"
+                    );
+                }
+            }
         }
         "window/logMessage" | "window/showMessage" | "window/logTrace" => {
             trace_server_message(server, method, &params);
@@ -1989,6 +2365,10 @@ fn initialize_params(
                 },
             },
             "textDocument": {
+                "diagnostic": {
+                    "dynamicRegistration": true,
+                    "relatedDocumentSupport": false,
+                },
                 "declaration": {
                     "dynamicRegistration": true,
                     "linkSupport": true,
@@ -2008,6 +2388,13 @@ fn initialize_params(
                 "references": {
                     "dynamicRegistration": true,
                 },
+                "publishDiagnostics": {
+                    "relatedInformation": false,
+                    "tagSupport": { "valueSet": [1, 2] },
+                    "versionSupport": true,
+                    "codeDescriptionSupport": true,
+                    "dataSupport": true,
+                },
                 "typeDefinition": {
                     "dynamicRegistration": true,
                     "linkSupport": true,
@@ -2016,6 +2403,33 @@ fn initialize_params(
         },
         "initializationOptions": config.initialization_options(),
     })
+}
+
+fn normalize_diagnostics(
+    diagnostics: Vec<Diagnostic>,
+    document: &SynchronizedDocument,
+    encoding: PositionEncoding,
+    server: &str,
+) -> Result<Vec<JsonValue>, LspError> {
+    diagnostics
+        .into_iter()
+        .map(|mut diagnostic| {
+            diagnostic.range = document
+                .from_lsp_range(diagnostic.range, encoding)
+                .map_err(|source| LspError::PositionConversion {
+                    server: server.to_owned(),
+                    path: document.absolute_path().to_path_buf(),
+                    source,
+                })?;
+            serde_json::to_value(diagnostic).map_err(LspError::EncodeMessage)
+        })
+        .collect()
+}
+
+fn diagnostics_to_values(
+    diagnostics: Vec<Diagnostic>,
+) -> Result<Vec<JsonValue>, serde_json::Error> {
+    diagnostics.into_iter().map(serde_json::to_value).collect()
 }
 
 fn path_to_file_uri(path: &Path) -> String {

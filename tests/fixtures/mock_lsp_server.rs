@@ -73,7 +73,7 @@ fn handle_request<R: BufRead>(
     match method {
         "initialize" => {
             eprintln!("mock-lsp initializing");
-            state.lock().unwrap().initialize_params = Some(params);
+            state.lock().unwrap().initialize_params = Some(params.clone());
             let text_document_sync = if mode.starts_with("document-incremental") {
                 json_object([
                     ("openClose", Json::Bool(true)),
@@ -97,6 +97,7 @@ fn handle_request<R: BufRead>(
                     Some(Json::String("utf-32".to_owned()))
                 }
                 "hover-utf-16"
+                | "diagnostics-pull-utf-16"
                 | "definition-locations-utf-16"
                 | "definition-project-target-utf-16"
                 | "definition-external-utf-16"
@@ -159,6 +160,15 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let diagnostic_provider = mode
+                .starts_with("diagnostics-pull")
+                .then(|| {
+                    json_object([
+                        ("identifier", Json::String("mock-diagnostics".to_owned())),
+                        ("interFileDependencies", Json::Bool(false)),
+                        ("workspaceDiagnostics", Json::Bool(false)),
+                    ])
+                });
             let mut capabilities = vec![
                 ("declarationProvider".to_owned(), declaration_provider),
                 ("definitionProvider".to_owned(), definition_provider),
@@ -174,11 +184,41 @@ fn handle_request<R: BufRead>(
                     type_definition_provider,
                 ),
             ];
+            if let Some(diagnostic_provider) = diagnostic_provider {
+                capabilities.push((
+                    "diagnosticProvider".to_owned(),
+                    diagnostic_provider,
+                ));
+            }
             if let Some(position_encoding) = position_encoding {
                 capabilities.push((
                     "positionEncoding".to_owned(),
                     position_encoding,
                 ));
+            }
+            if mode == "diagnostics-push-stale" {
+                let root_uri = params
+                    .get("rootUri")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .trim_end_matches('/');
+                write_message(
+                    output,
+                    notification(
+                        "textDocument/publishDiagnostics",
+                        json_object([
+                            (
+                                "uri",
+                                Json::String(format!("{root_uri}/main.rs")),
+                            ),
+                            ("version", Json::Number(0)),
+                            (
+                                "diagnostics",
+                                Json::Array(vec![mock_diagnostic(4, 10)]),
+                            ),
+                        ]),
+                    ),
+                )?;
             }
             write_message(
                 output,
@@ -277,6 +317,90 @@ fn handle_request<R: BufRead>(
             ]);
             drop(state);
             write_message(output, response(id, report))?;
+        }
+        "mock/publishDiagnostics" => {
+            write_message(
+                output,
+                notification("textDocument/publishDiagnostics", params),
+            )?;
+            write_message(output, response(id, Json::Null))?;
+        }
+        "textDocument/diagnostic" => {
+            if !mode.starts_with("diagnostics-pull") {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "diagnostic request bypassed capability gate".to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let mut state = state.lock().unwrap();
+            let previous_result_id = params
+                .get("previousResultId")
+                .and_then(Json::as_str);
+            let identifier =
+                params.get("identifier").and_then(Json::as_str);
+            if identifier != Some("mock-diagnostics") {
+                drop(state);
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32602,
+                        "diagnostic request omitted the provider identifier"
+                            .to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+            let result = if state.diagnostic_requests == 0 {
+                if previous_result_id.is_some() {
+                    drop(state);
+                    write_message(
+                        output,
+                        error_response(
+                            id,
+                            -32602,
+                            "first diagnostic request included a result id"
+                                .to_owned(),
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                json_object([
+                    ("kind", Json::String("full".to_owned())),
+                    ("resultId", Json::String("pull-1".to_owned())),
+                    (
+                        "items",
+                        Json::Array(vec![mock_diagnostic(6, 12)]),
+                    ),
+                ])
+            } else {
+                if previous_result_id != Some("pull-1") {
+                    drop(state);
+                    write_message(
+                        output,
+                        error_response(
+                            id,
+                            -32602,
+                            "subsequent diagnostic request omitted the result id"
+                                .to_owned(),
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                json_object([
+                    ("kind", Json::String("unchanged".to_owned())),
+                    ("resultId", Json::String("pull-1".to_owned())),
+                ])
+            };
+            state.diagnostic_requests += 1;
+            drop(state);
+            write_message(output, response(id, result))?;
         }
         "textDocument/hover" => {
             if mode == "hover-timeout" {
@@ -839,6 +963,8 @@ fn probe_client<R: BufRead>(
         implementation_dynamic_registration,
         implementation_link_support,
         references_dynamic_registration,
+        diagnostic_dynamic_registration,
+        diagnostic_version_support,
     ) = {
         let mut state = state.lock().unwrap();
         state.client_probe_complete = true;
@@ -918,6 +1044,20 @@ fn probe_client<R: BufRead>(
             .and_then(|references| references.get("dynamicRegistration"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let diagnostics = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("diagnostic"));
+        let diagnostic_dynamic_registration = diagnostics
+            .and_then(|diagnostics| diagnostics.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let publish_diagnostics = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("publishDiagnostics"));
+        let diagnostic_version_support = publish_diagnostics
+            .and_then(|diagnostics| diagnostics.get("versionSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         (
             position_encodings,
             dynamic_registration,
@@ -931,6 +1071,8 @@ fn probe_client<R: BufRead>(
             implementation_dynamic_registration,
             implementation_link_support,
             references_dynamic_registration,
+            diagnostic_dynamic_registration,
+            diagnostic_version_support,
         )
     };
     Ok(json_object([
@@ -1053,7 +1195,45 @@ fn probe_client<R: BufRead>(
             "references_dynamic_registration",
             Json::Bool(references_dynamic_registration),
         ),
+        (
+            "diagnostic_dynamic_registration",
+            Json::Bool(diagnostic_dynamic_registration),
+        ),
+        (
+            "diagnostic_version_support",
+            Json::Bool(diagnostic_version_support),
+        ),
     ]))
+}
+
+fn mock_diagnostic(start: i64, end: i64) -> Json {
+    json_object([
+        (
+            "range",
+            json_object([
+                (
+                    "start",
+                    json_object([
+                        ("line", Json::Number(0)),
+                        ("character", Json::Number(start)),
+                    ]),
+                ),
+                (
+                    "end",
+                    json_object([
+                        ("line", Json::Number(0)),
+                        ("character", Json::Number(end)),
+                    ]),
+                ),
+            ]),
+        ),
+        ("severity", Json::Number(1)),
+        ("message", Json::String("mock diagnostic".to_owned())),
+        (
+            "data",
+            json_object([("extension", Json::Bool(true))]),
+        ),
+    ])
 }
 
 fn read_response<R: BufRead>(
@@ -1199,6 +1379,7 @@ struct MockState {
     cancellations: BTreeSet<String>,
     document_events: Vec<Json>,
     open_documents: BTreeSet<String>,
+    diagnostic_requests: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

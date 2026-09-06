@@ -8,7 +8,8 @@ use std::{
 use deixis::{
     cli::CliOptions,
     lsp::{
-        DefinitionLocation, LazyLanguageServer, LspError, ReferenceLocation,
+        DefinitionLocation, DiagnosticAvailability, DiagnosticSource,
+        LazyLanguageServer, LspError, ReferenceLocation,
     },
     positions::{Position, PositionEncoding, Range},
     project::StartupState,
@@ -138,9 +139,124 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(probe.implementation_dynamic_registration);
     assert!(probe.implementation_link_support);
     assert!(probe.references_dynamic_registration);
+    assert!(probe.diagnostic_dynamic_registration);
+    assert!(probe.diagnostic_version_support);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
     assert!(manager.dynamic_registrations().await.is_empty());
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pulls_and_caches_current_document_diagnostics()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("diagnostics-pull-utf-16", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    for _ in 0..2 {
+        let report = manager.document_diagnostics("main.rs", "rust").await?;
+        assert_eq!(report.source(), DiagnosticSource::Pull);
+        assert_eq!(report.availability(), DiagnosticAvailability::Current);
+        assert_eq!(report.document_version(), 1);
+        assert_eq!(report.report_version(), None);
+        assert_eq!(report.result_id(), Some("pull-1"));
+        assert_eq!(report.position_encoding(), PositionEncoding::Utf8);
+        assert_eq!(report.diagnostics().len(), 1);
+        assert_eq!(
+            report.diagnostics()[0]["range"],
+            json!({
+                "start": { "line": 0, "character": 8 },
+                "end": { "line": 0, "character": 14 },
+            })
+        );
+        assert_eq!(report.diagnostics()[0]["data"]["extension"], true);
+    }
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn distinguishes_current_stale_and_unavailable_push_diagnostics()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root("normal", 1_000, 1_000)?;
+    let source = root.join("main.rs");
+    fs::write(&source, "let answer = 42;\n")?;
+    manager.ensure_started().await?;
+    let uri = url::Url::from_file_path(&source).unwrap().to_string();
+
+    let publish = |version: Option<i32>, message: &str| {
+        let mut params = json!({
+            "uri": uri,
+            "diagnostics": [{
+                "range": {
+                    "start": { "line": 0, "character": 4 },
+                    "end": { "line": 0, "character": 10 },
+                },
+                "message": message,
+            }],
+        });
+        if let Some(version) = version {
+            params["version"] = json!(version);
+        }
+        params
+    };
+
+    let unavailable = manager.document_diagnostics("main.rs", "rust").await?;
+    assert_eq!(
+        unavailable.availability(),
+        DiagnosticAvailability::Unavailable
+    );
+    assert!(unavailable.diagnostics().is_empty());
+
+    manager
+        .request::<JsonValue>(
+            "mock/publishDiagnostics",
+            publish(Some(1), "current"),
+        )
+        .await?;
+    let current = manager.document_diagnostics("main.rs", "rust").await?;
+    assert_eq!(current.source(), DiagnosticSource::Push);
+    assert_eq!(current.availability(), DiagnosticAvailability::Current);
+    assert_eq!(current.report_version(), Some(1));
+    assert_eq!(current.position_encoding(), PositionEncoding::Utf8);
+
+    fs::write(&source, "let replacement = 7;\n")?;
+    let stale = manager.document_diagnostics("main.rs", "rust").await?;
+    assert_eq!(stale.availability(), DiagnosticAvailability::Stale);
+    assert_eq!(stale.document_version(), 2);
+    assert_eq!(stale.report_version(), Some(1));
+
+    manager
+        .request::<JsonValue>(
+            "mock/publishDiagnostics",
+            publish(Some(2), "newest"),
+        )
+        .await?;
+    manager
+        .request::<JsonValue>(
+            "mock/publishDiagnostics",
+            publish(Some(1), "late and old"),
+        )
+        .await?;
+    let newest = manager.document_diagnostics("main.rs", "rust").await?;
+    assert_eq!(newest.availability(), DiagnosticAvailability::Current);
+    assert_eq!(newest.report_version(), Some(2));
+    assert_eq!(newest.diagnostics()[0]["message"], "newest");
+
+    manager
+        .request::<JsonValue>(
+            "mock/publishDiagnostics",
+            publish(None, "version unknown"),
+        )
+        .await?;
+    let versioned_wins =
+        manager.document_diagnostics("main.rs", "rust").await?;
+    assert_eq!(versioned_wins.report_version(), Some(2));
+    assert_eq!(versioned_wins.diagnostics()[0]["message"], "newest");
 
     manager.shutdown().await?;
     Ok(())
@@ -837,6 +953,8 @@ struct ProbeResponse {
     implementation_dynamic_registration: bool,
     implementation_link_support: bool,
     references_dynamic_registration: bool,
+    diagnostic_dynamic_registration: bool,
+    diagnostic_version_support: bool,
 }
 
 #[derive(Debug, Deserialize)]

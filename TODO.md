@@ -77,7 +77,7 @@ matrix.
 - [ ] Add hierarchical document symbols and normalize flat-symbol responses.
 - [ ] Add workspace symbols, fan out across capable servers, and merge in stable
   configuration order.
-- [ ] Cache versioned push diagnostics and implement pull diagnostics when
+- [x] Cache versioned push diagnostics and implement pull diagnostics when
   advertised. Mark unavailable or stale reports explicitly.
 - [ ] Add stable text renderers for all tools without discarding structured LSP
   fields.

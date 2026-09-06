@@ -15,10 +15,12 @@ that server on demand, handle common server-to-client messages, continue after
 malformed server output, and shut down all started servers with a bounded
 forced-kill fallback. A configured session
 exposes the read-only `deixis_server_status` lifecycle probe and
-capability-gated `hover` and `definition` tools. Both semantic tools synchronize
-project-contained documents and translate negotiated position encodings. Hover
-returns structured markup; definition normalizes LSP location variants and
-retains configured-server provenance. Both include a concise text fallback.
+capability-gated navigation tools and a `diagnostics` tool. The semantic tools
+synchronize project-contained documents and translate negotiated position
+encodings. Hover returns structured markup; navigation normalizes LSP location
+variants and retains configured-server provenance. Diagnostics prefers pull
+reports when advertised and otherwise exposes cached push reports with explicit
+freshness. Every tool includes a concise text fallback.
 Nothing in this document should be read as already implemented unless it is
 also marked complete in `TODO.md`.
 
@@ -148,14 +150,15 @@ access, or command interpolation.
 ## MCP surface
 
 Without selected configuration, the current server advertises no tools. With
-configuration, it advertises seven read-only tools: `deixis_server_status`,
-`hover`, `definition`, `declaration`, `type_definition`, `implementation`, and
-`references`. The probe accepts an optional server name and `start` flag;
-without a name, it uses the first name in stable lexical order.
-The semantic tools take a root-contained path, a zero-based UTF-8 position, and
-an optional server override. They resolve the path before routing, infer the
-language ID, synchronize the document, verify the corresponding server
-capability, and translate the request through the negotiated position encoding.
+configuration, it advertises eight read-only tools: `deixis_server_status`,
+`hover`, `definition`, `declaration`, `type_definition`, `implementation`,
+`references`, and `diagnostics`. The probe accepts an optional server name and
+`start` flag; without a name, it uses the first name in stable lexical order.
+The position-based semantic tools take a root-contained path, a zero-based
+UTF-8 position, and an optional server override. They resolve the path before
+routing, infer the language ID, synchronize the document, verify the
+corresponding server capability, and translate the request through the
+negotiated position encoding.
 Hover returns the LSP contents and optional range as structured JSON. The four
 navigation tools accept `Location`, `Location[]`, `LocationLink[]`, or `null`,
 and normalize every result to the `LocationLink` superset: configured server
@@ -166,10 +169,22 @@ LSP reference context, and normalizes `Location[]` or `null` to the configured
 server name, URI, range, and range position encoding. Each semantic tool also
 returns readable text content. No tool forwards arbitrary JSON-RPC.
 
+The `diagnostics` tool takes a root-contained path and optional server override.
+After synchronizing the document, it requests `textDocument/diagnostic` when
+the server advertises pull diagnostics. Full pull reports are cached by result
+ID so an unchanged response can reuse the prior items. Otherwise, the tool
+returns the newest cached `textDocument/publishDiagnostics` report for the
+document URI. A push report whose version matches the synchronized document is
+`current`; a mismatched or versionless report is `stale`, and a missing report
+is `unavailable`. Older and versionless notifications do not replace a newer
+versioned report. Current diagnostic ranges are converted to UTF-8; stale ranges
+retain the negotiated server encoding because the old source text is not
+available for sound conversion. Reports preserve diagnostic extension fields
+and identify both their source and position encoding.
+
 The semantic tool set remains read-only. Planned additions are:
 
-- `document_symbols` and `workspace_symbols`; and
-- `diagnostics`.
+- `document_symbols` and `workspace_symbols`.
 
 MCP hosts already namespace tools by server, so tool names do not repeat an
 `lsp_` prefix. Every handler checks the downstream server capability before

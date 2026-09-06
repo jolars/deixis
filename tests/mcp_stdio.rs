@@ -360,6 +360,138 @@ async fn hover_returns_structured_markup_across_position_encodings()
 }
 
 #[tokio::test]
+async fn diagnostics_prefers_pull_reports_and_exposes_freshness()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("diagnostics-pull-utf-16")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "diagnostics-pull-utf-16")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+    let diagnostics_tool = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "diagnostics")
+        .expect("configured servers should expose diagnostics");
+    assert_eq!(
+        diagnostics_tool.input_schema.get("required"),
+        Some(&json!(["path"]))
+    );
+    assert!(diagnostics_tool.output_schema.is_some());
+    assert_eq!(
+        diagnostics_tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+
+    let arguments = json!({ "path": "main.rs" }).as_object().unwrap().clone();
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("diagnostics").with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(
+        result.structured_content,
+        Some(json!({
+            "server": "mock-lsp",
+            "uri": url::Url::from_file_path(root.join("main.rs"))
+                .unwrap()
+                .to_string(),
+            "source": "pull",
+            "availability": "current",
+            "documentVersion": 1,
+            "reportVersion": null,
+            "resultId": "pull-1",
+            "positionEncoding": "utf-8",
+            "diagnostics": [{
+                "range": {
+                    "start": { "line": 0, "character": 8 },
+                    "end": { "line": 0, "character": 14 },
+                },
+                "severity": 1,
+                "message": "mock diagnostic",
+                "data": { "extension": true },
+            }],
+        }))
+    );
+    assert!(
+        result.content[0]
+            .as_text()
+            .is_some_and(|content| content.text.contains("1 diagnostic"))
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn diagnostics_marks_missing_and_outdated_push_reports()
+-> Result<(), Box<dyn Error>> {
+    for (mode, availability, report_version, diagnostic_count) in [
+        ("diagnostics-push-unavailable", "unavailable", None, 0),
+        ("diagnostics-push-stale", "stale", Some(0), 1),
+    ] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+        let arguments =
+            json!({ "path": "main.rs" }).as_object().unwrap().clone();
+
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("diagnostics")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(false), "{mode}");
+        let report = result
+            .structured_content
+            .as_ref()
+            .expect("diagnostics should be structured");
+        assert_eq!(report["source"], "push", "{mode}");
+        assert_eq!(report["availability"], availability, "{mode}");
+        assert_eq!(report["documentVersion"], 1, "{mode}");
+        assert_eq!(report["reportVersion"], json!(report_version), "{mode}");
+        assert_eq!(
+            report["diagnostics"].as_array().map(Vec::len),
+            Some(diagnostic_count),
+            "{mode}"
+        );
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn hover_rejects_a_server_without_the_capability()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("hover-unsupported")?;

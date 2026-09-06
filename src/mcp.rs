@@ -17,7 +17,9 @@ use tracing::info;
 
 use crate::{
     config::{Config, ConfigRouteError},
-    lsp::{LazyLanguageServer, LspError, ServerSnapshot},
+    lsp::{
+        DiagnosticAvailability, LazyLanguageServer, LspError, ServerSnapshot,
+    },
     positions::Position,
     project::{Project, ProjectPathError, StartupState},
 };
@@ -29,6 +31,7 @@ const DEFINITION_TOOL: &str = "definition";
 const TYPE_DEFINITION_TOOL: &str = "type_definition";
 const IMPLEMENTATION_TOOL: &str = "implementation";
 const REFERENCES_TOOL: &str = "references";
+const DIAGNOSTICS_TOOL: &str = "diagnostics";
 
 #[derive(Clone, Copy)]
 enum LocationOperation {
@@ -160,6 +163,7 @@ impl ServerHandler for DeixisServer {
                 location_tool(TYPE_DEFINITION_SPEC),
                 location_tool(IMPLEMENTATION_SPEC),
                 references_tool(),
+                diagnostics_tool(),
             ]
         };
         Ok(ListToolsResult::with_all_items(tools))
@@ -186,6 +190,7 @@ impl ServerHandler for DeixisServer {
                 self.call_location(request, IMPLEMENTATION_SPEC).await
             }
             REFERENCES_TOOL => self.call_references(request).await,
+            DIAGNOSTICS_TOOL => self.call_diagnostics(request).await,
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -589,6 +594,118 @@ impl DeixisServer {
 
         Ok(result.into())
     }
+
+    async fn call_diagnostics(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, McpError> {
+        const METHOD: &str = "textDocument/diagnostic";
+
+        let arguments = request.arguments.unwrap_or_default();
+        let arguments = serde_json::from_value::<DiagnosticsArguments>(
+            JsonValue::Object(arguments),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid diagnostics arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate()?;
+        let Some(config) = self.config() else {
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    DIAGNOSTICS_TOOL,
+                    "no language server is configured",
+                )
+                .with_method(METHOD)
+                .with_path(&arguments.path),
+            ));
+        };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_path(
+                    DIAGNOSTICS_TOOL,
+                    METHOD,
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_route(
+                        DIAGNOSTICS_TOOL,
+                        METHOD,
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
+        let report = match language_server
+            .document_diagnostics(file.absolute(), route.language_id())
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: DIAGNOSTICS_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some(METHOD),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
+            }
+        };
+        let count = report.diagnostics().len();
+        let text = match report.availability() {
+            DiagnosticAvailability::Unavailable => {
+                format!("Diagnostics are unavailable for {}.", arguments.path)
+            }
+            DiagnosticAvailability::Stale => format!(
+                "{} stale diagnostic{} for {} (report version {}, document version {}).",
+                count,
+                if count == 1 { "" } else { "s" },
+                arguments.path,
+                report.report_version().map_or_else(
+                    || "unknown".to_owned(),
+                    |version| version.to_string()
+                ),
+                report.document_version(),
+            ),
+            DiagnosticAvailability::Current if count == 0 => {
+                format!("No diagnostics for {}.", arguments.path)
+            }
+            DiagnosticAvailability::Current => format!(
+                "{} diagnostic{} for {}.",
+                count,
+                if count == 1 { "" } else { "s" },
+                arguments.path,
+            ),
+        };
+        let structured = serde_json::to_value(report).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode diagnostics response: {error}"),
+                None,
+            )
+        })?;
+        let mut result = CallToolResult::structured(structured);
+        result.content = vec![ContentBlock::text(text)];
+
+        Ok(result.into())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -706,6 +823,7 @@ impl ToolError {
         match error {
             LspError::Spawn { server, .. }
             | LspError::MissingPipe { server, .. }
+            | LspError::InvalidDiagnosticReport { server, .. }
             | LspError::UnsupportedDocumentSynchronization { server, .. }
             | LspError::UnsupportedPositionEncoding { server, .. }
             | LspError::PositionConversion { server, .. }
@@ -776,9 +894,9 @@ fn lsp_error_code(error: &LspError) -> &'static str {
         LspError::Spawn { .. } | LspError::MissingPipe { .. } => {
             "server_start_failed"
         }
-        LspError::EncodeMessage(_) | LspError::DecodeResult(_) => {
-            "lsp_protocol_error"
-        }
+        LspError::EncodeMessage(_)
+        | LspError::DecodeResult(_)
+        | LspError::InvalidDiagnosticReport { .. } => "lsp_protocol_error",
         LspError::ReadDocument { .. }
         | LspError::DocumentSynchronizationClosed { .. }
         | LspError::DocumentLanguageChanged { .. }
@@ -823,6 +941,36 @@ struct ReferencesArguments {
     server: Option<String>,
     position: Position,
     include_declaration: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiagnosticsArguments {
+    path: String,
+    #[serde(default)]
+    server: Option<String>,
+}
+
+impl DiagnosticsArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        if self.path.is_empty() {
+            return Err(McpError::invalid_params(
+                "invalid diagnostics arguments: `path` must not be empty",
+                None,
+            ));
+        }
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "invalid diagnostics arguments: `server` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ReferencesArguments {
@@ -1169,6 +1317,81 @@ fn references_tool() -> Tool {
             }
         },
         "required": ["locations"],
+        "additionalProperties": false
+    })))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    )
+}
+
+fn diagnostics_tool() -> Tool {
+    Tool::new(
+        DIAGNOSTICS_TOOL,
+        "Return pull or cached push diagnostics for a project file.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative or root-contained absolute file path."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(result_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "server": {
+                "type": "string",
+                "description": "Configured name of the language server that produced this report."
+            },
+            "uri": { "type": "string" },
+            "source": { "enum": ["pull", "push"] },
+            "availability": {
+                "enum": ["current", "stale", "unavailable"]
+            },
+            "documentVersion": { "type": "integer" },
+            "reportVersion": { "type": ["integer", "null"] },
+            "resultId": { "type": ["string", "null"] },
+            "positionEncoding": {
+                "enum": ["utf-8", "utf-16", "utf-32"],
+                "description": "Encoding used by character offsets in diagnostic ranges. Current reports use UTF-8; stale push reports retain the server encoding."
+            },
+            "diagnostics": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "range": range_schema()
+                    },
+                    "required": ["range"],
+                    "additionalProperties": true
+                }
+            }
+        },
+        "required": [
+            "server",
+            "uri",
+            "source",
+            "availability",
+            "documentVersion",
+            "reportVersion",
+            "resultId",
+            "positionEncoding",
+            "diagnostics"
+        ],
         "additionalProperties": false
     })))
     .with_annotations(
