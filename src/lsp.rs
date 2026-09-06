@@ -761,6 +761,10 @@ pub enum LspError {
     TransportClosed {
         server: String,
     },
+    ServerExited {
+        server: String,
+        method: String,
+    },
     RequestCanceled {
         server: String,
         method: String,
@@ -868,6 +872,10 @@ impl fmt::Display for LspError {
             Self::TransportClosed { server } => {
                 write!(formatter, "language server `{server}` transport closed")
             }
+            Self::ServerExited { server, method } => write!(
+                formatter,
+                "language server `{server}` exited while request `{method}` was pending"
+            ),
             Self::RequestCanceled { server, method } => {
                 write!(
                     formatter,
@@ -926,6 +934,7 @@ impl Error for LspError {
             | Self::DocumentLanguageChanged { .. }
             | Self::DocumentVersionOverflow { .. }
             | Self::TransportClosed { .. }
+            | Self::ServerExited { .. }
             | Self::RequestCanceled { .. }
             | Self::RequestTimeout { .. }
             | Self::ResponseError { .. } => None,
@@ -1115,7 +1124,7 @@ impl RunningServer {
 struct ActiveServer {
     name: String,
     sender: mpsc::Sender<Vec<u8>>,
-    pending: Arc<Mutex<BTreeMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+    pending: PendingRequests,
     next_request_id: Arc<AtomicU64>,
     project_root: PathBuf,
     configuration: JsonValue,
@@ -1124,6 +1133,15 @@ struct ActiveServer {
     registrations: Arc<Mutex<BTreeMap<String, JsonValue>>>,
     documents: Arc<Mutex<DocumentStore>>,
 }
+
+type PendingRequests = Arc<
+    Mutex<
+        BTreeMap<
+            u64,
+            oneshot::Sender<Result<JsonRpcResponse, PendingRequestError>>,
+        >,
+    >,
+>;
 
 impl ActiveServer {
     fn new(
@@ -1330,8 +1348,14 @@ impl ActiveServer {
         }
 
         match timeout(request_timeout, receiver).await {
-            Ok(Ok(response)) => {
+            Ok(Ok(Ok(response))) => {
                 response.into_result(&self.name, method.to_owned())
+            }
+            Ok(Ok(Err(PendingRequestError::ServerExited))) => {
+                Err(LspError::ServerExited {
+                    server: self.name.clone(),
+                    method: method.to_owned(),
+                })
             }
             Ok(Err(_)) => Err(LspError::RequestCanceled {
                 server: self.name.clone(),
@@ -1433,6 +1457,11 @@ struct JsonRpcResponse {
     error: Option<ResponseError>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PendingRequestError {
+    ServerExited,
+}
+
 impl JsonRpcResponse {
     fn into_result(
         self,
@@ -1518,6 +1547,11 @@ async fn reader_loop(
             }
         }
     }
+
+    let pending = std::mem::take(&mut *active.pending.lock().await);
+    for sender in pending.into_values() {
+        let _ = sender.send(Err(PendingRequestError::ServerExited));
+    }
 }
 
 async fn stderr_loop(server: String, stderr: ChildStderr) {
@@ -1581,7 +1615,7 @@ async fn handle_incoming_message(
     };
 
     if let Some(sender) = active.pending.lock().await.remove(&id) {
-        let _ = sender.send(response);
+        let _ = sender.send(Ok(response));
     } else {
         debug!(server = %server, request_id = id, "ignoring stale LSP response");
     }

@@ -11,15 +11,15 @@ use rmcp::{
     service::RequestContext,
     transport::stdio,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use tracing::info;
 
 use crate::{
-    config::Config,
-    lsp::{LazyLanguageServer, ServerSnapshot},
+    config::{Config, ConfigRouteError},
+    lsp::{LazyLanguageServer, LspError, ServerSnapshot},
     positions::Position,
-    project::{Project, StartupState},
+    project::{Project, ProjectPathError, StartupState},
 };
 
 const SERVER_STATUS_TOOL: &str = "deixis_server_status";
@@ -141,29 +141,45 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
-        let language_server = match arguments.server.as_deref() {
-            Some(name) => self.language_servers.get(name),
-            None => self.language_servers.values().next(),
-        };
+        let language_server_name = arguments.server.as_deref().or_else(|| {
+            self.language_servers.keys().next().map(String::as_str)
+        });
+        let language_server = language_server_name
+            .and_then(|name| self.language_servers.get(name));
         let Some(language_server) = language_server else {
-            let message = arguments.server.map_or_else(
-                || "no language server is configured".to_owned(),
-                |name| format!("server `{name}` is not configured"),
+            let error = arguments.server.as_deref().map_or_else(
+                || {
+                    ToolError::new(
+                        "no_server_configured",
+                        SERVER_STATUS_TOOL,
+                        "no language server is configured",
+                    )
+                },
+                |name| {
+                    ToolError::new(
+                        "unknown_server",
+                        SERVER_STATUS_TOOL,
+                        format!("server `{name}` is not configured"),
+                    )
+                    .with_server(name)
+                },
             );
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                message,
-            )])
-            .into());
+            return Ok(error_result(error));
         };
 
         let status = if arguments.start {
             match language_server.ensure_started().await {
                 Ok(status) => status,
                 Err(error) => {
-                    return Ok(CallToolResult::error(vec![
-                        ContentBlock::text(error.to_string()),
-                    ])
-                    .into());
+                    return Ok(error_result(ToolError::from_lsp(
+                        ToolContext {
+                            tool: SERVER_STATUS_TOOL,
+                            server: language_server_name,
+                            method: Some("initialize"),
+                            path: None,
+                        },
+                        &error,
+                    )));
                 }
             }
         } else {
@@ -189,28 +205,39 @@ impl DeixisServer {
         })?;
         arguments.validate()?;
         let Some(config) = self.config() else {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "no language server is configured",
-            )])
-            .into());
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    HOVER_TOOL,
+                    "no language server is configured",
+                )
+                .with_method("textDocument/hover")
+                .with_path(&arguments.path),
+            ));
         };
         let file = match self.project().resolve_file(&arguments.path) {
             Ok(file) => file,
             Err(error) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    error.to_string(),
-                )])
-                .into());
+                return Ok(error_result(ToolError::from_path(
+                    HOVER_TOOL,
+                    "textDocument/hover",
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
             }
         };
         let route =
             match config.route(file.relative(), arguments.server.as_deref()) {
                 Ok(route) => route,
                 Err(error) => {
-                    return Ok(CallToolResult::error(vec![
-                        ContentBlock::text(error.to_string()),
-                    ])
-                    .into());
+                    return Ok(error_result(ToolError::from_route(
+                        HOVER_TOOL,
+                        "textDocument/hover",
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
                 }
             };
         let language_server = self
@@ -224,10 +251,15 @@ impl DeixisServer {
         {
             Ok(hover) => hover,
             Err(error) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    error.to_string(),
-                )])
-                .into());
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: HOVER_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some("textDocument/hover"),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
             }
         };
 
@@ -275,28 +307,39 @@ impl DeixisServer {
         })?;
         arguments.validate()?;
         let Some(config) = self.config() else {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "no language server is configured",
-            )])
-            .into());
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    DEFINITION_TOOL,
+                    "no language server is configured",
+                )
+                .with_method("textDocument/definition")
+                .with_path(&arguments.path),
+            ));
         };
         let file = match self.project().resolve_file(&arguments.path) {
             Ok(file) => file,
             Err(error) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    error.to_string(),
-                )])
-                .into());
+                return Ok(error_result(ToolError::from_path(
+                    DEFINITION_TOOL,
+                    "textDocument/definition",
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
             }
         };
         let route =
             match config.route(file.relative(), arguments.server.as_deref()) {
                 Ok(route) => route,
                 Err(error) => {
-                    return Ok(CallToolResult::error(vec![
-                        ContentBlock::text(error.to_string()),
-                    ])
-                    .into());
+                    return Ok(error_result(ToolError::from_route(
+                        DEFINITION_TOOL,
+                        "textDocument/definition",
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
                 }
             };
         let language_server = self
@@ -314,10 +357,15 @@ impl DeixisServer {
         {
             Ok(definitions) => definitions,
             Err(error) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    error.to_string(),
-                )])
-                .into());
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: DEFINITION_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some("textDocument/definition"),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
             }
         };
         let text = if definitions.is_empty() {
@@ -341,6 +389,212 @@ impl DeixisServer {
 
         Ok(result.into())
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolError {
+    code: &'static str,
+    message: String,
+    tool: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lsp_error: Option<LspResponseError>,
+}
+
+#[derive(Debug, Serialize)]
+struct LspResponseError {
+    code: i64,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<JsonValue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolContext<'a> {
+    tool: &'static str,
+    server: Option<&'a str>,
+    method: Option<&'a str>,
+    path: Option<&'a str>,
+}
+
+impl ToolError {
+    fn new(
+        code: &'static str,
+        tool: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            tool,
+            server: None,
+            method: None,
+            path: None,
+            timeout_ms: None,
+            lsp_error: None,
+        }
+    }
+
+    fn with_server(mut self, server: &str) -> Self {
+        self.server = Some(server.to_owned());
+        self
+    }
+
+    fn with_method(mut self, method: &str) -> Self {
+        self.method = Some(method.to_owned());
+        self
+    }
+
+    fn with_path(mut self, path: &str) -> Self {
+        self.path = Some(path.to_owned());
+        self
+    }
+
+    fn from_path(
+        tool: &'static str,
+        method: &'static str,
+        path: &str,
+        server: Option<&str>,
+        error: &ProjectPathError,
+    ) -> Self {
+        let mut result = Self::new("invalid_path", tool, error.to_string())
+            .with_method(method)
+            .with_path(path);
+        if let Some(server) = server {
+            result = result.with_server(server);
+        }
+        result
+    }
+
+    fn from_route(
+        tool: &'static str,
+        method: &'static str,
+        path: &str,
+        server: Option<&str>,
+        error: &ConfigRouteError,
+    ) -> Self {
+        let mut result = Self::new("routing_error", tool, error.to_string())
+            .with_method(method)
+            .with_path(path);
+        if let Some(server) = server {
+            result = result.with_server(server);
+        }
+        result
+    }
+
+    fn from_lsp(context: ToolContext<'_>, error: &LspError) -> Self {
+        let mut result =
+            Self::new(lsp_error_code(error), context.tool, error.to_string());
+        if let Some(server) = context.server {
+            result = result.with_server(server);
+        }
+        if let Some(method) = context.method {
+            result = result.with_method(method);
+        }
+        if let Some(path) = context.path {
+            result = result.with_path(path);
+        }
+
+        match error {
+            LspError::Spawn { server, .. }
+            | LspError::MissingPipe { server, .. }
+            | LspError::UnsupportedDocumentSynchronization { server, .. }
+            | LspError::UnsupportedPositionEncoding { server, .. }
+            | LspError::PositionConversion { server, .. }
+            | LspError::DocumentSynchronizationClosed { server, .. }
+            | LspError::DocumentLanguageChanged { server, .. }
+            | LspError::DocumentVersionOverflow { server, .. }
+            | LspError::TransportClosed { server }
+            | LspError::Shutdown { server, .. } => {
+                result.server = Some(server.clone());
+            }
+            LspError::UnsupportedCapability { server, method } => {
+                result.server = Some(server.clone());
+                result.method = Some((*method).to_owned());
+            }
+            LspError::ServerExited { server, method }
+            | LspError::RequestCanceled { server, method } => {
+                result.server = Some(server.clone());
+                result.method = Some(method.clone());
+            }
+            LspError::RequestTimeout {
+                server,
+                method,
+                timeout,
+            } => {
+                result.server = Some(server.clone());
+                result.method = Some(method.clone());
+                result.timeout_ms = Some(
+                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                );
+            }
+            LspError::ResponseError {
+                server,
+                method,
+                code,
+                message,
+                data,
+            } => {
+                result.server = Some(server.clone());
+                result.method = Some(method.clone());
+                result.lsp_error = Some(LspResponseError {
+                    code: *code,
+                    message: message.clone(),
+                    data: data.clone(),
+                });
+            }
+            LspError::EncodeMessage(_)
+            | LspError::DecodeResult(_)
+            | LspError::DocumentPath(_)
+            | LspError::ReadDocument { .. } => {}
+        }
+
+        result
+    }
+}
+
+fn lsp_error_code(error: &LspError) -> &'static str {
+    match error {
+        LspError::DocumentPath(_) => "invalid_path",
+        LspError::PositionConversion { .. } => "invalid_position",
+        LspError::UnsupportedDocumentSynchronization { .. }
+        | LspError::UnsupportedPositionEncoding { .. }
+        | LspError::UnsupportedCapability { .. } => "unsupported_capability",
+        LspError::RequestTimeout { .. } => "request_timeout",
+        LspError::TransportClosed { .. } | LspError::ServerExited { .. } => {
+            "server_exited"
+        }
+        LspError::ResponseError { .. } => "lsp_error",
+        LspError::Spawn { .. } | LspError::MissingPipe { .. } => {
+            "server_start_failed"
+        }
+        LspError::EncodeMessage(_) | LspError::DecodeResult(_) => {
+            "lsp_protocol_error"
+        }
+        LspError::ReadDocument { .. }
+        | LspError::DocumentSynchronizationClosed { .. }
+        | LspError::DocumentLanguageChanged { .. }
+        | LspError::DocumentVersionOverflow { .. } => "document_error",
+        LspError::RequestCanceled { .. } => "request_canceled",
+        LspError::Shutdown { .. } => "server_error",
+    }
+}
+
+fn error_result(error: ToolError) -> CallToolResponse {
+    let message = error.message.clone();
+    let mut result = CallToolResult::structured_error(json!({
+        "error": error,
+    }));
+    result.content = vec![ContentBlock::text(message)];
+    result.into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,6 +715,7 @@ fn server_status_tool() -> Tool {
             "additionalProperties": false
         })),
     )
+    .with_raw_output_schema(result_output_schema(status_output_schema()))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(true)
@@ -493,7 +748,7 @@ fn hover_tool() -> Tool {
             "additionalProperties": false
         })),
     )
-    .with_raw_output_schema(Arc::new(object_schema(json!({
+    .with_raw_output_schema(result_output_schema(json!({
         "type": "object",
         "properties": {
             "contents": {
@@ -550,7 +805,7 @@ fn hover_tool() -> Tool {
         },
         "required": ["contents"],
         "additionalProperties": false
-    }))))
+    })))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(true)
@@ -583,7 +838,7 @@ fn definition_tool() -> Tool {
             "additionalProperties": false
         })),
     )
-    .with_raw_output_schema(Arc::new(object_schema(json!({
+    .with_raw_output_schema(result_output_schema(json!({
         "type": "object",
         "properties": {
             "locations": {
@@ -617,7 +872,7 @@ fn definition_tool() -> Tool {
         },
         "required": ["locations"],
         "additionalProperties": false
-    }))))
+    })))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(true)
@@ -655,6 +910,93 @@ fn range_schema() -> JsonValue {
             "end": position_schema()
         },
         "required": ["start", "end"],
+        "additionalProperties": false
+    })
+}
+
+fn status_output_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "configuredName": { "type": "string" },
+            "started": { "type": "boolean" },
+            "serverName": { "type": ["string", "null"] },
+            "serverVersion": { "type": ["string", "null"] },
+            "positionEncoding": {
+                "enum": ["utf-8", "utf-16", "utf-32", null]
+            },
+            "textDocumentSync": {},
+            "capabilities": { "type": "object" }
+        },
+        "required": [
+            "configuredName",
+            "started",
+            "serverName",
+            "serverVersion",
+            "positionEncoding",
+            "textDocumentSync",
+            "capabilities"
+        ],
+        "additionalProperties": false
+    })
+}
+
+fn result_output_schema(success: JsonValue) -> Arc<JsonObject> {
+    Arc::new(object_schema(json!({
+        "oneOf": [success, error_output_schema()]
+    })))
+}
+
+fn error_output_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "error": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "enum": [
+                            "invalid_path",
+                            "invalid_position",
+                            "unsupported_capability",
+                            "request_timeout",
+                            "server_exited",
+                            "lsp_error",
+                            "server_start_failed",
+                            "lsp_protocol_error",
+                            "document_error",
+                            "request_canceled",
+                            "server_error",
+                            "routing_error",
+                            "no_server_configured",
+                            "unknown_server"
+                        ]
+                    },
+                    "message": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "server": { "type": "string" },
+                    "method": { "type": "string" },
+                    "path": { "type": "string" },
+                    "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 0
+                    },
+                    "lspError": {
+                        "type": "object",
+                        "properties": {
+                            "code": { "type": "integer" },
+                            "message": { "type": "string" },
+                            "data": {}
+                        },
+                        "required": ["code", "message"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["code", "message", "tool"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["error"],
         "additionalProperties": false
     })
 }

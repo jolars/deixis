@@ -62,7 +62,7 @@ Windows.
   fallback.
 - [x] Add capability-gated `definition`, normalize `Location` and
   `LocationLink`, and retain source-server provenance.
-- [ ] Define a consistent structured error shape for invalid paths, invalid
+- [x] Define a consistent structured error shape for invalid paths, invalid
   positions, unsupported capabilities, timeouts, server exits, and LSP
   errors.
 
@@ -99,8 +99,8 @@ support the corresponding LSP method.
   shutdown time with documented defaults.
 - [ ] Track language-server readiness signals and distinguish transient startup
   empties from stable no-result responses.
-- [ ] Forward MCP cancellation to LSP and fail all outstanding requests when a
-  child exits.
+- [ ] Forward MCP cancellation to LSP.
+- [x] Fail all outstanding requests when a child exits.
 - [ ] Add bounded restart behavior with crash-loop protection and useful stderr
   context.
 - [ ] Exercise concurrent requests, late responses, duplicate IDs, cancellation

@@ -9,7 +9,7 @@ use std::{
 
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, ServerCapabilities},
+    model::{CallToolRequestParams, CallToolResult, ServerCapabilities},
     transport::TokioChildProcess,
 };
 use serde_json::{Value as JsonValue, json};
@@ -239,6 +239,37 @@ async fn discovers_the_user_config_without_fixing_the_project_root()
         timeout(Duration::from_secs(10), client.list_tools(None)).await??;
 
     assert!(tools.tools.iter().any(|tool| tool.name == "hover"));
+    for tool in &tools.tools {
+        let output_schema = tool.output_schema.as_ref().unwrap_or_else(|| {
+            panic!("{} should declare an output schema", tool.name)
+        });
+        let error_codes = output_schema
+            .get("oneOf")
+            .and_then(JsonValue::as_array)
+            .and_then(|variants| {
+                variants.iter().find_map(|variant| {
+                    variant.pointer("/properties/error/properties/code/enum")
+                })
+            })
+            .and_then(JsonValue::as_array)
+            .unwrap_or_else(|| {
+                panic!("{} should advertise the shared error schema", tool.name)
+            });
+        for code in [
+            "invalid_path",
+            "invalid_position",
+            "unsupported_capability",
+            "request_timeout",
+            "server_exited",
+            "lsp_error",
+        ] {
+            assert!(
+                error_codes.contains(&json!(code)),
+                "{}: {code}",
+                tool.name
+            );
+        }
+    }
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())
@@ -372,6 +403,125 @@ async fn hover_rejects_a_server_without_the_capability()
     );
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn hover_failures_have_a_consistent_structured_shape()
+-> Result<(), Box<dyn Error>> {
+    let invalid_path =
+        call_hover_error("normal", "missing.rs", None, 0, 8, 1_000).await?;
+    assert_tool_error(
+        &invalid_path,
+        "invalid_path",
+        None,
+        Some("textDocument/hover"),
+        "missing.rs",
+    );
+
+    let invalid_position = call_hover_error(
+        "normal",
+        "main.rs",
+        Some("let answer = 42;\n"),
+        0,
+        100,
+        1_000,
+    )
+    .await?;
+    assert_tool_error(
+        &invalid_position,
+        "invalid_position",
+        Some("mock-lsp"),
+        Some("textDocument/hover"),
+        "main.rs",
+    );
+
+    let unsupported = call_hover_error(
+        "hover-unsupported",
+        "main.rs",
+        Some("let answer = 42;\n"),
+        0,
+        4,
+        1_000,
+    )
+    .await?;
+    assert_tool_error(
+        &unsupported,
+        "unsupported_capability",
+        Some("mock-lsp"),
+        Some("textDocument/hover"),
+        "main.rs",
+    );
+
+    let request_timeout = call_hover_error(
+        "hover-timeout",
+        "main.rs",
+        Some("let answer = 42;\n"),
+        0,
+        4,
+        50,
+    )
+    .await?;
+    assert_tool_error(
+        &request_timeout,
+        "request_timeout",
+        Some("mock-lsp"),
+        Some("textDocument/hover"),
+        "main.rs",
+    );
+    assert_eq!(
+        request_timeout
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/error/timeoutMs")),
+        Some(&json!(50))
+    );
+
+    let server_exit = call_hover_error(
+        "hover-exit",
+        "main.rs",
+        Some("let answer = 42;\n"),
+        0,
+        4,
+        1_000,
+    )
+    .await?;
+    assert_tool_error(
+        &server_exit,
+        "server_exited",
+        Some("mock-lsp"),
+        Some("textDocument/hover"),
+        "main.rs",
+    );
+
+    let lsp_error = call_hover_error(
+        "hover-error",
+        "main.rs",
+        Some("let answer = 42;\n"),
+        0,
+        4,
+        1_000,
+    )
+    .await?;
+    assert_tool_error(
+        &lsp_error,
+        "lsp_error",
+        Some("mock-lsp"),
+        Some("textDocument/hover"),
+        "main.rs",
+    );
+    assert_eq!(
+        lsp_error
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/error/lspError")),
+        Some(&json!({
+            "code": -32042,
+            "message": "mock hover failed",
+            "data": { "retry": false },
+        }))
+    );
+
     Ok(())
 }
 
@@ -620,6 +770,84 @@ fn unique_dir(name: &str) -> Result<PathBuf, std::io::Error> {
     Ok(path)
 }
 
+async fn call_hover_error(
+    mode: &str,
+    path: &str,
+    source: Option<&str>,
+    line: u32,
+    character: u32,
+    request_timeout_ms: u64,
+) -> Result<CallToolResult, Box<dyn Error>> {
+    let root = unique_dir(mode)?;
+    if let Some(source) = source {
+        fs::write(root.join(path), source)?;
+    }
+    let config_path = write_mock_config_for_mode_with_timeout(
+        &root,
+        mode,
+        request_timeout_ms,
+    )?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({
+        "path": path,
+        "position": { "line": line, "character": character },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("hover").with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(result)
+}
+
+fn assert_tool_error(
+    result: &CallToolResult,
+    code: &str,
+    server: Option<&str>,
+    method: Option<&str>,
+    path: &str,
+) {
+    assert_eq!(result.is_error, Some(true));
+    let error = result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .expect("tool errors should contain a structured error envelope");
+    assert_eq!(error.get("code").and_then(JsonValue::as_str), Some(code));
+    assert_eq!(error.get("tool").and_then(JsonValue::as_str), Some("hover"));
+    assert_eq!(error.get("server").and_then(JsonValue::as_str), server);
+    assert_eq!(error.get("method").and_then(JsonValue::as_str), method);
+    assert_eq!(error.get("path").and_then(JsonValue::as_str), Some(path));
+    let message = error
+        .get("message")
+        .and_then(JsonValue::as_str)
+        .expect("tool errors should contain a readable message");
+    assert_eq!(
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|content| content.text.as_str()),
+        Some(message)
+    );
+}
+
 fn write_mock_config(
     root: &std::path::Path,
 ) -> Result<PathBuf, Box<dyn Error>> {
@@ -630,14 +858,30 @@ fn write_mock_config_for_mode(
     root: &std::path::Path,
     mode: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    write_mock_config_for_mode_with_timeout(root, mode, 1_000)
+}
+
+fn write_mock_config_for_mode_with_timeout(
+    root: &std::path::Path,
+    mode: &str,
+    request_timeout_ms: u64,
+) -> Result<PathBuf, Box<dyn Error>> {
     let config_path = root.join("deixis.toml");
-    write_mock_config_to(&config_path, mode)?;
+    write_mock_config_to_with_timeout(&config_path, mode, request_timeout_ms)?;
     Ok(config_path)
 }
 
 fn write_mock_config_to(
     config_path: &std::path::Path,
     mode: &str,
+) -> Result<(), Box<dyn Error>> {
+    write_mock_config_to_with_timeout(config_path, mode, 1_000)
+}
+
+fn write_mock_config_to_with_timeout(
+    config_path: &std::path::Path,
+    mode: &str,
+    request_timeout_ms: u64,
 ) -> Result<(), Box<dyn Error>> {
     let server = support::mock_lsp_server()?;
     fs::write(
@@ -650,7 +894,7 @@ args = ["--mode", {}]
 file_extensions = {{ ".rs" = "rust" }}
 
 [servers.mock-lsp.timeouts]
-request_ms = 1000
+request_ms = {request_timeout_ms}
 shutdown_ms = 1000
 "#,
             support::toml_string(&server),

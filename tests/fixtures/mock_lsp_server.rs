@@ -233,6 +233,27 @@ fn handle_request<R: BufRead>(
             write_message(output, response(id, report))?;
         }
         "textDocument/hover" => {
+            if mode == "hover-timeout" {
+                return Ok(());
+            }
+            if mode == "hover-exit" {
+                return Err(io::Error::other(
+                    "mock language server exited during hover",
+                )
+                .into());
+            }
+            if mode == "hover-error" {
+                write_message(
+                    output,
+                    error_response_with_data(
+                        id,
+                        -32042,
+                        "mock hover failed".to_owned(),
+                        json_object([("retry", Json::Bool(false))]),
+                    ),
+                )?;
+                return Ok(());
+            }
             if mode == "hover-unsupported" {
                 write_message(
                     output,
@@ -835,6 +856,26 @@ fn error_response(id: Json, code: i64, message: String) -> Json {
             json_object([
                 ("code", Json::Number(code)),
                 ("message", Json::String(message)),
+            ]),
+        ),
+    ])
+}
+
+fn error_response_with_data(
+    id: Json,
+    code: i64,
+    message: String,
+    data: Json,
+) -> Json {
+    json_object([
+        ("jsonrpc", Json::String(JSONRPC_VERSION.to_owned())),
+        ("id", id),
+        (
+            "error",
+            json_object([
+                ("code", Json::Number(code)),
+                ("message", Json::String(message)),
+                ("data", data),
             ]),
         ),
     ])

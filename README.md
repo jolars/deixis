@@ -114,10 +114,17 @@ capability, and returns structured LSP markup with a concise text fallback.
 server, target URI, ranges, and target position encoding. References, symbols,
 diagnostics, and other semantic tools remain unshipped.
 
+Tool execution failures return `isError: true`, a concise text message, and a
+structured `error` object. Its stable `code`, `message`, and `tool` fields are
+supplemented with the server, LSP method, project path, timeout, or downstream
+JSON-RPC error when applicable. Invalid arguments remain MCP `invalid_params`
+protocol errors.
+
 Startup sends `initialize` and `initialized`, records reported capabilities,
 correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,
 handles common server-to-client workspace messages, tracks dynamic registration
-state, logs malformed server output without stopping the reader loop, rejects
+state, fails pending requests when a server exits, logs malformed server output
+without stopping the reader loop, rejects
 `workspace/applyEdit` while read-only, and shuts down with `shutdown`, `exit`,
 and a bounded forced-kill fallback.
 

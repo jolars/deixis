@@ -310,6 +310,22 @@ tool name, server name, method, project-relative path when applicable, and the
 underlying LSP or process error. Protocol data and source contents are not
 written to normal info logs.
 
+Tool execution failures set `isError` and return the same concise message as
+text plus a structured envelope under `structuredContent.error`. Every envelope
+contains a stable `code`, `message`, and `tool`; it includes `server`, `method`,
+and `path` when those values are known. Timeouts add `timeoutMs`. Downstream
+JSON-RPC failures add an `lspError` object containing the server's numeric code,
+message, and optional data. The public codes are `invalid_path`,
+`invalid_position`, `unsupported_capability`, `request_timeout`,
+`server_exited`, `lsp_error`, `server_start_failed`, `lsp_protocol_error`,
+`document_error`, `request_canceled`, `server_error`, `routing_error`,
+`no_server_configured`, and `unknown_server`. Malformed tool arguments remain
+MCP `invalid_params` protocol errors because tool execution has not begun.
+
+When a language server closes stdout, the reader resolves every pending request
+immediately as a server-exit failure. Those calls do not wait for their
+individual request deadlines.
+
 ## Repository shape
 
 The bootstrap is a single binary crate. It should remain one package until a
