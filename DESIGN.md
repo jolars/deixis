@@ -149,24 +149,22 @@ access, or command interpolation.
 
 Without selected configuration, the current server advertises no tools. With
 configuration, it advertises the read-only `deixis_server_status` lifecycle
-probe, `hover`, and `definition`. The probe accepts an optional server name and
-`start` flag; without a name, it uses the first name in stable lexical order.
-The semantic tools take a root-contained path, a zero-based UTF-8 position, and
-an optional server override. They resolve the path before routing, infer the
-language ID, synchronize the document, verify the corresponding server
-capability, and translate the request through the negotiated position encoding.
-Hover returns the LSP contents and optional range as structured JSON.
-Definition accepts `Location`, `Location[]`, `LocationLink[]`, or `null`, and
-normalizes every result to the `LocationLink` superset: configured server name,
-target URI, target range, target selection range, target position encoding, and
-an optional origin selection range. Each semantic tool also returns readable
-text content. No tool forwards arbitrary JSON-RPC.
+probe, `hover`, `definition`, `declaration`, `type_definition`, and
+`implementation`. The probe accepts an optional server name and `start` flag;
+without a name, it uses the first name in stable lexical order. The semantic
+tools take a root-contained path, a zero-based UTF-8 position, and an optional
+server override. They resolve the path before routing, infer the language ID,
+synchronize the document, verify the corresponding server capability, and
+translate the request through the negotiated position encoding. Hover returns
+the LSP contents and optional range as structured JSON. The four location tools
+accept `Location`, `Location[]`, `LocationLink[]`, or `null`, and normalize every
+result to the `LocationLink` superset: configured server name, target URI,
+target range, target selection range, target position encoding, and an optional
+origin selection range. Each semantic tool also returns readable text content.
+No tool forwards arbitrary JSON-RPC.
 
-The semantic tool set remains read-only. It starts with `hover` and
-`definition`; planned additions are:
+The semantic tool set remains read-only. Planned additions are:
 
-- `declaration`;
-- `type_definition` and `implementation`;
 - `references`;
 - `document_symbols` and `workspace_symbols`; and
 - `diagnostics`.
@@ -187,7 +185,7 @@ request and result are stable regardless of the selected language server. The
 document layer translates positions to and from the server's negotiated UTF-8,
 UTF-16, or UTF-32 encoding and rejects missing lines, offsets past a line end,
 reversed ranges, and offsets that split a code point. LF, CRLF, and CR are
-logical line endings and cannot be addressed from within a position. Definition
+logical line endings and cannot be addressed from within a position. Location
 targets outside the project, including virtual-document URI schemes, are never
 read merely because a server returned them. Their ranges retain the negotiated
 encoding, which is reported in `targetPositionEncoding`; an origin selection

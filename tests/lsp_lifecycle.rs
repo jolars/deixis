@@ -129,6 +129,12 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert_eq!(probe.hover_content_formats, ["markdown", "plaintext"]);
     assert!(probe.definition_dynamic_registration);
     assert!(probe.definition_link_support);
+    assert!(probe.declaration_dynamic_registration);
+    assert!(probe.declaration_link_support);
+    assert!(probe.type_definition_dynamic_registration);
+    assert!(probe.type_definition_link_support);
+    assert!(probe.implementation_dynamic_registration);
+    assert!(probe.implementation_link_support);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
     assert!(manager.dynamic_registrations().await.is_empty());
@@ -490,6 +496,102 @@ async fn maps_a_null_definition_response_to_no_locations()
 }
 
 #[tokio::test]
+async fn normalizes_declaration_type_definition_and_implementation()
+-> Result<(), Box<dyn Error>> {
+    for (mode, operation) in [
+        ("declaration-location-utf-8", "declaration"),
+        ("type-definition-locations-utf-16", "type_definition"),
+        ("implementation-links-utf-32", "implementation"),
+    ] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+        let locations = match operation {
+            "declaration" => {
+                manager
+                    .declaration("main.rs", "rust", Position::new(0, 8))
+                    .await?
+            }
+            "type_definition" => {
+                manager
+                    .type_definition("main.rs", "rust", Position::new(0, 8))
+                    .await?
+            }
+            "implementation" => {
+                manager
+                    .implementation("main.rs", "rust", Position::new(0, 8))
+                    .await?
+            }
+            _ => unreachable!(),
+        };
+
+        assert_eq!(locations.len(), 1, "{mode}");
+        assert_eq!(locations[0].server, "mock-lsp", "{mode}");
+        assert!(locations[0].uri.ends_with("/main.rs"), "{mode}");
+        assert_eq!(
+            locations[0].target_range,
+            Range::new(Position::new(0, 8), Position::new(0, 14)),
+            "{mode}"
+        );
+        assert_eq!(
+            locations[0].target_selection_range, locations[0].target_range,
+            "{mode}"
+        );
+        assert_eq!(
+            locations[0].target_position_encoding,
+            PositionEncoding::Utf8,
+            "{mode}"
+        );
+        assert_eq!(locations[0].origin_selection_range, None, "{mode}");
+
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_new_location_operations_before_synchronizing_when_unsupported()
+-> Result<(), Box<dyn Error>> {
+    for (mode, operation) in [
+        ("declaration-unsupported", "declaration"),
+        ("type-definition-unsupported", "type_definition"),
+        ("implementation-unsupported", "implementation"),
+    ] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+        let error = match operation {
+            "declaration" => manager
+                .declaration("main.rs", "rust", Position::new(0, 8))
+                .await
+                .unwrap_err(),
+            "type_definition" => manager
+                .type_definition("main.rs", "rust", Position::new(0, 8))
+                .await
+                .unwrap_err(),
+            "implementation" => manager
+                .implementation("main.rs", "rust", Position::new(0, 8))
+                .await
+                .unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(error, LspError::UnsupportedCapability { .. }),
+            "{mode}: {error}"
+        );
+
+        let probe: DocumentEventsResponse = manager
+            .request("mock/documentEvents", JsonValue::Null)
+            .await?;
+        assert!(probe.events.is_empty(), "{mode}");
+        assert_eq!(probe.open_documents, 0, "{mode}");
+
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
 {
     let manager = configured_manager("malformed", 1_000, 1_000)?;
@@ -649,6 +751,12 @@ struct ProbeResponse {
     hover_content_formats: Vec<String>,
     definition_dynamic_registration: bool,
     definition_link_support: bool,
+    declaration_dynamic_registration: bool,
+    declaration_link_support: bool,
+    type_definition_dynamic_registration: bool,
+    type_definition_link_support: bool,
+    implementation_dynamic_registration: bool,
+    implementation_link_support: bool,
 }
 
 #[derive(Debug, Deserialize)]

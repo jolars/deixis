@@ -99,10 +99,13 @@ fn handle_request<R: BufRead>(
                 "hover-utf-16"
                 | "definition-locations-utf-16"
                 | "definition-project-target-utf-16"
-                | "definition-external-utf-16" => {
+                | "definition-external-utf-16"
+                | "type-definition-locations-utf-16" => {
                     Some(Json::String("utf-16".to_owned()))
                 }
-                "hover-utf-32" | "definition-links-utf-32" => {
+                "hover-utf-32"
+                | "definition-links-utf-32"
+                | "implementation-links-utf-32" => {
                     Some(Json::String("utf-32".to_owned()))
                 }
                 _ => Some(Json::String("utf-8".to_owned())),
@@ -123,10 +126,43 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let declaration_provider = match mode {
+                "declaration-unsupported" => Json::Bool(false),
+                "declaration-options" => json_object([(
+                    "workDoneProgress",
+                    Json::Bool(true),
+                )]),
+                _ => Json::Bool(true),
+            };
+            let type_definition_provider = match mode {
+                "type-definition-unsupported" => Json::Bool(false),
+                "type-definition-options" => json_object([(
+                    "workDoneProgress",
+                    Json::Bool(true),
+                )]),
+                _ => Json::Bool(true),
+            };
+            let implementation_provider = match mode {
+                "implementation-unsupported" => Json::Bool(false),
+                "implementation-options" => json_object([(
+                    "workDoneProgress",
+                    Json::Bool(true),
+                )]),
+                _ => Json::Bool(true),
+            };
             let mut capabilities = vec![
+                ("declarationProvider".to_owned(), declaration_provider),
                 ("definitionProvider".to_owned(), definition_provider),
                 ("hoverProvider".to_owned(), hover_provider),
+                (
+                    "implementationProvider".to_owned(),
+                    implementation_provider,
+                ),
                 ("textDocumentSync".to_owned(), text_document_sync),
+                (
+                    "typeDefinitionProvider".to_owned(),
+                    type_definition_provider,
+                ),
             ];
             if let Some(position_encoding) = position_encoding {
                 capabilities.push((
@@ -338,25 +374,35 @@ fn handle_request<R: BufRead>(
                 ),
             )?;
         }
-        "textDocument/definition" => {
-            if mode == "definition-unsupported" {
+        "textDocument/declaration"
+        | "textDocument/definition"
+        | "textDocument/implementation"
+        | "textDocument/typeDefinition" => {
+            let operation = match method {
+                "textDocument/declaration" => "declaration",
+                "textDocument/definition" => "definition",
+                "textDocument/implementation" => "implementation",
+                "textDocument/typeDefinition" => "type-definition",
+                _ => unreachable!(),
+            };
+            if mode == format!("{operation}-unsupported") {
                 write_message(
                     output,
                     error_response(
                         id,
                         -32601,
-                        "definition request bypassed capability gate".to_owned(),
+                        format!("{operation} request bypassed capability gate"),
                     ),
                 )?;
                 return Ok(());
             }
 
-            let expected_character = match mode {
-                "definition-locations-utf-16"
-                | "definition-project-target-utf-16"
-                | "definition-external-utf-16" => 6,
-                "definition-links-utf-32" => 5,
-                _ => 8,
+            let expected_character = if mode.ends_with("utf-16") {
+                6
+            } else if mode.ends_with("utf-32") {
+                5
+            } else {
+                8
             };
             let position = params.get("position");
             let line = position
@@ -372,7 +418,7 @@ fn handle_request<R: BufRead>(
                         id,
                         -32602,
                         format!(
-                            "expected definition position 0:{expected_character}, got {line:?}:{character:?}"
+                            "expected {operation} position 0:{expected_character}, got {line:?}:{character:?}"
                         ),
                     ),
                 )?;
@@ -415,10 +461,10 @@ fn handle_request<R: BufRead>(
                 ("range", selection_range.clone()),
             ]);
             let result = match mode {
-                "definition-locations-utf-16" => {
+                mode if mode.contains("-locations-") => {
                     Json::Array(vec![location])
                 }
-                "definition-links-utf-32" => Json::Array(vec![json_object([
+                mode if mode.contains("-links-") => Json::Array(vec![json_object([
                     ("targetUri", Json::String(target_uri)),
                     ("targetRange", selection_range.clone()),
                     ("targetSelectionRange", selection_range),
@@ -435,7 +481,7 @@ fn handle_request<R: BufRead>(
                         ("targetSelectionRange", selection_range),
                     ])])
                 }
-                "definition-null" => Json::Null,
+                mode if mode.ends_with("-null") => Json::Null,
                 _ => location,
             };
             write_message(output, response(id, result))?;
@@ -671,6 +717,12 @@ fn probe_client<R: BufRead>(
         hover_content_formats,
         definition_dynamic_registration,
         definition_link_support,
+        declaration_dynamic_registration,
+        declaration_link_support,
+        type_definition_dynamic_registration,
+        type_definition_link_support,
+        implementation_dynamic_registration,
+        implementation_link_support,
     ) = {
         let mut state = state.lock().unwrap();
         state.client_probe_complete = true;
@@ -707,12 +759,55 @@ fn probe_client<R: BufRead>(
             .and_then(|definition| definition.get("linkSupport"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let declaration = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("declaration"));
+        let declaration_dynamic_registration = declaration
+            .and_then(|declaration| declaration.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let declaration_link_support = declaration
+            .and_then(|declaration| declaration.get("linkSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let type_definition = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("typeDefinition"));
+        let type_definition_dynamic_registration = type_definition
+            .and_then(|type_definition| {
+                type_definition.get("dynamicRegistration")
+            })
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let type_definition_link_support = type_definition
+            .and_then(|type_definition| type_definition.get("linkSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let implementation = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("implementation"));
+        let implementation_dynamic_registration = implementation
+            .and_then(|implementation| {
+                implementation.get("dynamicRegistration")
+            })
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let implementation_link_support = implementation
+            .and_then(|implementation| implementation.get("linkSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         (
             position_encodings,
             dynamic_registration,
             content_formats,
             definition_dynamic_registration,
             definition_link_support,
+            declaration_dynamic_registration,
+            declaration_link_support,
+            type_definition_dynamic_registration,
+            type_definition_link_support,
+            implementation_dynamic_registration,
+            implementation_link_support,
         )
     };
     Ok(json_object([
@@ -806,6 +901,30 @@ fn probe_client<R: BufRead>(
         (
             "definition_link_support",
             Json::Bool(definition_link_support),
+        ),
+        (
+            "declaration_dynamic_registration",
+            Json::Bool(declaration_dynamic_registration),
+        ),
+        (
+            "declaration_link_support",
+            Json::Bool(declaration_link_support),
+        ),
+        (
+            "type_definition_dynamic_registration",
+            Json::Bool(type_definition_dynamic_registration),
+        ),
+        (
+            "type_definition_link_support",
+            Json::Bool(type_definition_link_support),
+        ),
+        (
+            "implementation_dynamic_registration",
+            Json::Bool(implementation_dynamic_registration),
+        ),
+        (
+            "implementation_link_support",
+            Json::Bool(implementation_link_support),
         ),
     ]))
 }

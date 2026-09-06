@@ -668,6 +668,174 @@ async fn definition_rejects_a_server_without_the_capability()
 }
 
 #[tokio::test]
+async fn exposes_declaration_type_definition_and_implementation_end_to_end()
+-> Result<(), Box<dyn Error>> {
+    for (tool, mode) in [
+        ("declaration", "declaration-location-utf-8"),
+        ("type_definition", "type-definition-locations-utf-16"),
+        ("implementation", "implementation-links-utf-32"),
+    ] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+        let tools =
+            timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+        let semantic_tool = tools
+            .tools
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .unwrap_or_else(|| {
+                panic!("configured servers should expose {tool}")
+            });
+        assert_eq!(
+            semantic_tool.input_schema.get("required"),
+            Some(&json!(["path", "position"])),
+            "{tool}"
+        );
+        assert!(semantic_tool.output_schema.is_some(), "{tool}");
+        assert_eq!(
+            semantic_tool
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint),
+            Some(true)
+        );
+
+        let arguments = json!({
+            "path": "main.rs",
+            "position": { "line": 0, "character": 8 },
+        })
+        .as_object()
+        .expect("semantic arguments should be an object")
+        .clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new(tool).with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(false), "{tool}");
+        let locations = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("locations"))
+            .and_then(JsonValue::as_array)
+            .unwrap_or_else(|| panic!("{tool} should return locations"));
+        assert_eq!(locations.len(), 1, "{tool}");
+        assert_eq!(locations[0]["server"], "mock-lsp", "{tool}");
+        assert!(
+            locations[0]["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/main.rs")),
+            "{tool}"
+        );
+        assert_eq!(
+            locations[0]["targetSelectionRange"],
+            json!({
+                "start": { "line": 0, "character": 8 },
+                "end": { "line": 0, "character": 14 },
+            }),
+            "{tool}"
+        );
+        assert_eq!(locations[0]["targetPositionEncoding"], "utf-8", "{tool}");
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_location_tools_report_their_unsupported_capabilities()
+-> Result<(), Box<dyn Error>> {
+    for (tool, mode, method) in [
+        (
+            "declaration",
+            "declaration-unsupported",
+            "textDocument/declaration",
+        ),
+        (
+            "type_definition",
+            "type-definition-unsupported",
+            "textDocument/typeDefinition",
+        ),
+        (
+            "implementation",
+            "implementation-unsupported",
+            "textDocument/implementation",
+        ),
+    ] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+        let arguments = json!({
+            "path": "main.rs",
+            "position": { "line": 0, "character": 4 },
+        })
+        .as_object()
+        .expect("semantic arguments should be an object")
+        .clone();
+
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new(tool).with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(true), "{tool}");
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/error/code")),
+            Some(&json!("unsupported_capability")),
+            "{tool}"
+        );
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/error/method")),
+            Some(&json!(method)),
+            "{tool}"
+        );
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/error/tool")),
+            Some(&json!(tool)),
+            "{tool}"
+        );
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn routes_hover_to_the_server_selected_by_the_file_extension()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("multi-server-routing")?;

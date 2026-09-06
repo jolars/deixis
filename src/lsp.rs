@@ -154,6 +154,72 @@ impl LazyLanguageServer {
         language_id: &str,
         position: Position,
     ) -> Result<Vec<DefinitionLocation>, LspError> {
+        self.location_request(
+            path,
+            language_id,
+            position,
+            "textDocument/definition",
+            "definitionProvider",
+        )
+        .await
+    }
+
+    pub async fn declaration(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
+        self.location_request(
+            path,
+            language_id,
+            position,
+            "textDocument/declaration",
+            "declarationProvider",
+        )
+        .await
+    }
+
+    pub async fn type_definition(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
+        self.location_request(
+            path,
+            language_id,
+            position,
+            "textDocument/typeDefinition",
+            "typeDefinitionProvider",
+        )
+        .await
+    }
+
+    pub async fn implementation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
+        self.location_request(
+            path,
+            language_id,
+            position,
+            "textDocument/implementation",
+            "implementationProvider",
+        )
+        .await
+    }
+
+    async fn location_request(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        method: &'static str,
+        capability: &'static str,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
         let file = self
             .project
             .resolve_file(path)
@@ -161,15 +227,12 @@ impl LazyLanguageServer {
         let active = self.active_server().await?;
         let snapshot = active.status.lock().await.clone();
         if !active
-            .supports_method(
-                "textDocument/definition",
-                snapshot.capabilities().get("definitionProvider"),
-            )
+            .supports_method(method, snapshot.capabilities().get(capability))
             .await
         {
             return Err(LspError::UnsupportedCapability {
                 server: self.config.name().to_owned(),
-                method: "textDocument/definition",
+                method,
             });
         }
 
@@ -184,7 +247,7 @@ impl LazyLanguageServer {
             })?;
         let value = active
             .request_value(
-                "textDocument/definition",
+                method,
                 json!({
                     "textDocument": { "uri": document.uri() },
                     "position": lsp_position,
@@ -192,18 +255,17 @@ impl LazyLanguageServer {
                 self.config.timeouts().request(),
             )
             .await?;
-        let response: Option<DefinitionResponse> =
+        let response: Option<LocationResponse> =
             serde_json::from_value(value).map_err(LspError::DecodeResult)?;
 
         let mut locations = Vec::new();
-        for location in response.into_iter().flat_map(DefinitionResponse::items)
-        {
+        for location in response.into_iter().flat_map(LocationResponse::items) {
             let (uri, target_range, target_selection_range, origin_range) =
                 match location {
-                    DefinitionResponseItem::Location(location) => {
+                    LocationResponseItem::Location(location) => {
                         (location.uri, location.range, location.range, None)
                     }
-                    DefinitionResponseItem::LocationLink(link) => (
+                    LocationResponseItem::LocationLink(link) => (
                         link.target_uri,
                         link.target_range,
                         link.target_selection_range,
@@ -222,7 +284,7 @@ impl LazyLanguageServer {
                 })
                 .transpose()?;
             let target = self
-                .normalize_definition_target(
+                .normalize_location_target(
                     &document,
                     &uri,
                     target_range,
@@ -243,7 +305,7 @@ impl LazyLanguageServer {
         Ok(locations)
     }
 
-    async fn normalize_definition_target(
+    async fn normalize_location_target(
         &self,
         document: &SynchronizedDocument,
         uri: &str,
@@ -408,32 +470,32 @@ impl DefinitionLocation {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum DefinitionResponse {
+enum LocationResponse {
     Location(Location),
     Locations(Vec<Location>),
     LocationLinks(Vec<LocationLink>),
 }
 
-impl DefinitionResponse {
-    fn items(self) -> Vec<DefinitionResponseItem> {
+impl LocationResponse {
+    fn items(self) -> Vec<LocationResponseItem> {
         match self {
             Self::Location(location) => {
-                vec![DefinitionResponseItem::Location(location)]
+                vec![LocationResponseItem::Location(location)]
             }
             Self::Locations(locations) => locations
                 .into_iter()
-                .map(DefinitionResponseItem::Location)
+                .map(LocationResponseItem::Location)
                 .collect(),
             Self::LocationLinks(links) => links
                 .into_iter()
-                .map(DefinitionResponseItem::LocationLink)
+                .map(LocationResponseItem::LocationLink)
                 .collect(),
         }
     }
 }
 
 #[derive(Debug)]
-enum DefinitionResponseItem {
+enum LocationResponseItem {
     Location(Location),
     LocationLink(LocationLink),
 }
@@ -1830,6 +1892,10 @@ fn initialize_params(
                 },
             },
             "textDocument": {
+                "declaration": {
+                    "dynamicRegistration": true,
+                    "linkSupport": true,
+                },
                 "definition": {
                     "dynamicRegistration": true,
                     "linkSupport": true,
@@ -1837,6 +1903,14 @@ fn initialize_params(
                 "hover": {
                     "dynamicRegistration": true,
                     "contentFormat": ["markdown", "plaintext"],
+                },
+                "implementation": {
+                    "dynamicRegistration": true,
+                    "linkSupport": true,
+                },
+                "typeDefinition": {
+                    "dynamicRegistration": true,
+                    "linkSupport": true,
                 },
             },
         },

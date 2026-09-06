@@ -24,7 +24,51 @@ use crate::{
 
 const SERVER_STATUS_TOOL: &str = "deixis_server_status";
 const HOVER_TOOL: &str = "hover";
+const DECLARATION_TOOL: &str = "declaration";
 const DEFINITION_TOOL: &str = "definition";
+const TYPE_DEFINITION_TOOL: &str = "type_definition";
+const IMPLEMENTATION_TOOL: &str = "implementation";
+
+#[derive(Clone, Copy)]
+enum LocationOperation {
+    Declaration,
+    Definition,
+    TypeDefinition,
+    Implementation,
+}
+
+#[derive(Clone, Copy)]
+struct LocationToolSpec {
+    operation: LocationOperation,
+    tool: &'static str,
+    method: &'static str,
+    plural: &'static str,
+}
+
+const DECLARATION_SPEC: LocationToolSpec = LocationToolSpec {
+    operation: LocationOperation::Declaration,
+    tool: DECLARATION_TOOL,
+    method: "textDocument/declaration",
+    plural: "declarations",
+};
+const DEFINITION_SPEC: LocationToolSpec = LocationToolSpec {
+    operation: LocationOperation::Definition,
+    tool: DEFINITION_TOOL,
+    method: "textDocument/definition",
+    plural: "definitions",
+};
+const TYPE_DEFINITION_SPEC: LocationToolSpec = LocationToolSpec {
+    operation: LocationOperation::TypeDefinition,
+    tool: TYPE_DEFINITION_TOOL,
+    method: "textDocument/typeDefinition",
+    plural: "type definitions",
+};
+const IMPLEMENTATION_SPEC: LocationToolSpec = LocationToolSpec {
+    operation: LocationOperation::Implementation,
+    tool: IMPLEMENTATION_TOOL,
+    method: "textDocument/implementation",
+    plural: "implementations",
+};
 
 #[derive(Clone)]
 pub struct DeixisServer {
@@ -107,7 +151,14 @@ impl ServerHandler for DeixisServer {
         let tools = if self.language_servers.is_empty() {
             Vec::new()
         } else {
-            vec![server_status_tool(), hover_tool(), definition_tool()]
+            vec![
+                server_status_tool(),
+                hover_tool(),
+                location_tool(DECLARATION_SPEC),
+                location_tool(DEFINITION_SPEC),
+                location_tool(TYPE_DEFINITION_SPEC),
+                location_tool(IMPLEMENTATION_SPEC),
+            ]
         };
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -120,7 +171,18 @@ impl ServerHandler for DeixisServer {
         match request.name.as_ref() {
             SERVER_STATUS_TOOL => self.call_server_status(&request).await,
             HOVER_TOOL => self.call_hover(request).await,
-            DEFINITION_TOOL => self.call_definition(request).await,
+            DECLARATION_TOOL => {
+                self.call_location(request, DECLARATION_SPEC).await
+            }
+            DEFINITION_TOOL => {
+                self.call_location(request, DEFINITION_SPEC).await
+            }
+            TYPE_DEFINITION_TOOL => {
+                self.call_location(request, TYPE_DEFINITION_SPEC).await
+            }
+            IMPLEMENTATION_TOOL => {
+                self.call_location(request, IMPLEMENTATION_SPEC).await
+            }
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -291,29 +353,30 @@ impl DeixisServer {
         Ok(result.into())
     }
 
-    async fn call_definition(
+    async fn call_location(
         &self,
         request: CallToolRequestParams,
+        spec: LocationToolSpec,
     ) -> Result<CallToolResponse, McpError> {
         let arguments = request.arguments.unwrap_or_default();
-        let arguments = serde_json::from_value::<DefinitionArguments>(
+        let arguments = serde_json::from_value::<LocationArguments>(
             JsonValue::Object(arguments),
         )
         .map_err(|error| {
             McpError::invalid_params(
-                format!("invalid definition arguments: {error}"),
+                format!("invalid {} arguments: {error}", spec.tool),
                 None,
             )
         })?;
-        arguments.validate()?;
+        arguments.validate(spec.tool)?;
         let Some(config) = self.config() else {
             return Ok(error_result(
                 ToolError::new(
                     "no_server_configured",
-                    DEFINITION_TOOL,
+                    spec.tool,
                     "no language server is configured",
                 )
-                .with_method("textDocument/definition")
+                .with_method(spec.method)
                 .with_path(&arguments.path),
             ));
         };
@@ -321,8 +384,8 @@ impl DeixisServer {
             Ok(file) => file,
             Err(error) => {
                 return Ok(error_result(ToolError::from_path(
-                    DEFINITION_TOOL,
-                    "textDocument/definition",
+                    spec.tool,
+                    spec.method,
                     &arguments.path,
                     arguments.server.as_deref(),
                     &error,
@@ -334,8 +397,8 @@ impl DeixisServer {
                 Ok(route) => route,
                 Err(error) => {
                     return Ok(error_result(ToolError::from_route(
-                        DEFINITION_TOOL,
-                        "textDocument/definition",
+                        spec.tool,
+                        spec.method,
                         &arguments.path,
                         arguments.server.as_deref(),
                         &error,
@@ -347,39 +410,70 @@ impl DeixisServer {
             .get(route.server().name())
             .expect("every validated server should have a lifecycle manager");
 
-        let definitions = match language_server
-            .definition(
-                file.absolute(),
-                route.language_id(),
-                arguments.position,
-            )
-            .await
-        {
-            Ok(definitions) => definitions,
+        let locations = match spec.operation {
+            LocationOperation::Declaration => {
+                language_server
+                    .declaration(
+                        file.absolute(),
+                        route.language_id(),
+                        arguments.position,
+                    )
+                    .await
+            }
+            LocationOperation::Definition => {
+                language_server
+                    .definition(
+                        file.absolute(),
+                        route.language_id(),
+                        arguments.position,
+                    )
+                    .await
+            }
+            LocationOperation::TypeDefinition => {
+                language_server
+                    .type_definition(
+                        file.absolute(),
+                        route.language_id(),
+                        arguments.position,
+                    )
+                    .await
+            }
+            LocationOperation::Implementation => {
+                language_server
+                    .implementation(
+                        file.absolute(),
+                        route.language_id(),
+                        arguments.position,
+                    )
+                    .await
+            }
+        };
+        let locations = match locations {
+            Ok(locations) => locations,
             Err(error) => {
                 return Ok(error_result(ToolError::from_lsp(
                     ToolContext {
-                        tool: DEFINITION_TOOL,
+                        tool: spec.tool,
                         server: Some(route.server().name()),
-                        method: Some("textDocument/definition"),
+                        method: Some(spec.method),
                         path: Some(&arguments.path),
                     },
                     &error,
                 )));
             }
         };
-        let text = if definitions.is_empty() {
-            "No definitions.".to_owned()
+        let text = if locations.is_empty() {
+            format!("No {}.", spec.plural)
         } else {
-            definitions
+            locations
                 .iter()
-                .map(|definition| definition.text())
+                .map(|location| location.text())
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let locations = serde_json::to_value(definitions).map_err(|error| {
+        let locations = serde_json::to_value(locations).map_err(|error| {
             McpError::internal_error(
-                format!("failed to encode definition response: {error}"),
+                format!("failed to encode {} response: {error}", spec.tool),
                 None,
             )
         })?;
@@ -608,18 +702,18 @@ struct HoverArguments {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DefinitionArguments {
+struct LocationArguments {
     path: String,
     #[serde(default)]
     server: Option<String>,
     position: Position,
 }
 
-impl DefinitionArguments {
-    fn validate(&self) -> Result<(), McpError> {
+impl LocationArguments {
+    fn validate(&self, tool: &str) -> Result<(), McpError> {
         if self.path.is_empty() {
             return Err(McpError::invalid_params(
-                "invalid definition arguments: `path` must not be empty",
+                format!("invalid {tool} arguments: `path` must not be empty"),
                 None,
             ));
         }
@@ -629,7 +723,7 @@ impl DefinitionArguments {
             .is_some_and(|server| server.trim().is_empty())
         {
             return Err(McpError::invalid_params(
-                "invalid definition arguments: `server` must not be empty",
+                format!("invalid {tool} arguments: `server` must not be empty"),
                 None,
             ));
         }
@@ -815,10 +909,13 @@ fn hover_tool() -> Tool {
     )
 }
 
-fn definition_tool() -> Tool {
+fn location_tool(spec: LocationToolSpec) -> Tool {
     Tool::new(
-        DEFINITION_TOOL,
-        "Return definitions for a UTF-8 position in a project file.",
+        spec.tool,
+        format!(
+            "Return {} for a UTF-8 position in a project file.",
+            spec.plural
+        ),
         object_schema(json!({
             "type": "object",
             "properties": {
@@ -848,7 +945,7 @@ fn definition_tool() -> Tool {
                     "properties": {
                         "server": {
                             "type": "string",
-                            "description": "Configured name of the language server that returned this definition."
+                            "description": "Configured name of the language server that returned this location."
                         },
                         "uri": { "type": "string" },
                         "targetRange": range_schema(),
