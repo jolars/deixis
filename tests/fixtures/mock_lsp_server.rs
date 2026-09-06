@@ -96,27 +96,10 @@ fn handle_request<R: BufRead>(
                     Some(Json::String("utf-7".to_owned()))
                 }
                 "position-malformed" => Some(Json::Number(8)),
-                "document-incremental-utf-16" => {
+                mode if mode.ends_with("utf-16") => {
                     Some(Json::String("utf-16".to_owned()))
                 }
-                "document-incremental-utf-32" => {
-                    Some(Json::String("utf-32".to_owned()))
-                }
-                "hover-utf-16"
-                | "diagnostics-pull-utf-16"
-                | "definition-locations-utf-16"
-                | "definition-project-target-utf-16"
-                | "definition-external-utf-16"
-                | "document-symbols-flat-utf-16"
-                | "document-symbols-hierarchical-utf-16"
-                | "references-locations-utf-16"
-                | "workspace-symbol-wait-utf-16"
-                | "type-definition-locations-utf-16" => {
-                    Some(Json::String("utf-16".to_owned()))
-                }
-                "hover-utf-32"
-                | "definition-links-utf-32"
-                | "implementation-links-utf-32" => {
+                mode if mode.ends_with("utf-32") => {
                     Some(Json::String("utf-32".to_owned()))
                 }
                 _ => Some(Json::String("utf-8".to_owned())),
@@ -409,7 +392,29 @@ fn handle_request<R: BufRead>(
                 return Ok(());
             }
             let first_request = state.diagnostic_requests == 0;
-            let result = if first_request {
+            let partial_response = mode.contains("-partial-");
+            let result = if partial_response {
+                if previous_result_id.is_some() {
+                    drop(state);
+                    write_message(
+                        output,
+                        error_response(
+                            id,
+                            -32602,
+                            "first diagnostic request included a result id"
+                                .to_owned(),
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                json_object([
+                    ("kind", Json::String("full".to_owned())),
+                    (
+                        "items",
+                        Json::Array(vec![minimal_diagnostic(6, 12)]),
+                    ),
+                ])
+            } else if first_request {
                 if previous_result_id.is_some() {
                     drop(state);
                     write_message(
@@ -493,10 +498,12 @@ fn handle_request<R: BufRead>(
                 return Ok(());
             }
 
-            let expected_character = match mode {
-                "hover-utf-16" => 6,
-                "hover-utf-32" => 5,
-                _ => 8,
+            let expected_character = if mode.ends_with("utf-16") {
+                6
+            } else if mode.ends_with("utf-32") {
+                5
+            } else {
+                8
             };
             let position = params.get("position");
             let line = position
@@ -518,25 +525,31 @@ fn handle_request<R: BufRead>(
                 )?;
                 return Ok(());
             }
-            let hover_value = if mode == "hover-large-response" {
-                "x".repeat(8_192)
-            } else {
-                "`answer`: the ultimate value".to_owned()
-            };
-
-            write_message(
-                output,
-                response(
-                    id,
+            let result = match mode {
+                "semantic-responses-null" => Json::Null,
+                "semantic-responses-empty" => json_object([(
+                    "contents",
+                    Json::Array(Vec::new()),
+                )]),
+                mode if mode.contains("-partial-") => json_object([(
+                    "contents",
+                    Json::String("minimal hover".to_owned()),
+                )]),
+                _ => {
+                    let hover_value = if mode == "hover-large-response" {
+                        "x".repeat(8_192)
+                    } else {
+                        "`answer`: the ultimate value".to_owned()
+                    };
                     json_object([
                         (
                             "contents",
                             json_object([
-                                ("kind", Json::String("markdown".to_owned())),
                                 (
-                                    "value",
-                                    Json::String(hover_value),
+                                    "kind",
+                                    Json::String("markdown".to_owned()),
                                 ),
+                                ("value", Json::String(hover_value)),
                             ]),
                         ),
                         (
@@ -564,9 +577,11 @@ fn handle_request<R: BufRead>(
                                 ),
                             ]),
                         ),
-                    ]),
-                ),
-            )?;
+                    ])
+                }
+            };
+
+            write_message(output, response(id, result))?;
         }
         "textDocument/references" => {
             if mode == "references-unsupported" {
@@ -671,7 +686,12 @@ fn handle_request<R: BufRead>(
                     ]),
                 ),
             ]));
-            write_message(output, response(id, Json::Array(locations)))?;
+            let result = match mode {
+                "semantic-responses-null" => Json::Null,
+                "semantic-responses-empty" => Json::Array(Vec::new()),
+                _ => Json::Array(locations),
+            };
+            write_message(output, response(id, result))?;
         }
         "textDocument/documentSymbol" => {
             if mode == "document-symbols-unsupported" {
@@ -717,6 +737,16 @@ fn handle_request<R: BufRead>(
                     ])])
                 }
                 "document-symbols-null" => Json::Null,
+                "semantic-responses-null" => Json::Null,
+                "semantic-responses-empty" => Json::Array(Vec::new()),
+                mode if mode.contains("-partial-") => {
+                    Json::Array(vec![json_object([
+                        ("name", Json::String("answer".to_owned())),
+                        ("kind", Json::Number(13)),
+                        ("range", answer_range.clone()),
+                        ("selectionRange", answer_range),
+                    ])])
+                }
                 _ => Json::Array(vec![json_object([
                     ("name", Json::String("binding".to_owned())),
                     ("detail", Json::String("let binding".to_owned())),
@@ -833,6 +863,17 @@ fn handle_request<R: BufRead>(
                 ("range", selection_range.clone()),
             ]);
             let result = match mode {
+                "semantic-responses-null" => Json::Null,
+                "semantic-responses-empty" => Json::Array(Vec::new()),
+                "definition-multi-location-utf-16" => {
+                    Json::Array(vec![
+                        location,
+                        json_object([
+                            ("uri", Json::String(target_uri)),
+                            ("range", mock_range(0, 3)),
+                        ]),
+                    ])
+                }
                 mode if mode.contains("-locations-") => {
                     Json::Array(vec![location])
                 }
@@ -922,35 +963,57 @@ fn handle_request<R: BufRead>(
             } else {
                 (0, 3)
             };
-            let symbol = json_object([
-                ("name", Json::String(name)),
-                ("kind", Json::Number(12)),
-                ("tags", Json::Array(vec![Json::Number(1)])),
-                ("deprecated", Json::Bool(true)),
-                ("containerName", Json::String("mock crate".to_owned())),
-                (
-                    "location",
-                    json_object([
+            let uri = Json::String(format!(
+                "{}/main.rs",
+                root_uri.trim_end_matches('/')
+            ));
+            let result = match mode {
+                "semantic-responses-null" => Json::Null,
+                "semantic-responses-empty" => Json::Array(Vec::new()),
+                mode if mode.contains("-partial-") => {
+                    Json::Array(vec![json_object([
+                        ("name", Json::String("answer".to_owned())),
+                        ("kind", Json::Number(12)),
                         (
-                            "uri",
-                            Json::String(format!(
-                                "{}/main.rs",
-                                root_uri.trim_end_matches('/')
-                            )),
+                            "location",
+                            json_object([
+                                ("uri", uri),
+                                ("range", mock_range(start, end)),
+                            ]),
                         ),
-                        ("range", mock_range(start, end)),
-                    ]),
-                ),
-                (
-                    "data",
-                    json_object([
-                        ("query", Json::String(query.to_owned())),
-                        ("extension", Json::Bool(true)),
-                    ]),
-                ),
-                ("x-mock-extension", Json::Bool(true)),
-            ]);
-            write_message(output, response(id, Json::Array(vec![symbol])))?;
+                    ])])
+                }
+                _ => Json::Array(vec![json_object([
+                    ("name", Json::String(name)),
+                    ("kind", Json::Number(12)),
+                    ("tags", Json::Array(vec![Json::Number(1)])),
+                    ("deprecated", Json::Bool(true)),
+                    (
+                        "containerName",
+                        Json::String("mock crate".to_owned()),
+                    ),
+                    (
+                        "location",
+                        json_object([
+                            ("uri", uri),
+                            ("range", mock_range(start, end)),
+                            (
+                                "x-location-extension",
+                                Json::String("nested".to_owned()),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "data",
+                        json_object([
+                            ("query", Json::String(query.to_owned())),
+                            ("extension", Json::Bool(true)),
+                        ]),
+                    ),
+                    ("x-mock-extension", Json::Bool(true)),
+                ])]),
+            };
+            write_message(output, response(id, result))?;
         }
         "shutdown" => {
             if mode == "ignore-shutdown" {
@@ -1668,6 +1731,16 @@ fn mock_diagnostic(start: i64, end: i64) -> Json {
         (
             "data",
             json_object([("extension", Json::Bool(true))]),
+        ),
+    ])
+}
+
+fn minimal_diagnostic(start: i64, end: i64) -> Json {
+    json_object([
+        ("range", mock_range(start, end)),
+        (
+            "message",
+            Json::String("minimal diagnostic".to_owned()),
         ),
     ])
 }

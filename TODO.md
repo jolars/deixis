@@ -81,7 +81,7 @@ matrix.
   advertised. Mark unavailable or stale reports explicitly.
 - [x] Add stable text renderers for all tools without discarding structured LSP
   fields.
-- [ ] Test null, empty, partial, multi-location, deprecated, and extension-rich
+- [x] Test null, empty, partial, multi-location, deprecated, and extension-rich
   LSP responses.
 
 Acceptance: the read-only tool set works end to end against the mock server, and

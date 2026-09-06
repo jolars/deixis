@@ -826,6 +826,181 @@ async fn maps_a_null_definition_response_to_no_locations()
 }
 
 #[tokio::test]
+async fn normalizes_null_and_empty_semantic_responses()
+-> Result<(), Box<dyn Error>> {
+    for mode in ["semantic-responses-null", "semantic-responses-empty"] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+        let position = Position::new(0, 8);
+
+        let hover = manager.hover("main.rs", "rust", position).await?;
+        if mode.ends_with("null") {
+            assert!(hover.is_none(), "{mode}");
+        } else {
+            let hover =
+                hover.expect("the empty hover object should be retained");
+            assert_eq!(hover.text(), "", "{mode}");
+            assert_eq!(
+                serde_json::to_value(hover)?,
+                json!({ "contents": [] }),
+                "{mode}"
+            );
+        }
+
+        assert!(
+            manager
+                .declaration("main.rs", "rust", position)
+                .await?
+                .is_empty(),
+            "{mode}"
+        );
+        assert!(
+            manager
+                .definition("main.rs", "rust", position)
+                .await?
+                .is_empty(),
+            "{mode}"
+        );
+        assert!(
+            manager
+                .type_definition("main.rs", "rust", position)
+                .await?
+                .is_empty(),
+            "{mode}"
+        );
+        assert!(
+            manager
+                .implementation("main.rs", "rust", position)
+                .await?
+                .is_empty(),
+            "{mode}"
+        );
+        assert!(
+            manager
+                .references("main.rs", "rust", position, true)
+                .await?
+                .is_empty(),
+            "{mode}"
+        );
+        assert!(
+            manager
+                .document_symbols("main.rs", "rust")
+                .await?
+                .is_empty(),
+            "{mode}"
+        );
+        assert!(manager.workspace_symbols("").await?.is_empty(), "{mode}");
+
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepts_partial_lsp_objects_with_optional_fields_omitted()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root(
+        "diagnostics-pull-partial-utf-16",
+        1_000,
+        1_000,
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let position = Position::new(0, 8);
+
+    let hover = manager
+        .hover("main.rs", "rust", position)
+        .await?
+        .expect("the partial hover should be present");
+    assert_eq!(
+        serde_json::to_value(hover)?,
+        json!({ "contents": "minimal hover" })
+    );
+
+    let definitions = manager.definition("main.rs", "rust", position).await?;
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].origin_selection_range, None);
+    assert_eq!(
+        definitions[0].target_selection_range,
+        Range::new(Position::new(0, 8), Position::new(0, 14))
+    );
+
+    let references = manager
+        .references("main.rs", "rust", position, false)
+        .await?;
+    assert_eq!(references.len(), 1);
+    assert_eq!(
+        references[0].range,
+        Range::new(Position::new(0, 8), Position::new(0, 14))
+    );
+
+    for _ in 0..2 {
+        let report = manager.document_diagnostics("main.rs", "rust").await?;
+        assert_eq!(report.result_id(), None);
+        assert_eq!(report.diagnostics().len(), 1);
+        assert_eq!(
+            report.diagnostics()[0],
+            json!({
+                "range": {
+                    "start": { "line": 0, "character": 8 },
+                    "end": { "line": 0, "character": 14 },
+                },
+                "message": "minimal diagnostic",
+            })
+        );
+    }
+
+    let symbols = serde_json::to_value(
+        manager.document_symbols("main.rs", "rust").await?,
+    )?;
+    assert_eq!(symbols.as_array().map(Vec::len), Some(1));
+    assert_eq!(symbols[0]["name"], "answer");
+    assert_eq!(symbols[0]["children"], json!([]));
+    assert!(symbols[0].get("detail").is_none());
+    assert!(symbols[0].get("tags").is_none());
+    assert!(symbols[0].get("deprecated").is_none());
+
+    let workspace_symbols =
+        serde_json::to_value(manager.workspace_symbols("answer").await?)?;
+    assert_eq!(workspace_symbols.as_array().map(Vec::len), Some(1));
+    assert_eq!(workspace_symbols[0]["name"], "answer");
+    assert!(workspace_symbols[0].get("tags").is_none());
+    assert!(workspace_symbols[0].get("deprecated").is_none());
+    assert!(workspace_symbols[0].get("containerName").is_none());
+    assert!(workspace_symbols[0].get("data").is_none());
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn preserves_every_location_in_a_multi_location_response()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root(
+        "definition-multi-location-utf-16",
+        1_000,
+        1_000,
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let definitions = manager
+        .definition("main.rs", "rust", Position::new(0, 8))
+        .await?;
+
+    assert_eq!(definitions.len(), 2);
+    assert_eq!(
+        definitions[0].target_selection_range,
+        Range::new(Position::new(0, 8), Position::new(0, 14))
+    );
+    assert_eq!(
+        definitions[1].target_selection_range,
+        Range::new(Position::new(0, 0), Position::new(0, 3))
+    );
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn normalizes_declaration_type_definition_and_implementation()
 -> Result<(), Box<dyn Error>> {
     for (mode, operation) in [

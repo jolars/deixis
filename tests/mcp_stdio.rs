@@ -449,6 +449,97 @@ async fn every_tool_has_a_stable_text_fallback_and_structured_output()
 }
 
 #[tokio::test]
+async fn read_only_tools_accept_null_and_empty_lsp_results()
+-> Result<(), Box<dyn Error>> {
+    for mode in ["semantic-responses-null", "semantic-responses-empty"] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+        let position_arguments = json!({
+            "path": "main.rs",
+            "position": { "line": 0, "character": 8 },
+        });
+        let cases = [
+            ("hover", position_arguments.clone(), "contents"),
+            ("declaration", position_arguments.clone(), "locations"),
+            ("definition", position_arguments.clone(), "locations"),
+            ("type_definition", position_arguments.clone(), "locations"),
+            ("implementation", position_arguments.clone(), "locations"),
+            (
+                "references",
+                json!({
+                    "path": "main.rs",
+                    "position": { "line": 0, "character": 8 },
+                    "includeDeclaration": true,
+                }),
+                "locations",
+            ),
+            ("document_symbols", json!({ "path": "main.rs" }), "symbols"),
+            ("workspace_symbols", json!({ "query": "" }), "symbols"),
+        ];
+
+        for (tool, arguments, result_field) in cases {
+            let result = timeout(
+                Duration::from_secs(10),
+                client.call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(
+                        arguments
+                            .as_object()
+                            .expect("tool arguments should be an object")
+                            .clone(),
+                    ),
+                ),
+            )
+            .await??;
+
+            assert_eq!(result.is_error, Some(false), "{mode}: {tool}");
+            let structured = result
+                .structured_content
+                .as_ref()
+                .expect("successful results should be structured");
+            if tool == "hover" && mode.ends_with("null") {
+                assert_eq!(structured[result_field], JsonValue::Null);
+            } else {
+                assert_eq!(
+                    structured[result_field],
+                    json!([]),
+                    "{mode}: {tool}"
+                );
+            }
+
+            if tool == "workspace_symbols"
+                || (tool == "hover" && mode.ends_with("empty"))
+            {
+                assert!(
+                    structured.get("readiness").is_none(),
+                    "{mode}: {tool}"
+                );
+                assert!(
+                    structured.get("resultStability").is_none(),
+                    "{mode}: {tool}"
+                );
+            } else {
+                assert_eq!(structured["readiness"]["state"], "unknown");
+                assert_eq!(structured["resultStability"], "indeterminate");
+            }
+        }
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("workspace-symbol-fanout")?;
@@ -509,6 +600,7 @@ async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
         })
     );
     assert_eq!(symbols[0]["positionEncoding"], "utf-8");
+    assert_eq!(symbols[0]["location"]["x-location-extension"], "nested");
     assert_eq!(symbols[0]["data"]["query"], "answer");
     assert_eq!(symbols[0]["x-mock-extension"], true);
     assert_eq!(symbols[1]["server"], "zeta");
@@ -1205,11 +1297,12 @@ async fn hover_failures_have_a_consistent_structured_shape()
 #[tokio::test]
 async fn definition_normalizes_locations_and_retains_server_provenance()
 -> Result<(), Box<dyn Error>> {
-    for mode in [
-        "definition-location-utf-8",
-        "definition-locations-utf-16",
-        "definition-links-utf-32",
-        "definition-options",
+    for (mode, expected_locations) in [
+        ("definition-location-utf-8", 1),
+        ("definition-locations-utf-16", 1),
+        ("definition-links-utf-32", 1),
+        ("definition-options", 1),
+        ("definition-multi-location-utf-16", 2),
     ] {
         let root = unique_dir(mode)?;
         fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
@@ -1261,7 +1354,7 @@ async fn definition_normalizes_locations_and_retains_server_provenance()
             .and_then(|value| value.get("locations"))
             .and_then(JsonValue::as_array)
             .expect("definition should return a locations array");
-        assert_eq!(locations.len(), 1, "{mode}");
+        assert_eq!(locations.len(), expected_locations, "{mode}");
         assert_eq!(locations[0]["server"], "mock-lsp", "{mode}");
         assert!(
             locations[0]["uri"]
@@ -1283,6 +1376,16 @@ async fn definition_normalizes_locations_and_retains_server_provenance()
         );
         assert_eq!(locations[0]["targetPositionEncoding"], "utf-8", "{mode}");
         assert!(locations[0].get("originSelectionRange").is_none(), "{mode}");
+        if expected_locations == 2 {
+            assert_eq!(
+                locations[1]["targetSelectionRange"],
+                json!({
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 3 },
+                }),
+                "{mode}"
+            );
+        }
         assert!(
             result
                 .content
