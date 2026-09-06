@@ -107,6 +107,8 @@ fn handle_request<R: BufRead>(
                 | "definition-locations-utf-16"
                 | "definition-project-target-utf-16"
                 | "definition-external-utf-16"
+                | "document-symbols-flat-utf-16"
+                | "document-symbols-hierarchical-utf-16"
                 | "references-locations-utf-16"
                 | "workspace-symbol-wait-utf-16"
                 | "type-definition-locations-utf-16" => {
@@ -167,6 +169,8 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let document_symbol_provider =
+                Json::Bool(mode != "document-symbols-unsupported");
             let workspace_symbol_provider =
                 Json::Bool(mode != "workspace-symbol-unsupported");
             let diagnostic_provider = mode
@@ -181,6 +185,10 @@ fn handle_request<R: BufRead>(
             let mut capabilities = vec![
                 ("declarationProvider".to_owned(), declaration_provider),
                 ("definitionProvider".to_owned(), definition_provider),
+                (
+                    "documentSymbolProvider".to_owned(),
+                    document_symbol_provider,
+                ),
                 ("hoverProvider".to_owned(), hover_provider),
                 (
                     "implementationProvider".to_owned(),
@@ -664,6 +672,79 @@ fn handle_request<R: BufRead>(
                 ),
             ]));
             write_message(output, response(id, Json::Array(locations)))?;
+        }
+        "textDocument/documentSymbol" => {
+            if mode == "document-symbols-unsupported" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "document symbol request bypassed capability gate"
+                            .to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let source_uri = params
+                .get("textDocument")
+                .and_then(|document| document.get("uri"))
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            let answer_range = mock_range(6, 12);
+            let result = match mode {
+                "document-symbols-flat-utf-16" => {
+                    Json::Array(vec![json_object([
+                        ("name", Json::String("answer".to_owned())),
+                        ("kind", Json::Number(13)),
+                        ("tags", Json::Array(vec![Json::Number(1)])),
+                        (
+                            "containerName",
+                            Json::String("binding".to_owned()),
+                        ),
+                        (
+                            "location",
+                            json_object([
+                                ("uri", Json::String(source_uri.to_owned())),
+                                ("range", answer_range),
+                            ]),
+                        ),
+                        (
+                            "x-mock-extension",
+                            Json::String("flat".to_owned()),
+                        ),
+                    ])])
+                }
+                "document-symbols-null" => Json::Null,
+                _ => Json::Array(vec![json_object([
+                    ("name", Json::String("binding".to_owned())),
+                    ("detail", Json::String("let binding".to_owned())),
+                    ("kind", Json::Number(13)),
+                    ("tags", Json::Array(vec![Json::Number(1)])),
+                    ("deprecated", Json::Bool(true)),
+                    ("range", mock_range(0, 18)),
+                    ("selectionRange", answer_range.clone()),
+                    (
+                        "children",
+                        Json::Array(vec![json_object([
+                            ("name", Json::String("answer".to_owned())),
+                            ("kind", Json::Number(13)),
+                            ("range", answer_range.clone()),
+                            ("selectionRange", answer_range),
+                            (
+                                "x-mock-extension",
+                                Json::String("child".to_owned()),
+                            ),
+                        ])]),
+                    ),
+                    (
+                        "x-mock-extension",
+                        Json::String("parent".to_owned()),
+                    ),
+                ])]),
+            };
+            write_message(output, response(id, result))?;
         }
         "textDocument/declaration"
         | "textDocument/definition"
@@ -1196,6 +1277,11 @@ fn probe_client<R: BufRead>(
         implementation_dynamic_registration,
         implementation_link_support,
         references_dynamic_registration,
+        document_symbol_dynamic_registration,
+        document_symbol_kind_count,
+        hierarchical_document_symbol_support,
+        document_symbol_tag_support,
+        document_symbol_label_support,
         workspace_symbol_dynamic_registration,
         workspace_symbol_kind_count,
         workspace_symbol_tag_support,
@@ -1283,6 +1369,32 @@ fn probe_client<R: BufRead>(
             .and_then(|references| references.get("dynamicRegistration"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let document_symbol = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("documentSymbol"));
+        let document_symbol_dynamic_registration = document_symbol
+            .and_then(|symbol| symbol.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let document_symbol_kind_count = document_symbol
+            .and_then(|symbol| symbol.get("symbolKind"))
+            .and_then(|kind| kind.get("valueSet"))
+            .and_then(Json::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let hierarchical_document_symbol_support = document_symbol
+            .and_then(|symbol| symbol.get("hierarchicalDocumentSymbolSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let document_symbol_tag_support = document_symbol
+            .and_then(|symbol| symbol.get("tagSupport"))
+            .and_then(|support| support.get("valueSet"))
+            .and_then(Json::as_array)
+            .is_some_and(|tags| tags.as_slice() == [Json::Number(1)]);
+        let document_symbol_label_support = document_symbol
+            .and_then(|symbol| symbol.get("labelSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         let workspace_symbol = capabilities
             .get("workspace")
             .and_then(|workspace| workspace.get("symbol"));
@@ -1343,6 +1455,11 @@ fn probe_client<R: BufRead>(
             implementation_dynamic_registration,
             implementation_link_support,
             references_dynamic_registration,
+            document_symbol_dynamic_registration,
+            document_symbol_kind_count,
+            hierarchical_document_symbol_support,
+            document_symbol_tag_support,
+            document_symbol_label_support,
             workspace_symbol_dynamic_registration,
             workspace_symbol_kind_count,
             workspace_symbol_tag_support,
@@ -1472,6 +1589,26 @@ fn probe_client<R: BufRead>(
         (
             "references_dynamic_registration",
             Json::Bool(references_dynamic_registration),
+        ),
+        (
+            "document_symbol_dynamic_registration",
+            Json::Bool(document_symbol_dynamic_registration),
+        ),
+        (
+            "document_symbol_kind_count",
+            Json::Number(document_symbol_kind_count as i64),
+        ),
+        (
+            "hierarchical_document_symbol_support",
+            Json::Bool(hierarchical_document_symbol_support),
+        ),
+        (
+            "document_symbol_tag_support",
+            Json::Bool(document_symbol_tag_support),
+        ),
+        (
+            "document_symbol_label_support",
+            Json::Bool(document_symbol_label_support),
         ),
         (
             "workspace_symbol_dynamic_registration",

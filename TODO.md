@@ -74,7 +74,7 @@ matrix.
 
 - [x] Add `declaration`, `type_definition`, and `implementation`.
 - [x] Add references with explicit declaration inclusion.
-- [ ] Add hierarchical document symbols and normalize flat-symbol responses.
+- [x] Add hierarchical document symbols and normalize flat-symbol responses.
 - [x] Add workspace symbols, fan out across capable servers, and merge in stable
   configuration order.
 - [x] Cache versioned push diagnostics and implement pull diagnostics when

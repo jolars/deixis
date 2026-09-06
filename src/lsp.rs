@@ -286,6 +286,84 @@ impl LazyLanguageServer {
         Ok(references)
     }
 
+    pub async fn document_symbols(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+    ) -> Result<Vec<DocumentSymbol>, LspError> {
+        const METHOD: &str = "textDocument/documentSymbol";
+
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server().await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_method(
+                METHOD,
+                snapshot.capabilities().get("documentSymbolProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: METHOD,
+            });
+        }
+
+        let document = active.synchronize_document(file, language_id).await?;
+        let value = active
+            .request_value(
+                METHOD,
+                json!({ "textDocument": { "uri": document.uri() } }),
+                self.config.timeouts().request(),
+            )
+            .await?;
+        let response: Option<RawDocumentSymbolResponse> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+
+        match response {
+            None => Ok(Vec::new()),
+            Some(RawDocumentSymbolResponse::Hierarchical(symbols)) => symbols
+                .into_iter()
+                .map(|symbol| {
+                    normalize_hierarchical_document_symbol(
+                        symbol,
+                        &document,
+                        encoding,
+                        self.config.name(),
+                    )
+                })
+                .collect(),
+            Some(RawDocumentSymbolResponse::Flat(symbols)) => {
+                let mut normalized = Vec::with_capacity(symbols.len());
+                for symbol in symbols {
+                    let target = self
+                        .normalize_location_target(
+                            &document,
+                            &symbol.location.uri,
+                            symbol.location.range,
+                            symbol.location.range,
+                            encoding,
+                        )
+                        .await?;
+                    normalized.push(DocumentSymbol::new(
+                        self.config.name(),
+                        symbol.location.uri,
+                        symbol.name,
+                        symbol.kind,
+                        target,
+                        Vec::new(),
+                        symbol.fields,
+                    ));
+                }
+                Ok(normalized)
+            }
+        }
+    }
+
     pub async fn document_diagnostics(
         &self,
         path: impl AsRef<Path>,
@@ -659,6 +737,103 @@ pub struct ReferenceLocation {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DocumentSymbol {
+    pub server: String,
+    pub uri: String,
+    pub name: String,
+    pub kind: u32,
+    pub range: Range,
+    pub selection_range: Range,
+    pub position_encoding: PositionEncoding,
+    pub children: Vec<Self>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+impl DocumentSymbol {
+    fn new(
+        server: &str,
+        uri: String,
+        name: String,
+        kind: u32,
+        target: DefinitionTarget,
+        children: Vec<Self>,
+        mut fields: BTreeMap<String, JsonValue>,
+    ) -> Self {
+        for reserved in ["server", "uri", "positionEncoding", "children"] {
+            fields.remove(reserved);
+        }
+        Self {
+            server: server.to_owned(),
+            uri,
+            name,
+            kind,
+            range: target.range,
+            selection_range: target.selection_range,
+            position_encoding: target.position_encoding,
+            children,
+            fields,
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let mut lines = Vec::new();
+        self.push_text_lines(0, &mut lines);
+        lines.join("\n")
+    }
+
+    fn push_text_lines(&self, depth: usize, lines: &mut Vec<String>) {
+        let range = self.selection_range;
+        lines.push(format!(
+            "{}{}: {} (kind {}) at {}:{}:{}-{}:{} ({})",
+            "  ".repeat(depth),
+            self.server,
+            self.name,
+            self.kind,
+            self.uri,
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+            self.position_encoding,
+        ));
+        for child in &self.children {
+            child.push_text_lines(depth + 1, lines);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDocumentSymbolResponse {
+    Hierarchical(Vec<RawDocumentSymbol>),
+    Flat(Vec<RawSymbolInformation>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDocumentSymbol {
+    name: String,
+    kind: u32,
+    range: Range,
+    selection_range: Range,
+    #[serde(default)]
+    children: Vec<Self>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSymbolInformation {
+    name: String,
+    kind: u32,
+    location: RawWorkspaceSymbolLocation,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceSymbol {
     pub server: String,
     pub name: String,
@@ -825,6 +1000,48 @@ fn convert_definition_target(
         selection_range,
         position_encoding: PositionEncoding::Utf8,
     })
+}
+
+fn normalize_hierarchical_document_symbol(
+    symbol: RawDocumentSymbol,
+    document: &SynchronizedDocument,
+    encoding: PositionEncoding,
+    server: &str,
+) -> Result<DocumentSymbol, LspError> {
+    let RawDocumentSymbol {
+        name,
+        kind,
+        range,
+        selection_range,
+        children,
+        fields,
+    } = symbol;
+    let target = convert_definition_target(
+        document.text(),
+        document.absolute_path(),
+        range,
+        selection_range,
+        encoding,
+        server,
+    )?;
+    let children = children
+        .into_iter()
+        .map(|child| {
+            normalize_hierarchical_document_symbol(
+                child, document, encoding, server,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(DocumentSymbol::new(
+        server,
+        document.uri().to_owned(),
+        name,
+        kind,
+        target,
+        children,
+        fields,
+    ))
 }
 
 impl Hover {
@@ -2974,6 +3191,19 @@ fn initialize_params(
                 "diagnostic": {
                     "dynamicRegistration": true,
                     "relatedDocumentSupport": false,
+                },
+                "documentSymbol": {
+                    "dynamicRegistration": true,
+                    "symbolKind": {
+                        "valueSet": [
+                            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                            14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                            25, 26
+                        ],
+                    },
+                    "hierarchicalDocumentSymbolSupport": true,
+                    "tagSupport": { "valueSet": [1] },
+                    "labelSupport": true,
                 },
                 "declaration": {
                     "dynamicRegistration": true,

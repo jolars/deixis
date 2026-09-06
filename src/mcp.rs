@@ -34,6 +34,7 @@ const TYPE_DEFINITION_TOOL: &str = "type_definition";
 const IMPLEMENTATION_TOOL: &str = "implementation";
 const REFERENCES_TOOL: &str = "references";
 const DIAGNOSTICS_TOOL: &str = "diagnostics";
+const DOCUMENT_SYMBOLS_TOOL: &str = "document_symbols";
 const WORKSPACE_SYMBOLS_TOOL: &str = "workspace_symbols";
 
 #[derive(Clone, Copy)]
@@ -167,6 +168,7 @@ impl ServerHandler for DeixisServer {
                 location_tool(IMPLEMENTATION_SPEC),
                 references_tool(),
                 diagnostics_tool(),
+                document_symbols_tool(),
                 workspace_symbols_tool(),
             ]
         };
@@ -195,6 +197,7 @@ impl ServerHandler for DeixisServer {
             }
             REFERENCES_TOOL => self.call_references(request).await,
             DIAGNOSTICS_TOOL => self.call_diagnostics(request).await,
+            DOCUMENT_SYMBOLS_TOOL => self.call_document_symbols(request).await,
             WORKSPACE_SYMBOLS_TOOL => {
                 self.call_workspace_symbols(request).await
             }
@@ -760,6 +763,110 @@ impl DeixisServer {
         Ok(result.into())
     }
 
+    async fn call_document_symbols(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, McpError> {
+        const METHOD: &str = "textDocument/documentSymbol";
+
+        let arguments = serde_json::from_value::<DocumentSymbolsArguments>(
+            JsonValue::Object(request.arguments.unwrap_or_default()),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid document symbols arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate()?;
+        let Some(config) = self.config() else {
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    DOCUMENT_SYMBOLS_TOOL,
+                    "no language server is configured",
+                )
+                .with_method(METHOD)
+                .with_path(&arguments.path),
+            ));
+        };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_path(
+                    DOCUMENT_SYMBOLS_TOOL,
+                    METHOD,
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_route(
+                        DOCUMENT_SYMBOLS_TOOL,
+                        METHOD,
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
+
+        let symbols = match language_server
+            .document_symbols(file.absolute(), route.language_id())
+            .await
+        {
+            Ok(symbols) => symbols,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: DOCUMENT_SYMBOLS_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some(METHOD),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
+            }
+        };
+        let readiness = if symbols.is_empty() {
+            Some(language_server.status().await.readiness().clone())
+        } else {
+            None
+        };
+        let text = if let Some(readiness) = &readiness {
+            empty_result_text("document symbols", readiness)
+        } else {
+            symbols
+                .iter()
+                .map(|symbol| symbol.text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let symbols = serde_json::to_value(symbols).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode document symbols: {error}"),
+                None,
+            )
+        })?;
+        let mut structured = json!({ "symbols": symbols });
+        if let Some(readiness) = &readiness {
+            attach_empty_result_context(&mut structured, readiness);
+        }
+        let mut result = CallToolResult::structured(structured);
+        result.content = vec![ContentBlock::text(text)];
+
+        Ok(result.into())
+    }
+
     async fn call_workspace_symbols(
         &self,
         request: CallToolRequestParams,
@@ -1125,9 +1232,39 @@ struct DiagnosticsArguments {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DocumentSymbolsArguments {
+    path: String,
+    #[serde(default)]
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceSymbolsArguments {
     query: String,
+}
+
+impl DocumentSymbolsArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        if self.path.is_empty() {
+            return Err(McpError::invalid_params(
+                "invalid document symbols arguments: `path` must not be empty",
+                None,
+            ));
+        }
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "invalid document symbols arguments: `server` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DiagnosticsArguments {
@@ -1588,6 +1725,106 @@ fn diagnostics_tool() -> Tool {
             .idempotent(true)
             .open_world(false),
     )
+}
+
+fn document_symbols_tool() -> Tool {
+    Tool::new(
+        DOCUMENT_SYMBOLS_TOOL,
+        "Return hierarchical symbols for a project file, normalizing legacy flat symbol responses to the same node shape.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative or root-contained absolute file path."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(document_symbols_output_schema())
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    )
+}
+
+fn document_symbols_output_schema() -> Arc<JsonObject> {
+    Arc::new(object_schema(json!({
+        "$defs": {
+            "documentSymbol": {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "Configured name of the language server that returned this symbol."
+                    },
+                    "uri": { "type": "string" },
+                    "name": { "type": "string" },
+                    "detail": { "type": "string" },
+                    "kind": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 26
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "integer" }
+                    },
+                    "deprecated": { "type": "boolean" },
+                    "containerName": { "type": "string" },
+                    "range": range_schema(),
+                    "selectionRange": range_schema(),
+                    "positionEncoding": {
+                        "enum": ["utf-8", "utf-16", "utf-32"],
+                        "description": "Encoding used by character offsets in the symbol ranges. UTF-8 is used whenever the symbol belongs to a readable project file."
+                    },
+                    "children": {
+                        "type": "array",
+                        "items": { "$ref": "#/$defs/documentSymbol" }
+                    },
+                    "data": {}
+                },
+                "required": [
+                    "server",
+                    "uri",
+                    "name",
+                    "kind",
+                    "range",
+                    "selectionRange",
+                    "positionEncoding",
+                    "children"
+                ],
+                "additionalProperties": true
+            }
+        },
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "symbols": {
+                        "type": "array",
+                        "items": { "$ref": "#/$defs/documentSymbol" }
+                    },
+                    "readiness": readiness_schema(),
+                    "resultStability": result_stability_schema()
+                },
+                "required": ["symbols"],
+                "additionalProperties": false
+            },
+            error_output_schema()
+        ]
+    })))
 }
 
 fn workspace_symbols_tool() -> Tool {

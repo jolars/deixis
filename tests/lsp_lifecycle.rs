@@ -280,6 +280,11 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(probe.implementation_dynamic_registration);
     assert!(probe.implementation_link_support);
     assert!(probe.references_dynamic_registration);
+    assert!(probe.document_symbol_dynamic_registration);
+    assert_eq!(probe.document_symbol_kind_count, 26);
+    assert!(probe.hierarchical_document_symbol_support);
+    assert!(probe.document_symbol_tag_support);
+    assert!(probe.document_symbol_label_support);
     assert!(probe.workspace_symbol_dynamic_registration);
     assert_eq!(probe.workspace_symbol_kind_count, 26);
     assert!(probe.workspace_symbol_tag_support);
@@ -993,6 +998,86 @@ async fn rejects_references_before_synchronizing_when_unsupported()
 }
 
 #[tokio::test]
+async fn preserves_hierarchical_document_symbols_and_normalizes_flat_symbols()
+-> Result<(), Box<dyn Error>> {
+    for mode in [
+        "document-symbols-hierarchical-utf-16",
+        "document-symbols-flat-utf-16",
+    ] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+        let symbols = manager.document_symbols("main.rs", "rust").await?;
+        let symbols = serde_json::to_value(symbols)?;
+        let symbols = symbols.as_array().expect("document symbol array");
+
+        assert_eq!(symbols.len(), 1, "{mode}");
+        assert_eq!(symbols[0]["server"], "mock-lsp", "{mode}");
+        assert!(
+            symbols[0]["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/main.rs")),
+            "{mode}"
+        );
+        assert_eq!(symbols[0]["positionEncoding"], "utf-8", "{mode}");
+
+        if mode.contains("hierarchical") {
+            assert_eq!(symbols[0]["name"], "binding");
+            assert_eq!(symbols[0]["detail"], "let binding");
+            assert_eq!(symbols[0]["tags"], json!([1]));
+            assert_eq!(symbols[0]["deprecated"], true);
+            assert_eq!(symbols[0]["x-mock-extension"], "parent");
+            assert_eq!(symbols[0]["range"]["end"]["character"], 20);
+            assert_eq!(symbols[0]["selectionRange"], mock_answer_range());
+            let children = symbols[0]["children"]
+                .as_array()
+                .expect("hierarchical children");
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0]["name"], "answer");
+            assert_eq!(children[0]["range"], mock_answer_range());
+            assert_eq!(children[0]["selectionRange"], mock_answer_range());
+            assert_eq!(children[0]["x-mock-extension"], "child");
+        } else {
+            assert_eq!(symbols[0]["name"], "answer");
+            assert_eq!(symbols[0]["range"], mock_answer_range());
+            assert_eq!(symbols[0]["selectionRange"], mock_answer_range());
+            assert_eq!(symbols[0]["containerName"], "binding");
+            assert_eq!(symbols[0]["x-mock-extension"], "flat");
+            assert_eq!(symbols[0]["children"], json!([]));
+        }
+
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_document_symbols_before_synchronizing_when_unsupported()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root(
+        "document-symbols-unsupported",
+        1_000,
+        1_000,
+    )?;
+    fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+
+    let error = manager
+        .document_symbols("main.rs", "rust")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::UnsupportedCapability { .. }));
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert!(probe.events.is_empty());
+    assert_eq!(probe.open_documents, 0);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
 {
     let manager = configured_manager("malformed", 1_000, 1_000)?;
@@ -1223,6 +1308,11 @@ struct ProbeResponse {
     implementation_dynamic_registration: bool,
     implementation_link_support: bool,
     references_dynamic_registration: bool,
+    document_symbol_dynamic_registration: bool,
+    document_symbol_kind_count: usize,
+    hierarchical_document_symbol_support: bool,
+    document_symbol_tag_support: bool,
+    document_symbol_label_support: bool,
     workspace_symbol_dynamic_registration: bool,
     workspace_symbol_kind_count: usize,
     workspace_symbol_tag_support: bool,
@@ -1237,4 +1327,11 @@ struct ProbeResponse {
 struct DocumentEventsResponse {
     events: Vec<JsonValue>,
     open_documents: usize,
+}
+
+fn mock_answer_range() -> JsonValue {
+    json!({
+        "start": { "line": 0, "character": 8 },
+        "end": { "line": 0, "character": 14 },
+    })
 }

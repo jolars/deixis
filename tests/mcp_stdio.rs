@@ -438,6 +438,128 @@ async fn workspace_symbols_skip_servers_without_the_capability()
 }
 
 #[tokio::test]
+async fn document_symbols_preserve_hierarchy_and_normalize_flat_responses()
+-> Result<(), Box<dyn Error>> {
+    for mode in [
+        "document-symbols-hierarchical-utf-16",
+        "document-symbols-flat-utf-16",
+    ] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+        let tools =
+            timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+        let tool = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == "document_symbols")
+            .expect("configured servers should expose document symbols");
+        assert_eq!(tool.input_schema.get("required"), Some(&json!(["path"])));
+        assert!(tool.output_schema.is_some());
+        assert_eq!(
+            tool.annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
+
+        let arguments =
+            json!({ "path": "main.rs" }).as_object().unwrap().clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("document_symbols")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(false), "{mode}");
+        let symbols = result.structured_content.as_ref().unwrap()["symbols"]
+            .as_array()
+            .unwrap();
+        assert_eq!(symbols.len(), 1, "{mode}");
+        assert_eq!(symbols[0]["server"], "mock-lsp", "{mode}");
+        assert_eq!(symbols[0]["positionEncoding"], "utf-8", "{mode}");
+        assert!(
+            symbols[0]["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/main.rs")),
+            "{mode}"
+        );
+
+        let text = result.content[0].as_text().unwrap().text.as_str();
+        if mode.contains("hierarchical") {
+            let children = symbols[0]["children"].as_array().unwrap();
+            assert_eq!(symbols[0]["name"], "binding");
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0]["name"], "answer");
+            assert_eq!(children[0]["server"], "mock-lsp");
+            assert_eq!(children[0]["positionEncoding"], "utf-8");
+            assert!(text.lines().nth(1).is_some_and(|line| {
+                line.starts_with("  mock-lsp: answer")
+            }));
+        } else {
+            assert_eq!(symbols[0]["name"], "answer");
+            assert_eq!(symbols[0]["containerName"], "binding");
+            assert_eq!(symbols[0]["children"], json!([]));
+            assert_eq!(text.lines().count(), 1);
+        }
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn document_symbols_report_an_unsupported_server_capability()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("document-symbols-unsupported")?;
+    fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "document-symbols-unsupported")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({ "path": "main.rs" }).as_object().unwrap().clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("document_symbols")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(true));
+    let error = &result.structured_content.as_ref().unwrap()["error"];
+    assert_eq!(error["code"], "unsupported_capability");
+    assert_eq!(error["tool"], "document_symbols");
+    assert_eq!(error["server"], "mock-lsp");
+    assert_eq!(error["method"], "textDocument/documentSymbol");
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn hover_returns_structured_markup_across_position_encodings()
 -> Result<(), Box<dyn Error>> {
     for mode in [

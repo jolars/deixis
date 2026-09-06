@@ -22,7 +22,9 @@ variants and retains configured-server provenance. Diagnostics prefers pull
 reports when advertised and otherwise exposes cached push reports with explicit
 freshness. Workspace-symbol search fans out concurrently across capable
 servers, then merges results in stable lexical server-name order with explicit
-provenance. Every tool includes a concise text fallback.
+provenance. Document symbols preserve server-provided hierarchies and normalize
+legacy flat responses to a common node shape. Every tool includes a concise
+text fallback.
 Nothing in this document should be read as already implemented unless it is
 also marked complete in `TODO.md`.
 
@@ -164,11 +166,11 @@ access, or command interpolation.
 ## MCP surface
 
 Without selected configuration, the current server advertises no tools. With
-configuration, it advertises nine read-only tools: `deixis_server_status`,
+configuration, it advertises ten read-only tools: `deixis_server_status`,
 `hover`, `definition`, `declaration`, `type_definition`, `implementation`,
-`references`, `diagnostics`, and `workspace_symbols`. The probe accepts an
-optional server name and `start` flag; without a name, it uses the first name in
-stable lexical order.
+`references`, `diagnostics`, `document_symbols`, and `workspace_symbols`. The
+probe accepts an optional server name and `start` flag; without a name, it uses
+the first name in stable lexical order.
 The position-based semantic tools take a root-contained path, a zero-based
 UTF-8 position, and an optional server override. They resolve the path before
 routing, infer the language ID, synchronize the document, verify the
@@ -197,6 +199,16 @@ retain the negotiated server encoding because the old source text is not
 available for sound conversion. Reports preserve diagnostic extension fields
 and identify both their source and position encoding.
 
+The `document_symbols` tool takes a root-contained path and optional server
+override. Deixis advertises hierarchical document-symbol, symbol-kind, tag, and
+label support. Recursive `DocumentSymbol` responses retain their child trees.
+Deprecated flat `SymbolInformation` responses become root nodes in the same
+shape, using the location range as both the symbol range and selection range;
+the flat `containerName` remains metadata rather than being treated as a stable
+parent identity. Each node identifies its configured server, URI, and range
+encoding. Ranges in readable project files are translated to UTF-8, while
+other locations retain the negotiated server encoding.
+
 The `workspace_symbols` tool requires a query string, including an empty string
 when the caller wants all symbols. It starts and queries every configured server
 concurrently, skips servers that do not advertise `workspace/symbol`, and
@@ -208,10 +220,6 @@ ranges in readable project files are translated to UTF-8; other locations
 retain the server's negotiated encoding. Deixis advertises workspace-symbol
 kind and tag support, but not lazy resolve support, so returned locations must
 include a range.
-
-The semantic tool set remains read-only. Planned additions are:
-
-- `document_symbols`.
 
 MCP hosts already namespace tools by server, so tool names do not repeat an
 `lsp_` prefix. Every handler checks the downstream server capability before
@@ -227,11 +235,12 @@ Deixis advertises `window.workDoneProgress` and the rust-analyzer
 `experimental.serverStatusNotification` extension. It tracks active work-done
 tokens and rust-analyzer's health and quiescence values. The lifecycle probe
 exposes the resulting `readiness` state and its source. When hover, navigation,
-references, or current diagnostics return no semantic result, their structured
-output also includes `readiness` and a derived `resultStability`: `transient`
-while observed work is active, `stable` after observed work has completed, and
-`indeterminate` when the server has emitted no usable readiness signal or
-reports degraded health. Initialization by itself leaves readiness `unknown`.
+references, document symbols, or current diagnostics return no semantic result,
+their structured output also includes `readiness` and a derived
+`resultStability`: `transient` while observed work is active, `stable` after
+observed work has completed, and `indeterminate` when the server has emitted no
+usable readiness signal or reports degraded health. Initialization by itself
+leaves readiness `unknown`.
 
 Public positions use zero-based `line` and `character` fields. Input positions
 and ranges for readable project files use UTF-8 code-unit offsets so the same
