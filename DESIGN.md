@@ -14,11 +14,13 @@ over stdio, report its name and version, route a project file to a server, start
 that server on demand, handle common server-to-client messages, continue after
 malformed server output, and shut down all started servers with a bounded
 forced-kill fallback. A configured session
-exposes the read-only `deixis_server_status` lifecycle probe and a
-capability-gated `hover` tool. Hover synchronizes project-contained documents,
-translates negotiated position encodings, and returns structured markup plus a
-text fallback. Nothing in this document should be read as already implemented
-unless it is also marked complete in `TODO.md`.
+exposes the read-only `deixis_server_status` lifecycle probe and
+capability-gated `hover` and `definition` tools. Both semantic tools synchronize
+project-contained documents and translate negotiated position encodings. Hover
+returns structured markup; definition normalizes LSP location variants and
+retains configured-server provenance. Both include a concise text fallback.
+Nothing in this document should be read as already implemented unless it is
+also marked complete in `TODO.md`.
 
 ## Purpose
 
@@ -147,19 +149,23 @@ access, or command interpolation.
 
 Without selected configuration, the current server advertises no tools. With
 configuration, it advertises the read-only `deixis_server_status` lifecycle
-probe and `hover`. The probe accepts an optional server name and `start` flag;
-without a name, it uses the first name in stable lexical order. The `hover` tool
-takes a root-contained path, a zero-based UTF-8 position, and an optional server
-override. It resolves the path before routing, infers the language ID,
-synchronizes the document, verifies `hoverProvider`, converts the request and
-optional response range through the negotiated position encoding, and returns
-the LSP hover contents as structured JSON with readable text content. Neither
-tool forwards arbitrary JSON-RPC.
+probe, `hover`, and `definition`. The probe accepts an optional server name and
+`start` flag; without a name, it uses the first name in stable lexical order.
+The semantic tools take a root-contained path, a zero-based UTF-8 position, and
+an optional server override. They resolve the path before routing, infer the
+language ID, synchronize the document, verify the corresponding server
+capability, and translate the request through the negotiated position encoding.
+Hover returns the LSP contents and optional range as structured JSON.
+Definition accepts `Location`, `Location[]`, `LocationLink[]`, or `null`, and
+normalizes every result to the `LocationLink` superset: configured server name,
+target URI, target range, target selection range, target position encoding, and
+an optional origin selection range. Each semantic tool also returns readable
+text content. No tool forwards arbitrary JSON-RPC.
 
-The semantic tool set remains read-only. It starts with `hover`; planned
-additions are:
+The semantic tool set remains read-only. It starts with `hover` and
+`definition`; planned additions are:
 
-- `definition` and `declaration`;
+- `declaration`;
 - `type_definition` and `implementation`;
 - `references`;
 - `document_symbols` and `workspace_symbols`; and
@@ -175,13 +181,18 @@ ranges, symbol kinds, hover markup, diagnostic severities, and related
 information remain structured JSON. Each successful result also supplies a small
 textual representation for MCP clients that do not consume structured content.
 
-Public positions use zero-based `line` and `character` fields. At the MCP
-boundary, `character` is a UTF-8 code-unit offset so the same request is stable
-regardless of the selected language server. The document layer translates
-positions to and from the server's negotiated UTF-8, UTF-16, or UTF-32 encoding
-and rejects missing lines, offsets past a line end, reversed ranges, and offsets
-that split a code point. LF, CRLF, and CR are logical line endings and cannot be
-addressed from within a position.
+Public positions use zero-based `line` and `character` fields. Input positions
+and ranges for readable project files use UTF-8 code-unit offsets so the same
+request and result are stable regardless of the selected language server. The
+document layer translates positions to and from the server's negotiated UTF-8,
+UTF-16, or UTF-32 encoding and rejects missing lines, offsets past a line end,
+reversed ranges, and offsets that split a code point. LF, CRLF, and CR are
+logical line endings and cannot be addressed from within a position. Definition
+targets outside the project, including virtual-document URI schemes, are never
+read merely because a server returned them. Their ranges retain the negotiated
+encoding, which is reported in `targetPositionEncoding`; an origin selection
+range still refers to the synchronized project document and is converted to
+UTF-8.
 
 Deixis advertises UTF-8, UTF-16, and UTF-32 position support in that preference
 order. An omitted server selection defaults to UTF-16 as required for backward

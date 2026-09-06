@@ -24,6 +24,7 @@ use crate::{
 
 const SERVER_STATUS_TOOL: &str = "deixis_server_status";
 const HOVER_TOOL: &str = "hover";
+const DEFINITION_TOOL: &str = "definition";
 
 #[derive(Clone)]
 pub struct DeixisServer {
@@ -106,7 +107,7 @@ impl ServerHandler for DeixisServer {
         let tools = if self.language_servers.is_empty() {
             Vec::new()
         } else {
-            vec![server_status_tool(), hover_tool()]
+            vec![server_status_tool(), hover_tool(), definition_tool()]
         };
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -119,6 +120,7 @@ impl ServerHandler for DeixisServer {
         match request.name.as_ref() {
             SERVER_STATUS_TOOL => self.call_server_status(&request).await,
             HOVER_TOOL => self.call_hover(request).await,
+            DEFINITION_TOOL => self.call_definition(request).await,
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -256,6 +258,89 @@ impl DeixisServer {
 
         Ok(result.into())
     }
+
+    async fn call_definition(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, McpError> {
+        let arguments = request.arguments.unwrap_or_default();
+        let arguments = serde_json::from_value::<DefinitionArguments>(
+            JsonValue::Object(arguments),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid definition arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate()?;
+        let Some(config) = self.config() else {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "no language server is configured",
+            )])
+            .into());
+        };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    error.to_string(),
+                )])
+                .into());
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(CallToolResult::error(vec![
+                        ContentBlock::text(error.to_string()),
+                    ])
+                    .into());
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
+
+        let definitions = match language_server
+            .definition(
+                file.absolute(),
+                route.language_id(),
+                arguments.position,
+            )
+            .await
+        {
+            Ok(definitions) => definitions,
+            Err(error) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    error.to_string(),
+                )])
+                .into());
+            }
+        };
+        let text = if definitions.is_empty() {
+            "No definitions.".to_owned()
+        } else {
+            definitions
+                .iter()
+                .map(|definition| definition.text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let locations = serde_json::to_value(definitions).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode definition response: {error}"),
+                None,
+            )
+        })?;
+        let structured = json!({ "locations": locations });
+        let mut result = CallToolResult::structured(structured);
+        result.content = vec![ContentBlock::text(text)];
+
+        Ok(result.into())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +350,37 @@ struct HoverArguments {
     #[serde(default)]
     server: Option<String>,
     position: Position,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DefinitionArguments {
+    path: String,
+    #[serde(default)]
+    server: Option<String>,
+    position: Position,
+}
+
+impl DefinitionArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        if self.path.is_empty() {
+            return Err(McpError::invalid_params(
+                "invalid definition arguments: `path` must not be empty",
+                None,
+            ));
+        }
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "invalid definition arguments: `server` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl HoverArguments {
@@ -444,6 +560,73 @@ fn hover_tool() -> Tool {
     )
 }
 
+fn definition_tool() -> Tool {
+    Tool::new(
+        DEFINITION_TOOL,
+        "Return definitions for a UTF-8 position in a project file.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative or root-contained absolute file path."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
+                },
+                "position": position_schema(),
+            },
+            "required": ["path", "position"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(Arc::new(object_schema(json!({
+        "type": "object",
+        "properties": {
+            "locations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "Configured name of the language server that returned this definition."
+                        },
+                        "uri": { "type": "string" },
+                        "targetRange": range_schema(),
+                        "targetSelectionRange": range_schema(),
+                        "targetPositionEncoding": {
+                            "enum": ["utf-8", "utf-16", "utf-32"],
+                            "description": "Encoding used by character offsets in the target ranges. UTF-8 is used whenever the target is a readable project file."
+                        },
+                        "originSelectionRange": range_schema(),
+                    },
+                    "required": [
+                        "server",
+                        "uri",
+                        "targetRange",
+                        "targetSelectionRange",
+                        "targetPositionEncoding"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["locations"],
+        "additionalProperties": false
+    }))))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    )
+}
+
 fn position_schema() -> JsonValue {
     json!({
         "type": "object",
@@ -460,6 +643,18 @@ fn position_schema() -> JsonValue {
             }
         },
         "required": ["line", "character"],
+        "additionalProperties": false
+    })
+}
+
+fn range_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "start": position_schema(),
+            "end": position_schema()
+        },
+        "required": ["start", "end"],
         "additionalProperties": false
     })
 }

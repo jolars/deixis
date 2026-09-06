@@ -376,6 +376,148 @@ async fn hover_rejects_a_server_without_the_capability()
 }
 
 #[tokio::test]
+async fn definition_normalizes_locations_and_retains_server_provenance()
+-> Result<(), Box<dyn Error>> {
+    for mode in [
+        "definition-location-utf-8",
+        "definition-locations-utf-16",
+        "definition-links-utf-32",
+        "definition-options",
+    ] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+        let tools =
+            timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+        let definition_tool = tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == "definition")
+            .expect("configured servers should expose definition");
+        assert_eq!(
+            definition_tool.input_schema.get("required"),
+            Some(&json!(["path", "position"])),
+            "{mode}"
+        );
+        assert!(definition_tool.output_schema.is_some(), "{mode}");
+
+        let arguments = json!({
+            "path": "main.rs",
+            "position": { "line": 0, "character": 8 },
+        })
+        .as_object()
+        .expect("definition arguments should be an object")
+        .clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("definition")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(false), "{mode}");
+        let locations = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("locations"))
+            .and_then(JsonValue::as_array)
+            .expect("definition should return a locations array");
+        assert_eq!(locations.len(), 1, "{mode}");
+        assert_eq!(locations[0]["server"], "mock-lsp", "{mode}");
+        assert!(
+            locations[0]["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.ends_with("/main.rs")),
+            "{mode}"
+        );
+        assert_eq!(
+            locations[0]["targetRange"],
+            json!({
+                "start": { "line": 0, "character": 8 },
+                "end": { "line": 0, "character": 14 },
+            }),
+            "{mode}"
+        );
+        assert_eq!(
+            locations[0]["targetSelectionRange"], locations[0]["targetRange"],
+            "{mode}"
+        );
+        assert_eq!(locations[0]["targetPositionEncoding"], "utf-8", "{mode}");
+        assert!(locations[0].get("originSelectionRange").is_none(), "{mode}");
+        assert!(
+            result
+                .content
+                .first()
+                .and_then(|content| content.as_text())
+                .is_some_and(|content| content.text.contains("mock-lsp")),
+            "{mode}"
+        );
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn definition_rejects_a_server_without_the_capability()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("definition-unsupported")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "definition-unsupported")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .expect("definition arguments should be an object")
+    .clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("definition").with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .is_some_and(|content| content
+                .text
+                .contains("does not support `textDocument/definition`"))
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn routes_hover_to_the_server_selected_by_the_file_extension()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("multi-server-routing")?;

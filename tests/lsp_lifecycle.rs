@@ -7,8 +7,8 @@ use std::{
 
 use deixis::{
     cli::CliOptions,
-    lsp::{LazyLanguageServer, LspError},
-    positions::{Position, PositionEncoding},
+    lsp::{DefinitionLocation, LazyLanguageServer, LspError},
+    positions::{Position, PositionEncoding, Range},
     project::StartupState,
 };
 use serde::Deserialize;
@@ -127,6 +127,8 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert_eq!(probe.position_encodings, ["utf-8", "utf-16", "utf-32"]);
     assert!(probe.hover_dynamic_registration);
     assert_eq!(probe.hover_content_formats, ["markdown", "plaintext"]);
+    assert!(probe.definition_dynamic_registration);
+    assert!(probe.definition_link_support);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
     assert!(manager.dynamic_registrations().await.is_empty());
@@ -346,6 +348,148 @@ async fn rejects_hover_before_synchronizing_when_capability_is_disabled()
 }
 
 #[tokio::test]
+async fn normalizes_definition_responses_across_position_encodings()
+-> Result<(), Box<dyn Error>> {
+    for mode in [
+        "definition-location-utf-8",
+        "definition-locations-utf-16",
+        "definition-links-utf-32",
+        "definition-options",
+    ] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+        let definitions = manager
+            .definition("main.rs", "rust", Position::new(0, 8))
+            .await?;
+
+        assert_eq!(definitions.len(), 1, "{mode}");
+        assert_eq!(
+            definitions[0],
+            DefinitionLocation {
+                server: "mock-lsp".to_owned(),
+                uri: definitions[0].uri.clone(),
+                target_range: Range::new(
+                    Position::new(0, 8),
+                    Position::new(0, 14),
+                ),
+                target_selection_range: Range::new(
+                    Position::new(0, 8),
+                    Position::new(0, 14),
+                ),
+                target_position_encoding: PositionEncoding::Utf8,
+                origin_selection_range: None,
+            },
+            "{mode}"
+        );
+        assert!(definitions[0].uri.ends_with("/main.rs"), "{mode}");
+
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_definition_before_synchronizing_when_capability_is_disabled()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("definition-unsupported", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let error = manager
+        .definition("main.rs", "rust", Position::new(0, 8))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::UnsupportedCapability { .. }));
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert!(probe.events.is_empty());
+    assert_eq!(probe.open_documents, 0);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn converts_project_definition_targets_and_preserves_external_targets()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root(
+        "definition-project-target-utf-16",
+        1_000,
+        1_000,
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    fs::write(root.join("helper.rs"), "pub 🦀answer\n")?;
+
+    let definitions = manager
+        .definition("main.rs", "rust", Position::new(0, 8))
+        .await?;
+
+    assert_eq!(definitions.len(), 1);
+    assert!(definitions[0].uri.ends_with("/helper.rs"));
+    assert_eq!(
+        definitions[0].target_position_encoding,
+        PositionEncoding::Utf8
+    );
+    assert_eq!(
+        definitions[0].target_selection_range,
+        Range::new(Position::new(0, 8), Position::new(0, 14))
+    );
+    assert_eq!(
+        definitions[0].origin_selection_range,
+        Some(Range::new(Position::new(0, 8), Position::new(0, 14),))
+    );
+    manager.shutdown().await?;
+
+    let (manager, root) = configured_manager_with_root(
+        "definition-external-utf-16",
+        1_000,
+        1_000,
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let definitions = manager
+        .definition("main.rs", "rust", Position::new(0, 8))
+        .await?;
+
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].uri, "file:///deixis-external-do-not-read.rs");
+    assert_eq!(
+        definitions[0].target_position_encoding,
+        PositionEncoding::Utf16
+    );
+    assert_eq!(
+        definitions[0].target_selection_range,
+        Range::new(Position::new(0, 6), Position::new(0, 12))
+    );
+    assert_eq!(
+        definitions[0].origin_selection_range,
+        Some(Range::new(Position::new(0, 8), Position::new(0, 14),))
+    );
+    manager.shutdown().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn maps_a_null_definition_response_to_no_locations()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("definition-null", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let definitions = manager
+        .definition("main.rs", "rust", Position::new(0, 8))
+        .await?;
+
+    assert!(definitions.is_empty());
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
 {
     let manager = configured_manager("malformed", 1_000, 1_000)?;
@@ -503,6 +647,8 @@ struct ProbeResponse {
     position_encodings: Vec<String>,
     hover_dynamic_registration: bool,
     hover_content_formats: Vec<String>,
+    definition_dynamic_registration: bool,
+    definition_link_support: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -21,6 +21,7 @@ use tokio::{
     time::timeout,
 };
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::{
     config::LanguageServerConfig,
@@ -147,6 +148,163 @@ impl LazyLanguageServer {
         Ok(hover)
     }
 
+    pub async fn definition(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+    ) -> Result<Vec<DefinitionLocation>, LspError> {
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server().await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_method(
+                "textDocument/definition",
+                snapshot.capabilities().get("definitionProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: "textDocument/definition",
+            });
+        }
+
+        let document = active.synchronize_document(file, language_id).await?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+        let lsp_position = document
+            .to_lsp_position(position, encoding)
+            .map_err(|source| LspError::PositionConversion {
+                server: self.config.name().to_owned(),
+                path: document.absolute_path().to_path_buf(),
+                source,
+            })?;
+        let value = active
+            .request_value(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": document.uri() },
+                    "position": lsp_position,
+                }),
+                self.config.timeouts().request(),
+            )
+            .await?;
+        let response: Option<DefinitionResponse> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+
+        let mut locations = Vec::new();
+        for location in response.into_iter().flat_map(DefinitionResponse::items)
+        {
+            let (uri, target_range, target_selection_range, origin_range) =
+                match location {
+                    DefinitionResponseItem::Location(location) => {
+                        (location.uri, location.range, location.range, None)
+                    }
+                    DefinitionResponseItem::LocationLink(link) => (
+                        link.target_uri,
+                        link.target_range,
+                        link.target_selection_range,
+                        link.origin_selection_range,
+                    ),
+                };
+            let origin_selection_range = origin_range
+                .map(|range| {
+                    document.from_lsp_range(range, encoding).map_err(|source| {
+                        LspError::PositionConversion {
+                            server: self.config.name().to_owned(),
+                            path: document.absolute_path().to_path_buf(),
+                            source,
+                        }
+                    })
+                })
+                .transpose()?;
+            let target = self
+                .normalize_definition_target(
+                    &document,
+                    &uri,
+                    target_range,
+                    target_selection_range,
+                    encoding,
+                )
+                .await?;
+            locations.push(DefinitionLocation {
+                server: self.config.name().to_owned(),
+                uri,
+                target_range: target.range,
+                target_selection_range: target.selection_range,
+                target_position_encoding: target.position_encoding,
+                origin_selection_range,
+            });
+        }
+
+        Ok(locations)
+    }
+
+    async fn normalize_definition_target(
+        &self,
+        document: &SynchronizedDocument,
+        uri: &str,
+        range: Range,
+        selection_range: Range,
+        encoding: PositionEncoding,
+    ) -> Result<DefinitionTarget, LspError> {
+        if uri == document.uri() {
+            return convert_definition_target(
+                document.text(),
+                document.absolute_path(),
+                range,
+                selection_range,
+                encoding,
+                self.config.name(),
+            );
+        }
+
+        let Some(path) = Url::parse(uri)
+            .ok()
+            .filter(|uri| uri.scheme() == "file")
+            .and_then(|uri| uri.to_file_path().ok())
+        else {
+            return Ok(DefinitionTarget::unconverted(
+                range,
+                selection_range,
+                encoding,
+            ));
+        };
+        if !path.starts_with(self.project.root()) {
+            return Ok(DefinitionTarget::unconverted(
+                range,
+                selection_range,
+                encoding,
+            ));
+        }
+        let Ok(file) = self.project.resolve_file(&path) else {
+            return Ok(DefinitionTarget::unconverted(
+                range,
+                selection_range,
+                encoding,
+            ));
+        };
+        let Ok(text) = tokio::fs::read_to_string(file.absolute()).await else {
+            return Ok(DefinitionTarget::unconverted(
+                range,
+                selection_range,
+                encoding,
+            ));
+        };
+
+        convert_definition_target(
+            &text,
+            file.absolute(),
+            range,
+            selection_range,
+            encoding,
+            self.config.name(),
+        )
+    }
+
     pub async fn status(&self) -> ServerSnapshot {
         let active = {
             let state = self.state.lock().await;
@@ -218,6 +376,134 @@ pub struct Hover {
     pub contents: HoverContents,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefinitionLocation {
+    pub server: String,
+    pub uri: String,
+    pub target_range: Range,
+    pub target_selection_range: Range,
+    pub target_position_encoding: PositionEncoding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_selection_range: Option<Range>,
+}
+
+impl DefinitionLocation {
+    pub fn text(&self) -> String {
+        let range = self.target_selection_range;
+        format!(
+            "{}: {}:{}:{}-{}:{} ({})",
+            self.server,
+            self.uri,
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+            self.target_position_encoding,
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DefinitionResponse {
+    Location(Location),
+    Locations(Vec<Location>),
+    LocationLinks(Vec<LocationLink>),
+}
+
+impl DefinitionResponse {
+    fn items(self) -> Vec<DefinitionResponseItem> {
+        match self {
+            Self::Location(location) => {
+                vec![DefinitionResponseItem::Location(location)]
+            }
+            Self::Locations(locations) => locations
+                .into_iter()
+                .map(DefinitionResponseItem::Location)
+                .collect(),
+            Self::LocationLinks(links) => links
+                .into_iter()
+                .map(DefinitionResponseItem::LocationLink)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DefinitionResponseItem {
+    Location(Location),
+    LocationLink(LocationLink),
+}
+
+#[derive(Debug, Deserialize)]
+struct Location {
+    uri: String,
+    range: Range,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocationLink {
+    #[serde(default)]
+    origin_selection_range: Option<Range>,
+    target_uri: String,
+    target_range: Range,
+    target_selection_range: Range,
+}
+
+#[derive(Debug)]
+struct DefinitionTarget {
+    range: Range,
+    selection_range: Range,
+    position_encoding: PositionEncoding,
+}
+
+impl DefinitionTarget {
+    const fn unconverted(
+        range: Range,
+        selection_range: Range,
+        position_encoding: PositionEncoding,
+    ) -> Self {
+        Self {
+            range,
+            selection_range,
+            position_encoding,
+        }
+    }
+}
+
+fn convert_definition_target(
+    text: &str,
+    path: &Path,
+    range: Range,
+    selection_range: Range,
+    encoding: PositionEncoding,
+    server: &str,
+) -> Result<DefinitionTarget, LspError> {
+    let converter = PositionConverter::new(text);
+    let range =
+        converter
+            .from_lsp_range(range, encoding)
+            .map_err(|source| LspError::PositionConversion {
+                server: server.to_owned(),
+                path: path.to_path_buf(),
+                source,
+            })?;
+    let selection_range = converter
+        .from_lsp_range(selection_range, encoding)
+        .map_err(|source| LspError::PositionConversion {
+        server: server.to_owned(),
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(DefinitionTarget {
+        range,
+        selection_range,
+        position_encoding: PositionEncoding::Utf8,
+    })
 }
 
 impl Hover {
@@ -1510,6 +1796,10 @@ fn initialize_params(
                 },
             },
             "textDocument": {
+                "definition": {
+                    "dynamicRegistration": true,
+                    "linkSupport": true,
+                },
                 "hover": {
                     "dynamicRegistration": true,
                     "contentFormat": ["markdown", "plaintext"],
@@ -1521,31 +1811,9 @@ fn initialize_params(
 }
 
 fn path_to_file_uri(path: &Path) -> String {
-    let mut path = path.to_string_lossy().replace('\\', "/");
-    if !path.starts_with('/') {
-        path.insert(0, '/');
-    }
-
-    format!("file://{}", percent_encode_path(&path))
-}
-
-fn percent_encode_path(path: &str) -> String {
-    let mut encoded = String::new();
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'/'
-            | b':'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~' => encoded.push(byte as char),
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
+    Url::from_file_path(path)
+        .expect("project paths should be absolute file URI paths")
+        .into()
 }
 
 fn workspace_name(path: &Path) -> String {

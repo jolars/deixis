@@ -96,8 +96,15 @@ fn handle_request<R: BufRead>(
                 "document-incremental-utf-32" => {
                     Some(Json::String("utf-32".to_owned()))
                 }
-                "hover-utf-16" => Some(Json::String("utf-16".to_owned())),
-                "hover-utf-32" => Some(Json::String("utf-32".to_owned())),
+                "hover-utf-16"
+                | "definition-locations-utf-16"
+                | "definition-project-target-utf-16"
+                | "definition-external-utf-16" => {
+                    Some(Json::String("utf-16".to_owned()))
+                }
+                "hover-utf-32" | "definition-links-utf-32" => {
+                    Some(Json::String("utf-32".to_owned()))
+                }
                 _ => Some(Json::String("utf-8".to_owned())),
             };
             let hover_provider = match mode {
@@ -108,7 +115,16 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let definition_provider = match mode {
+                "definition-unsupported" => Json::Bool(false),
+                "definition-options" => json_object([(
+                    "workDoneProgress",
+                    Json::Bool(true),
+                )]),
+                _ => Json::Bool(true),
+            };
             let mut capabilities = vec![
+                ("definitionProvider".to_owned(), definition_provider),
                 ("hoverProvider".to_owned(), hover_provider),
                 ("textDocumentSync".to_owned(), text_document_sync),
             ];
@@ -300,6 +316,108 @@ fn handle_request<R: BufRead>(
                     ]),
                 ),
             )?;
+        }
+        "textDocument/definition" => {
+            if mode == "definition-unsupported" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "definition request bypassed capability gate".to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let expected_character = match mode {
+                "definition-locations-utf-16"
+                | "definition-project-target-utf-16"
+                | "definition-external-utf-16" => 6,
+                "definition-links-utf-32" => 5,
+                _ => 8,
+            };
+            let position = params.get("position");
+            let line = position
+                .and_then(|position| position.get("line"))
+                .and_then(Json::as_i64);
+            let character = position
+                .and_then(|position| position.get("character"))
+                .and_then(Json::as_i64);
+            if line != Some(0) || character != Some(expected_character) {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32602,
+                        format!(
+                            "expected definition position 0:{expected_character}, got {line:?}:{character:?}"
+                        ),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let source_uri = params
+                .get("textDocument")
+                .and_then(|document| document.get("uri"))
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            let target_uri = match mode {
+                "definition-project-target-utf-16" => source_uri
+                    .strip_suffix("main.rs")
+                    .map(|prefix| format!("{prefix}helper.rs"))
+                    .unwrap_or_else(|| source_uri.to_owned()),
+                "definition-external-utf-16" => {
+                    "file:///deixis-external-do-not-read.rs".to_owned()
+                }
+                _ => source_uri.to_owned(),
+            };
+            let selection_range = json_object([
+                (
+                    "start",
+                    json_object([
+                        ("line", Json::Number(0)),
+                        ("character", Json::Number(expected_character)),
+                    ]),
+                ),
+                (
+                    "end",
+                    json_object([
+                        ("line", Json::Number(0)),
+                        ("character", Json::Number(expected_character + 6)),
+                    ]),
+                ),
+            ]);
+            let location = json_object([
+                ("uri", Json::String(target_uri.clone())),
+                ("range", selection_range.clone()),
+            ]);
+            let result = match mode {
+                "definition-locations-utf-16" => {
+                    Json::Array(vec![location])
+                }
+                "definition-links-utf-32" => Json::Array(vec![json_object([
+                    ("targetUri", Json::String(target_uri)),
+                    ("targetRange", selection_range.clone()),
+                    ("targetSelectionRange", selection_range),
+                ])]),
+                "definition-project-target-utf-16"
+                | "definition-external-utf-16" => {
+                    Json::Array(vec![json_object([
+                        (
+                            "originSelectionRange",
+                            selection_range.clone(),
+                        ),
+                        ("targetUri", Json::String(target_uri)),
+                        ("targetRange", selection_range.clone()),
+                        ("targetSelectionRange", selection_range),
+                    ])])
+                }
+                "definition-null" => Json::Null,
+                _ => location,
+            };
+            write_message(output, response(id, result))?;
         }
         "shutdown" => {
             if mode == "ignore-shutdown" {
@@ -530,6 +648,8 @@ fn probe_client<R: BufRead>(
         position_encodings,
         hover_dynamic_registration,
         hover_content_formats,
+        definition_dynamic_registration,
+        definition_link_support,
     ) = {
         let mut state = state.lock().unwrap();
         state.client_probe_complete = true;
@@ -555,10 +675,23 @@ fn probe_client<R: BufRead>(
             .and_then(|hover| hover.get("contentFormat"))
             .cloned()
             .unwrap_or(Json::Null);
+        let definition = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("definition"));
+        let definition_dynamic_registration = definition
+            .and_then(|definition| definition.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let definition_link_support = definition
+            .and_then(|definition| definition.get("linkSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         (
             position_encodings,
             dynamic_registration,
             content_formats,
+            definition_dynamic_registration,
+            definition_link_support,
         )
     };
     Ok(json_object([
@@ -645,6 +778,14 @@ fn probe_client<R: BufRead>(
             Json::Bool(hover_dynamic_registration),
         ),
         ("hover_content_formats", hover_content_formats),
+        (
+            "definition_dynamic_registration",
+            Json::Bool(definition_dynamic_registration),
+        ),
+        (
+            "definition_link_support",
+            Json::Bool(definition_link_support),
+        ),
     ]))
 }
 

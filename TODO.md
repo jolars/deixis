@@ -60,7 +60,7 @@ Windows.
   marks, non-BMP characters, line endings, and invalid boundaries.
 - [x] Add capability-gated `hover` with structured markup and a concise text
   fallback.
-- [ ] Add capability-gated `definition`, normalize `Location` and
+- [x] Add capability-gated `definition`, normalize `Location` and
   `LocationLink`, and retain source-server provenance.
 - [ ] Define a consistent structured error shape for invalid paths, invalid
   positions, unsupported capabilities, timeouts, server exits, and LSP
