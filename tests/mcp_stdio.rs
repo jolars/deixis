@@ -284,6 +284,171 @@ async fn discovers_the_user_config_without_fixing_the_project_root()
 }
 
 #[tokio::test]
+async fn every_tool_has_a_stable_text_fallback_and_structured_output()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("stable-text-renderers")?;
+    fs::write(root.join("main.rs"), "let answer = 42; xx\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "diagnostics-pull-renderers")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let uri = url::Url::from_file_path(root.join("main.rs"))
+        .unwrap()
+        .to_string();
+
+    let stopped_status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+    )
+    .await??;
+    assert_eq!(
+        stopped_status.content[0].as_text().unwrap().text,
+        "mock-lsp: not started; readiness not started (lifecycle)."
+    );
+    assert_eq!(
+        stopped_status.structured_content.as_ref().unwrap()["capabilities"],
+        JsonValue::Null
+    );
+
+    let status_arguments =
+        json!({ "start": true }).as_object().unwrap().clone();
+    let status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("deixis_server_status")
+                .with_arguments(status_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(
+        status.content[0].as_text().unwrap().text,
+        "mock-lsp: started as deixis-mock-lsp 0.1.0; position encoding utf-8; readiness unknown (lifecycle)."
+    );
+    assert_eq!(
+        status.structured_content.as_ref().unwrap()["capabilities"]["hoverProvider"],
+        true
+    );
+
+    let position_arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let references_arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 8 },
+        "includeDeclaration": true,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let file_arguments =
+        json!({ "path": "main.rs" }).as_object().unwrap().clone();
+    let workspace_arguments =
+        json!({ "query": "answer" }).as_object().unwrap().clone();
+    let location_text = format!("mock-lsp: {uri}:0:8-0:14 (utf-8)");
+    let cases = [
+        (
+            "hover",
+            position_arguments.clone(),
+            "`answer`: the ultimate value".to_owned(),
+        ),
+        (
+            "declaration",
+            position_arguments.clone(),
+            location_text.clone(),
+        ),
+        (
+            "definition",
+            position_arguments.clone(),
+            location_text.clone(),
+        ),
+        (
+            "type_definition",
+            position_arguments.clone(),
+            location_text.clone(),
+        ),
+        ("implementation", position_arguments, location_text.clone()),
+        (
+            "references",
+            references_arguments,
+            format!("mock-lsp: {uri}:0:0-0:3 (utf-8)\n{location_text}"),
+        ),
+        (
+            "diagnostics",
+            file_arguments.clone(),
+            "1 diagnostic for main.rs.".to_owned(),
+        ),
+        (
+            "document_symbols",
+            file_arguments,
+            format!(
+                "mock-lsp: binding (kind 13) at {uri}:0:6-0:12 (utf-8)\n  mock-lsp: answer (kind 13) at {uri}:0:6-0:12 (utf-8)"
+            ),
+        ),
+        (
+            "workspace_symbols",
+            workspace_arguments,
+            format!("mock-lsp: mockSymbol (kind 12) at {uri}:0:0-0:3 (utf-8)"),
+        ),
+    ];
+
+    for (tool, arguments, expected_text) in cases {
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new(tool).with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(false), "{tool}");
+        assert_eq!(
+            result.content[0].as_text().unwrap().text,
+            expected_text,
+            "{tool}"
+        );
+        let structured =
+            result.structured_content.as_ref().unwrap_or_else(|| {
+                panic!("{tool} should retain structured output")
+            });
+        assert!(structured.is_object(), "{tool}");
+
+        match tool {
+            "hover" => assert_eq!(structured["contents"]["kind"], "markdown"),
+            "diagnostics" => {
+                assert_eq!(structured["diagnostics"][0]["severity"], 1);
+                assert_eq!(
+                    structured["diagnostics"][0]["data"]["extension"],
+                    true
+                );
+            }
+            "document_symbols" => assert_eq!(
+                structured["symbols"][0]["x-mock-extension"],
+                "parent"
+            ),
+            "workspace_symbols" => {
+                assert_eq!(structured["symbols"][0]["deprecated"], true);
+                assert_eq!(structured["symbols"][0]["x-mock-extension"], true);
+            }
+            _ => assert_eq!(structured["locations"][0]["server"], "mock-lsp"),
+        }
+    }
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("workspace-symbol-fanout")?;

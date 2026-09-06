@@ -230,6 +230,12 @@ Tool arguments and results follow LSP structures where practical. Locations,
 ranges, symbol kinds, hover markup, diagnostic severities, and related
 information remain structured JSON. Each successful result also supplies a small
 textual representation for MCP clients that do not consume structured content.
+These fallbacks have deterministic, tool-specific formats rather than serialized
+JSON. Status is one sentence; hover uses the rendered markup body; navigation
+and references use one location per line; diagnostics summarize availability and
+count; and symbols use one line per symbol, with indentation for document-symbol
+children. Extension fields and other details that do not belong in the concise
+text remain available in the structured result and do not perturb its rendering.
 
 Deixis advertises `window.workDoneProgress` and the rust-analyzer
 `experimental.serverStatusNotification` extension. It tracks active work-done

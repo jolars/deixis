@@ -129,6 +129,9 @@ servers is rejected unless the caller supplies the optional `server` override.
 Configured sessions advertise ten read-only tools: `deixis_server_status`,
 `hover`, `definition`, `declaration`, `type_definition`, `implementation`,
 `references`, `diagnostics`, `document_symbols`, and `workspace_symbols`.
+Every successful call returns both structured JSON and a stable, concise text
+fallback. The fallback is deliberately independent of optional LSP extension
+fields, which remain intact in the structured result.
 Calling the lifecycle probe with `{ "server": "rust", "start": true }`
 starts that server and returns its recorded status. Without `server`, it
 selects the first configured name in stable lexical order. The `hover` tool

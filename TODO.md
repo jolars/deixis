@@ -79,7 +79,7 @@ matrix.
   configuration order.
 - [x] Cache versioned push diagnostics and implement pull diagnostics when
   advertised. Mark unavailable or stale reports explicitly.
-- [ ] Add stable text renderers for all tools without discarding structured LSP
+- [x] Add stable text renderers for all tools without discarding structured LSP
   fields.
 - [ ] Test null, empty, partial, multi-location, deprecated, and extension-rich
   LSP responses.

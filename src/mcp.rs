@@ -20,7 +20,8 @@ use crate::{
     config::{Config, ConfigRouteError},
     lsp::{
         DiagnosticAvailability, LazyLanguageServer, LspError,
-        ReadinessSnapshot, ResultStability, ServerSnapshot,
+        ReadinessSnapshot, ReadinessSource, ReadinessState, ResultStability,
+        ServerSnapshot,
     },
     positions::Position,
     project::{Project, ProjectPathError, StartupState},
@@ -266,7 +267,7 @@ impl DeixisServer {
             language_server.status().await
         };
 
-        Ok(CallToolResult::structured(status_json(&status)).into())
+        Ok(success_result(status_json(&status), status_text(&status)))
     }
 
     async fn call_hover(
@@ -369,10 +370,7 @@ impl DeixisServer {
                 (structured, text)
             }
         };
-        let mut result = CallToolResult::structured(structured);
-        result.content = vec![ContentBlock::text(text)];
-
-        Ok(result.into())
+        Ok(success_result(structured, text))
     }
 
     async fn call_location(
@@ -508,10 +506,7 @@ impl DeixisServer {
         if let Some(readiness) = &readiness {
             attach_empty_result_context(&mut structured, readiness);
         }
-        let mut result = CallToolResult::structured(structured);
-        result.content = vec![ContentBlock::text(text)];
-
-        Ok(result.into())
+        Ok(success_result(structured, text))
     }
 
     async fn call_references(
@@ -620,10 +615,7 @@ impl DeixisServer {
         if let Some(readiness) = &readiness {
             attach_empty_result_context(&mut structured, readiness);
         }
-        let mut result = CallToolResult::structured(structured);
-        result.content = vec![ContentBlock::text(text)];
-
-        Ok(result.into())
+        Ok(success_result(structured, text))
     }
 
     async fn call_diagnostics(
@@ -757,10 +749,7 @@ impl DeixisServer {
         if let Some(readiness) = &readiness {
             attach_empty_result_context(&mut structured, readiness);
         }
-        let mut result = CallToolResult::structured(structured);
-        result.content = vec![ContentBlock::text(text)];
-
-        Ok(result.into())
+        Ok(success_result(structured, text))
     }
 
     async fn call_document_symbols(
@@ -861,10 +850,7 @@ impl DeixisServer {
         if let Some(readiness) = &readiness {
             attach_empty_result_context(&mut structured, readiness);
         }
-        let mut result = CallToolResult::structured(structured);
-        result.content = vec![ContentBlock::text(text)];
-
-        Ok(result.into())
+        Ok(success_result(structured, text))
     }
 
     async fn call_workspace_symbols(
@@ -976,11 +962,7 @@ impl DeixisServer {
                 None,
             )
         })?;
-        let mut result =
-            CallToolResult::structured(json!({ "symbols": symbols }));
-        result.content = vec![ContentBlock::text(text)];
-
-        Ok(result.into())
+        Ok(success_result(json!({ "symbols": symbols }), text))
     }
 }
 
@@ -1184,6 +1166,15 @@ fn lsp_error_code(error: &LspError) -> &'static str {
         LspError::RequestCanceled { .. } => "request_canceled",
         LspError::Shutdown { .. } => "server_error",
     }
+}
+
+fn success_result(
+    structured: JsonValue,
+    text: impl Into<String>,
+) -> CallToolResponse {
+    let mut result = CallToolResult::structured(structured);
+    result.content = vec![ContentBlock::text(text)];
+    result.into()
 }
 
 fn error_result(error: ToolError) -> CallToolResponse {
@@ -2070,6 +2061,44 @@ fn status_json(status: &ServerSnapshot) -> JsonValue {
         "capabilities": status.capabilities(),
         "readiness": status.readiness(),
     })
+}
+
+fn status_text(status: &ServerSnapshot) -> String {
+    let state = if status.started() {
+        match (status.server_name(), status.server_version()) {
+            (Some(name), Some(version)) => {
+                format!("started as {name} {version}")
+            }
+            (Some(name), None) => format!("started as {name}"),
+            (None, _) => "started".to_owned(),
+        }
+    } else {
+        "not started".to_owned()
+    };
+    let encoding = status
+        .position_encoding()
+        .map_or_else(String::new, |encoding| {
+            format!("; position encoding {encoding}")
+        });
+    let readiness = status.readiness();
+    let readiness_state = match readiness.state() {
+        ReadinessState::NotStarted => "not started",
+        ReadinessState::Starting => "starting",
+        ReadinessState::Busy => "busy",
+        ReadinessState::Ready => "ready",
+        ReadinessState::Degraded => "degraded",
+        ReadinessState::Unknown => "unknown",
+    };
+    let readiness_source = match readiness.source() {
+        ReadinessSource::Lifecycle => "lifecycle",
+        ReadinessSource::WorkDoneProgress => "work-done progress",
+        ReadinessSource::ServerStatus => "server status",
+    };
+
+    format!(
+        "{}: {state}{encoding}; readiness {readiness_state} ({readiness_source}).",
+        status.configured_name()
+    )
 }
 
 fn attach_empty_result_context(
