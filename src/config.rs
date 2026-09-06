@@ -9,10 +9,14 @@ use std::{
 use globset::Glob;
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Number, Value as JsonValue};
-use tokio::process::Command;
+use tokio::{process::Command, sync::Semaphore};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 16;
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -177,6 +181,7 @@ pub struct LanguageServerConfig {
     file_patterns: BTreeMap<String, String>,
     initialization_options: JsonValue,
     timeouts: TimeoutConfig,
+    limits: LimitConfig,
 }
 
 impl LanguageServerConfig {
@@ -210,6 +215,10 @@ impl LanguageServerConfig {
 
     pub fn timeouts(&self) -> TimeoutConfig {
         self.timeouts
+    }
+
+    pub fn limits(&self) -> LimitConfig {
+        self.limits
     }
 
     pub fn to_command(&self) -> Command {
@@ -262,17 +271,43 @@ impl LanguageServerConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeoutConfig {
+    startup: Duration,
     request: Duration,
     shutdown: Duration,
 }
 
 impl TimeoutConfig {
+    pub fn startup(&self) -> Duration {
+        self.startup
+    }
+
     pub fn request(&self) -> Duration {
         self.request
     }
 
     pub fn shutdown(&self) -> Duration {
         self.shutdown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitConfig {
+    outbound_queue_capacity: usize,
+    max_concurrent_requests: usize,
+    max_response_bytes: usize,
+}
+
+impl LimitConfig {
+    pub fn outbound_queue_capacity(self) -> usize {
+        self.outbound_queue_capacity
+    }
+
+    pub fn max_concurrent_requests(self) -> usize {
+        self.max_concurrent_requests
+    }
+
+    pub fn max_response_bytes(self) -> usize {
+        self.max_response_bytes
     }
 }
 
@@ -363,6 +398,7 @@ impl RawConfig {
                 file_patterns: server.file_patterns,
                 initialization_options,
                 timeouts: server.timeouts.validate()?,
+                limits: server.limits.validate()?,
             });
         }
 
@@ -386,11 +422,14 @@ struct RawLanguageServerConfig {
     initialization_options: Option<toml::Value>,
     #[serde(default)]
     timeouts: RawTimeoutConfig,
+    #[serde(default)]
+    limits: RawLimitConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTimeoutConfig {
+    startup_ms: Option<u64>,
     request_ms: Option<u64>,
     shutdown_ms: Option<u64>,
 }
@@ -398,6 +437,11 @@ struct RawTimeoutConfig {
 impl RawTimeoutConfig {
     fn validate(self) -> Result<TimeoutConfig, ConfigError> {
         Ok(TimeoutConfig {
+            startup: duration_or_default(
+                "startup_ms",
+                self.startup_ms,
+                DEFAULT_STARTUP_TIMEOUT,
+            )?,
             request: duration_or_default(
                 "request_ms",
                 self.request_ms,
@@ -407,6 +451,36 @@ impl RawTimeoutConfig {
                 "shutdown_ms",
                 self.shutdown_ms,
                 DEFAULT_SHUTDOWN_TIMEOUT,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLimitConfig {
+    outbound_queue_capacity: Option<usize>,
+    max_concurrent_requests: Option<usize>,
+    max_response_bytes: Option<usize>,
+}
+
+impl RawLimitConfig {
+    fn validate(self) -> Result<LimitConfig, ConfigError> {
+        Ok(LimitConfig {
+            outbound_queue_capacity: semaphore_bound_or_default(
+                "outbound_queue_capacity",
+                self.outbound_queue_capacity,
+                DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+            )?,
+            max_concurrent_requests: semaphore_bound_or_default(
+                "max_concurrent_requests",
+                self.max_concurrent_requests,
+                DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )?,
+            max_response_bytes: positive_or_default(
+                "max_response_bytes",
+                self.max_response_bytes,
+                DEFAULT_MAX_RESPONSE_BYTES,
             )?,
         })
     }
@@ -514,6 +588,35 @@ fn duration_or_default(
     }
 }
 
+fn positive_or_default(
+    field: &str,
+    value: Option<usize>,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    match value {
+        Some(0) => {
+            Err(validation(format!("{field} must be greater than zero")))
+        }
+        Some(value) => Ok(value),
+        None => Ok(default),
+    }
+}
+
+fn semaphore_bound_or_default(
+    field: &str,
+    value: Option<usize>,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    let value = positive_or_default(field, value, default)?;
+    if value > Semaphore::MAX_PERMITS {
+        return Err(validation(format!(
+            "{field} must not exceed {}",
+            Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(value)
+}
+
 fn toml_to_json(
     value: toml::Value,
     path: &str,
@@ -587,8 +690,14 @@ allFeatures = true
 features = ["serde", "toml"]
 
 [servers.rust.timeouts]
+startup_ms = 7000
 request_ms = 12000
 shutdown_ms = 3000
+
+[servers.rust.limits]
+outbound_queue_capacity = 32
+max_concurrent_requests = 8
+max_response_bytes = 8388608
 "#;
 
     #[test]
@@ -628,8 +737,12 @@ shutdown_ms = 3000
                 },
             })
         );
+        assert_eq!(server.timeouts().startup(), Duration::from_millis(7000));
         assert_eq!(server.timeouts().request(), Duration::from_millis(12000));
         assert_eq!(server.timeouts().shutdown(), Duration::from_millis(3000));
+        assert_eq!(server.limits().outbound_queue_capacity(), 32);
+        assert_eq!(server.limits().max_concurrent_requests(), 8);
+        assert_eq!(server.limits().max_response_bytes(), 8_388_608);
     }
 
     #[test]
@@ -796,6 +909,31 @@ request_ms = 0
     }
 
     #[test]
+    fn rejects_invalid_limit_values() {
+        for (field, value) in [
+            ("outbound_queue_capacity", 0),
+            ("max_concurrent_requests", 0),
+            ("max_response_bytes", 0),
+        ] {
+            let error = parse_error(&format!(
+                r#"
+[servers.rust]
+command = "rust-analyzer"
+file_extensions = {{ ".rs" = "rust" }}
+
+[servers.rust.limits]
+{field} = {value}
+"#,
+            ));
+
+            assert!(
+                error.contains(&format!("{field} must be greater than zero")),
+                "unexpected error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_initialization_options_that_are_not_json() {
         let error = parse_error(
             r#"
@@ -826,8 +964,12 @@ file_extensions = { ".py" = "python" }
         .unwrap();
         let server = config.server("pyright").unwrap();
 
+        assert_eq!(server.timeouts().startup(), Duration::from_secs(30));
         assert_eq!(server.timeouts().request(), Duration::from_secs(30));
         assert_eq!(server.timeouts().shutdown(), Duration::from_secs(5));
+        assert_eq!(server.limits().outbound_queue_capacity(), 64);
+        assert_eq!(server.limits().max_concurrent_requests(), 16);
+        assert_eq!(server.limits().max_response_bytes(), 16 * 1024 * 1024);
         assert_eq!(server.initialization_options(), &json!({}));
     }
 

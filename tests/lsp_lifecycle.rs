@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -17,6 +18,7 @@ use deixis::{
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
+use tokio::task::JoinSet;
 
 mod support;
 
@@ -72,6 +74,144 @@ async fn request_timeout_cancels_only_the_pending_request()
         .request("mock/echo", json!({ "message": "still alive" }))
         .await?;
     assert_eq!(echo.echo, json!({ "message": "still alive" }));
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_uses_its_own_deadline() -> Result<(), Box<dyn Error>> {
+    let manager = configured_manager_with_bounds(
+        "initialize-timeout",
+        TestBounds {
+            startup_timeout_ms: 50,
+            ..TestBounds::default()
+        },
+    )?;
+
+    let started = Instant::now();
+    let error = manager.ensure_started().await.unwrap_err();
+    assert!(matches!(
+        error,
+        LspError::RequestTimeout {
+            ref method,
+            timeout,
+            ..
+        } if method == "initialize" && timeout == Duration::from_millis(50)
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "startup cleanup extended the deadline to {:?}",
+        started.elapsed()
+    );
+    assert!(!manager.status().await.started());
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_an_lsp_response_over_the_configured_limit()
+-> Result<(), Box<dyn Error>> {
+    let manager = configured_manager_with_bounds(
+        "normal",
+        TestBounds {
+            max_response_bytes: 4_096,
+            ..TestBounds::default()
+        },
+    )?;
+    manager.ensure_started().await?;
+
+    let error = manager
+        .request::<JsonValue>("mock/largeResponse", json!({ "bytes": 8_192 }))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        LspError::ResponseTooLarge {
+            ref method,
+            response_bytes,
+            max_response_bytes: 4_096,
+            ..
+        } if method == "mock/largeResponse" && response_bytes > 4_096
+    ));
+
+    let _ = manager.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn limits_concurrent_requests_per_server() -> Result<(), Box<dyn Error>> {
+    let manager = Arc::new(configured_manager_with_bounds(
+        "normal",
+        TestBounds {
+            max_concurrent_requests: 2,
+            ..TestBounds::default()
+        },
+    )?);
+    manager.ensure_started().await?;
+
+    let mut tasks = JoinSet::new();
+    for _ in 0..6 {
+        let manager = Arc::clone(&manager);
+        tasks.spawn(async move {
+            manager
+                .request::<JsonValue>("mock/delay", json!({ "delay_ms": 100 }))
+                .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result??;
+    }
+
+    let concurrency: ConcurrencyResponse =
+        manager.request("mock/concurrency", JsonValue::Null).await?;
+    assert_eq!(concurrency.max_active_delays, 2);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_deadline_includes_waiting_for_a_concurrency_slot()
+-> Result<(), Box<dyn Error>> {
+    let manager = Arc::new(configured_manager_with_bounds(
+        "normal",
+        TestBounds {
+            request_timeout_ms: 100,
+            max_concurrent_requests: 1,
+            ..TestBounds::default()
+        },
+    )?);
+    manager.ensure_started().await?;
+
+    let started = Instant::now();
+    let first = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .request::<JsonValue>("mock/delay", json!({ "delay_ms": 500 }))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .request::<JsonValue>("mock/delay", json!({ "delay_ms": 500 }))
+                .await
+        })
+    };
+
+    assert!(matches!(first.await?, Err(LspError::RequestTimeout { .. })));
+    assert!(matches!(
+        second.await?,
+        Err(LspError::RequestTimeout { .. })
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "concurrency wait extended the request deadline to {:?}",
+        started.elapsed()
+    );
 
     manager.shutdown().await?;
     Ok(())
@@ -903,11 +1043,17 @@ async fn force_kills_an_unresponsive_server_on_shutdown()
         .request("mock/echo", json!({ "message": "started" }))
         .await?;
 
+    let started = Instant::now();
     let outcome = manager.shutdown().await?;
 
     assert!(outcome.started());
     assert!(!outcome.shutdown_response_received());
     assert!(outcome.forced());
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "forced shutdown extended the deadline to {:?}",
+        started.elapsed()
+    );
     Ok(())
 }
 
@@ -925,9 +1071,30 @@ fn configured_manager_with_root(
     request_timeout_ms: u64,
     shutdown_timeout_ms: u64,
 ) -> Result<(LazyLanguageServer, PathBuf), Box<dyn Error>> {
+    configured_manager_with_root_and_bounds(
+        mode,
+        TestBounds {
+            request_timeout_ms,
+            shutdown_timeout_ms,
+            ..TestBounds::default()
+        },
+    )
+}
+
+fn configured_manager_with_bounds(
+    mode: &str,
+    bounds: TestBounds,
+) -> Result<LazyLanguageServer, Box<dyn Error>> {
+    configured_manager_with_root_and_bounds(mode, bounds)
+        .map(|(manager, _root)| manager)
+}
+
+fn configured_manager_with_root_and_bounds(
+    mode: &str,
+    bounds: TestBounds,
+) -> Result<(LazyLanguageServer, PathBuf), Box<dyn Error>> {
     let root = support::unique_dir(mode)?;
-    let config_path =
-        write_config(&root, mode, request_timeout_ms, shutdown_timeout_ms)?;
+    let config_path = write_config_with_bounds(&root, mode, bounds)?;
     let options = CliOptions::new(Some(config_path), Some(root.clone()));
     let startup = StartupState::from_options_in(options, &root)?;
     let config = startup
@@ -942,11 +1109,10 @@ fn configured_manager_with_root(
     ))
 }
 
-fn write_config(
+fn write_config_with_bounds(
     root: &Path,
     mode: &str,
-    request_timeout_ms: u64,
-    shutdown_timeout_ms: u64,
+    bounds: TestBounds,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let server = support::mock_lsp_server()?;
     let config_path = root.join("deixis.toml");
@@ -960,8 +1126,14 @@ args = ["--mode", "{}"]
 file_extensions = {{ ".rs" = "rust" }}
 
 [servers.mock-lsp.timeouts]
+startup_ms = {}
 request_ms = {}
 shutdown_ms = {}
+
+[servers.mock-lsp.limits]
+outbound_queue_capacity = {}
+max_concurrent_requests = {}
+max_response_bytes = {}
 
 [servers.mock-lsp.initialization_options]
 answer = 42
@@ -972,11 +1144,38 @@ two = 2
 "#,
             support::toml_string(&server),
             mode,
-            request_timeout_ms,
-            shutdown_timeout_ms,
+            bounds.startup_timeout_ms,
+            bounds.request_timeout_ms,
+            bounds.shutdown_timeout_ms,
+            bounds.outbound_queue_capacity,
+            bounds.max_concurrent_requests,
+            bounds.max_response_bytes,
         ),
     )?;
     Ok(config_path)
+}
+
+#[derive(Clone, Copy)]
+struct TestBounds {
+    startup_timeout_ms: u64,
+    request_timeout_ms: u64,
+    shutdown_timeout_ms: u64,
+    outbound_queue_capacity: usize,
+    max_concurrent_requests: usize,
+    max_response_bytes: usize,
+}
+
+impl Default for TestBounds {
+    fn default() -> Self {
+        Self {
+            startup_timeout_ms: 1_000,
+            request_timeout_ms: 1_000,
+            shutdown_timeout_ms: 1_000,
+            outbound_queue_capacity: 64,
+            max_concurrent_requests: 16,
+            max_response_bytes: 16 * 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -993,6 +1192,11 @@ struct InitializedResponse {
 #[derive(Debug, Deserialize)]
 struct CancellationResponse {
     cancelled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConcurrencyResponse {
+    max_active_delays: usize,
 }
 
 #[derive(Debug, Deserialize)]

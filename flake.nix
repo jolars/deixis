@@ -157,9 +157,15 @@
 
                 timeouts = lib.mkOption {
                   default = { };
-                  description = "Language-server request and shutdown timeouts.";
+                  description = "Language-server startup, request, and shutdown timeouts.";
                   type = lib.types.submodule {
                     options = {
+                      startupMs = lib.mkOption {
+                        type = lib.types.ints.positive;
+                        default = 30000;
+                        description = "Initialization timeout in milliseconds.";
+                      };
+
                       requestMs = lib.mkOption {
                         type = lib.types.ints.positive;
                         default = 30000;
@@ -170,6 +176,32 @@
                         type = lib.types.ints.positive;
                         default = 5000;
                         description = "Shutdown timeout in milliseconds.";
+                      };
+                    };
+                  };
+                };
+
+                limits = lib.mkOption {
+                  default = { };
+                  description = "Language-server queue, concurrency, and response-size limits.";
+                  type = lib.types.submodule {
+                    options = {
+                      outboundQueueCapacity = lib.mkOption {
+                        type = lib.types.ints.positive;
+                        default = 64;
+                        description = "Maximum queued outbound LSP messages.";
+                      };
+
+                      maxConcurrentRequests = lib.mkOption {
+                        type = lib.types.ints.positive;
+                        default = 16;
+                        description = "Maximum in-flight LSP requests.";
+                      };
+
+                      maxResponseBytes = lib.mkOption {
+                        type = lib.types.ints.positive;
+                        default = 16777216;
+                        description = "Maximum Content-Length accepted from the language server.";
                       };
                     };
                   };
@@ -186,7 +218,13 @@
                 file_extensions = server.fileExtensions;
                 file_patterns = server.filePatterns;
                 initialization_options = server.initializationOptions;
+                limits = {
+                  outbound_queue_capacity = server.limits.outboundQueueCapacity;
+                  max_concurrent_requests = server.limits.maxConcurrentRequests;
+                  max_response_bytes = server.limits.maxResponseBytes;
+                };
                 timeouts = {
+                  startup_ms = server.timeouts.startupMs;
                   request_ms = server.timeouts.requestMs;
                   shutdown_ms = server.timeouts.shutdownMs;
                 };

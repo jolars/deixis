@@ -16,9 +16,9 @@ use serde_json::{Value as JsonValue, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdout},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant, timeout_at},
 };
 use tracing::{debug, info, warn};
 use url::Url;
@@ -1441,9 +1441,19 @@ pub enum LspError {
     TransportClosed {
         server: String,
     },
+    OutboundQueueFull {
+        server: String,
+        capacity: usize,
+    },
     ServerExited {
         server: String,
         method: String,
+    },
+    ResponseTooLarge {
+        server: String,
+        method: String,
+        response_bytes: usize,
+        max_response_bytes: usize,
     },
     RequestCanceled {
         server: String,
@@ -1556,9 +1566,22 @@ impl fmt::Display for LspError {
             Self::TransportClosed { server } => {
                 write!(formatter, "language server `{server}` transport closed")
             }
+            Self::OutboundQueueFull { server, capacity } => write!(
+                formatter,
+                "language server `{server}` outbound queue reached its capacity of {capacity} messages"
+            ),
             Self::ServerExited { server, method } => write!(
                 formatter,
                 "language server `{server}` exited while request `{method}` was pending"
+            ),
+            Self::ResponseTooLarge {
+                server,
+                method,
+                response_bytes,
+                max_response_bytes,
+            } => write!(
+                formatter,
+                "language server `{server}` response to `{method}` was {response_bytes} bytes, exceeding the {max_response_bytes}-byte limit"
             ),
             Self::RequestCanceled { server, method } => {
                 write!(
@@ -1619,7 +1642,9 @@ impl Error for LspError {
             | Self::DocumentLanguageChanged { .. }
             | Self::DocumentVersionOverflow { .. }
             | Self::TransportClosed { .. }
+            | Self::OutboundQueueFull { .. }
             | Self::ServerExited { .. }
+            | Self::ResponseTooLarge { .. }
             | Self::RequestCanceled { .. }
             | Self::RequestTimeout { .. }
             | Self::ResponseError { .. } => None,
@@ -1643,6 +1668,7 @@ impl RunningServer {
         let mut command = config.to_command();
         command
             .current_dir(project.root())
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1667,8 +1693,9 @@ impl RunningServer {
                 pipe: "stderr",
             })?;
 
-        let (sender, receiver) = mpsc::channel(64);
-        let active = ActiveServer::new(config, project, sender);
+        let (sender, receiver) =
+            mpsc::channel(config.limits().outbound_queue_capacity());
+        let active = ActiveServer::new(config, project.root(), sender);
         let writer_task = tokio::spawn(writer_loop(
             config.name().to_owned(),
             stdin,
@@ -1678,6 +1705,7 @@ impl RunningServer {
             config.name().to_owned(),
             stdout,
             active.clone(),
+            config.limits().max_response_bytes(),
         ));
         let stderr_task =
             tokio::spawn(stderr_loop(config.name().to_owned(), stderr));
@@ -1703,21 +1731,34 @@ impl RunningServer {
         config: &LanguageServerConfig,
         project: &Project,
     ) -> Result<(), LspError> {
+        let startup_timeout = config.timeouts().startup();
+        let params = initialize_params(config, project);
+        let deadline = Instant::now() + startup_timeout;
         let initialize_result = self
             .active
-            .request_value(
-                "initialize",
-                initialize_params(config, project),
-                config.timeouts().request(),
-            )
+            .request_value("initialize", params, startup_timeout)
             .await?;
         let snapshot =
             ServerSnapshot::initialized(config.name(), &initialize_result)?;
+        if Instant::now() >= deadline {
+            return Err(LspError::RequestTimeout {
+                server: config.name().to_owned(),
+                method: "initialize".to_owned(),
+                timeout: startup_timeout,
+            });
+        }
         *self.active.status.lock().await = snapshot;
         self.active.readiness.lock().await.mark_initialized();
         self.active
             .send_notification("initialized", json!({}))
             .await?;
+        if Instant::now() >= deadline {
+            return Err(LspError::RequestTimeout {
+                server: config.name().to_owned(),
+                method: "initialize".to_owned(),
+                timeout: startup_timeout,
+            });
+        }
         Ok(())
     }
 
@@ -1725,14 +1766,16 @@ impl RunningServer {
         mut self,
         shutdown_timeout: Duration,
     ) -> Result<ShutdownOutcome, LspError> {
+        let deadline = Instant::now() + shutdown_timeout;
         if let Err(error) = self.active.close_documents().await {
             let _ = self.force_stop(shutdown_timeout).await;
             return Err(error);
         }
 
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let shutdown_response_received = match self
             .active
-            .request_value("shutdown", JsonValue::Null, shutdown_timeout)
+            .request_value("shutdown", JsonValue::Null, remaining)
             .await
         {
             Ok(_) => true,
@@ -1744,10 +1787,10 @@ impl RunningServer {
         };
 
         let _ = self.active.send_notification("exit", JsonValue::Null).await;
-        let (forced, exit_status) = self.wait_or_kill(shutdown_timeout).await?;
+        let (forced, exit_status) = self.wait_or_kill(deadline).await?;
         *self.active.status.lock().await =
             ServerSnapshot::not_started(&self.active.name);
-        self.join_io_tasks(shutdown_timeout).await;
+        self.join_io_tasks(deadline).await;
         Ok(ShutdownOutcome::stopped(
             shutdown_response_received,
             forced,
@@ -1759,16 +1802,45 @@ impl RunningServer {
         &mut self,
         shutdown_timeout: Duration,
     ) -> Result<ShutdownOutcome, LspError> {
-        let (forced, exit_status) = self.wait_or_kill(shutdown_timeout).await?;
-        self.join_io_tasks(shutdown_timeout).await;
-        Ok(ShutdownOutcome::stopped(false, forced, exit_status))
+        let deadline = Instant::now() + shutdown_timeout;
+        let exit_status = match self.child.try_wait().map_err(|source| {
+            LspError::Shutdown {
+                server: self.active.name.clone(),
+                source,
+            }
+        })? {
+            Some(status) => status,
+            None => {
+                self.child.start_kill().map_err(|source| {
+                    LspError::Shutdown {
+                        server: self.active.name.clone(),
+                        source,
+                    }
+                })?;
+                timeout_at(deadline, self.child.wait())
+                    .await
+                    .map_err(|_| LspError::Shutdown {
+                        server: self.active.name.clone(),
+                        source: io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "language server did not exit after forced termination",
+                        ),
+                    })?
+                    .map_err(|source| LspError::Shutdown {
+                        server: self.active.name.clone(),
+                        source,
+                    })?
+            }
+        };
+        self.join_io_tasks(deadline).await;
+        Ok(ShutdownOutcome::stopped(false, true, exit_status))
     }
 
     async fn wait_or_kill(
         &mut self,
-        shutdown_timeout: Duration,
+        deadline: Instant,
     ) -> Result<(bool, ExitStatus), LspError> {
-        match timeout(shutdown_timeout, self.child.wait()).await {
+        match timeout_at(deadline, self.child.wait()).await {
             Ok(result) => {
                 result.map(|status| (false, status)).map_err(|source| {
                     LspError::Shutdown {
@@ -1796,13 +1868,13 @@ impl RunningServer {
         }
     }
 
-    async fn join_io_tasks(&mut self, shutdown_timeout: Duration) {
+    async fn join_io_tasks(&mut self, deadline: Instant) {
         // RunningServer owns a Sender until it is dropped, so the writer may be
         // waiting for receiver EOF even after the child process has exited.
         self.writer_task.abort();
-        let _ = timeout(shutdown_timeout, &mut self.reader_task).await;
-        let _ = timeout(shutdown_timeout, &mut self.stderr_task).await;
-        let _ = timeout(shutdown_timeout, &mut self.writer_task).await;
+        let _ = timeout_at(deadline, &mut self.reader_task).await;
+        let _ = timeout_at(deadline, &mut self.stderr_task).await;
+        let _ = timeout_at(deadline, &mut self.writer_task).await;
     }
 }
 
@@ -1810,7 +1882,9 @@ impl RunningServer {
 struct ActiveServer {
     name: String,
     sender: mpsc::Sender<Vec<u8>>,
-    pending: PendingRequests,
+    outbound_queue_capacity: usize,
+    requests: SharedRequestState,
+    request_permits: Arc<Semaphore>,
     next_request_id: Arc<AtomicU64>,
     project_root: PathBuf,
     configuration: JsonValue,
@@ -1821,27 +1895,32 @@ struct ActiveServer {
     documents: Arc<Mutex<DocumentStore>>,
 }
 
-type PendingRequests = Arc<
-    Mutex<
-        BTreeMap<
-            u64,
-            oneshot::Sender<Result<JsonRpcResponse, PendingRequestError>>,
-        >,
-    >,
->;
+type PendingRequestSender =
+    oneshot::Sender<Result<JsonRpcResponse, PendingRequestError>>;
+type SharedRequestState = Arc<Mutex<RequestState>>;
+
+#[derive(Default)]
+struct RequestState {
+    pending: BTreeMap<u64, PendingRequestSender>,
+    failure: Option<PendingRequestError>,
+}
 
 impl ActiveServer {
     fn new(
         config: &LanguageServerConfig,
-        project: &Project,
+        project_root: &Path,
         sender: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         Self {
             name: config.name().to_owned(),
             sender,
-            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            outbound_queue_capacity: config.limits().outbound_queue_capacity(),
+            requests: Arc::new(Mutex::new(RequestState::default())),
+            request_permits: Arc::new(Semaphore::new(
+                config.limits().max_concurrent_requests(),
+            )),
             next_request_id: Arc::new(AtomicU64::new(1)),
-            project_root: project.root().to_path_buf(),
+            project_root: project_root.to_path_buf(),
             configuration: config.initialization_options().clone(),
             status: Arc::new(Mutex::new(ServerSnapshot::not_started(
                 config.name(),
@@ -2195,9 +2274,33 @@ impl ActiveServer {
         params: JsonValue,
         request_timeout: Duration,
     ) -> Result<JsonValue, LspError> {
+        let deadline = Instant::now() + request_timeout;
+        let _permit =
+            match timeout_at(deadline, self.request_permits.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return Err(LspError::TransportClosed {
+                        server: self.name.clone(),
+                    });
+                }
+                Err(_) => {
+                    return Err(LspError::RequestTimeout {
+                        server: self.name.clone(),
+                        method: method.to_owned(),
+                        timeout: request_timeout,
+                    });
+                }
+            };
+
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id, sender);
+        {
+            let mut requests = self.requests.lock().await;
+            if let Some(failure) = requests.failure {
+                return Err(failure.into_lsp_error(&self.name, method));
+            }
+            requests.pending.insert(id, sender);
+        }
 
         let message = json!({
             "jsonrpc": JSONRPC_VERSION,
@@ -2206,26 +2309,21 @@ impl ActiveServer {
             "params": params,
         });
         if let Err(error) = self.send_message(message).await {
-            self.pending.lock().await.remove(&id);
+            self.requests.lock().await.pending.remove(&id);
             return Err(error);
         }
 
-        match timeout(request_timeout, receiver).await {
+        match timeout_at(deadline, receiver).await {
             Ok(Ok(Ok(response))) => {
                 response.into_result(&self.name, method.to_owned())
             }
-            Ok(Ok(Err(PendingRequestError::ServerExited))) => {
-                Err(LspError::ServerExited {
-                    server: self.name.clone(),
-                    method: method.to_owned(),
-                })
-            }
+            Ok(Ok(Err(error))) => Err(error.into_lsp_error(&self.name, method)),
             Ok(Err(_)) => Err(LspError::RequestCanceled {
                 server: self.name.clone(),
                 method: method.to_owned(),
             }),
             Err(_) => {
-                self.pending.lock().await.remove(&id);
+                self.requests.lock().await.pending.remove(&id);
                 let _ = self
                     .send_notification("$/cancelRequest", json!({ "id": id }))
                     .await;
@@ -2254,12 +2352,20 @@ impl ActiveServer {
     async fn send_message(&self, message: JsonValue) -> Result<(), LspError> {
         let body =
             serde_json::to_vec(&message).map_err(LspError::EncodeMessage)?;
-        self.sender
-            .send(body)
-            .await
-            .map_err(|_| LspError::TransportClosed {
-                server: self.name.clone(),
-            })
+        match self.sender.try_send(body) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(LspError::OutboundQueueFull {
+                    server: self.name.clone(),
+                    capacity: self.outbound_queue_capacity,
+                })
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(LspError::TransportClosed {
+                    server: self.name.clone(),
+                })
+            }
+        }
     }
 }
 
@@ -2323,6 +2429,30 @@ struct JsonRpcResponse {
 #[derive(Debug, Clone, Copy)]
 enum PendingRequestError {
     ServerExited,
+    ResponseTooLarge {
+        response_bytes: usize,
+        max_response_bytes: usize,
+    },
+}
+
+impl PendingRequestError {
+    fn into_lsp_error(self, server: &str, method: &str) -> LspError {
+        match self {
+            Self::ServerExited => LspError::ServerExited {
+                server: server.to_owned(),
+                method: method.to_owned(),
+            },
+            Self::ResponseTooLarge {
+                response_bytes,
+                max_response_bytes,
+            } => LspError::ResponseTooLarge {
+                server: server.to_owned(),
+                method: method.to_owned(),
+                response_bytes,
+                max_response_bytes,
+            },
+        }
+    }
 }
 
 impl JsonRpcResponse {
@@ -2384,15 +2514,16 @@ async fn reader_loop(
     server: String,
     stdout: ChildStdout,
     active: ActiveServer,
+    max_response_bytes: usize,
 ) {
     let mut reader = BufReader::new(stdout);
 
-    loop {
-        match read_lsp_message(&mut reader).await {
+    let failure = loop {
+        match read_lsp_message(&mut reader, max_response_bytes).await {
             Ok(Some(message)) => {
                 handle_incoming_message(&server, &active, message).await
             }
-            Ok(None) => break,
+            Ok(None) => break PendingRequestError::ServerExited,
             Err(ReadError::Json(error)) => {
                 warn!(
                     server = %server,
@@ -2400,20 +2531,39 @@ async fn reader_loop(
                     "language server emitted invalid JSON-RPC body"
                 );
             }
+            Err(ReadError::ResponseTooLarge {
+                response_bytes,
+                max_response_bytes,
+            }) => {
+                warn!(
+                    server = %server,
+                    response_bytes,
+                    max_response_bytes,
+                    "language server response exceeded configured size limit"
+                );
+                break PendingRequestError::ResponseTooLarge {
+                    response_bytes,
+                    max_response_bytes,
+                };
+            }
             Err(error) => {
                 warn!(
                     server = %server,
                     %error,
                     "language server stdout reader stopped"
                 );
-                break;
+                break PendingRequestError::ServerExited;
             }
         }
-    }
+    };
 
-    let pending = std::mem::take(&mut *active.pending.lock().await);
+    let pending = {
+        let mut requests = active.requests.lock().await;
+        requests.failure = Some(failure);
+        std::mem::take(&mut requests.pending)
+    };
     for sender in pending.into_values() {
-        let _ = sender.send(Err(PendingRequestError::ServerExited));
+        let _ = sender.send(Err(failure));
     }
 }
 
@@ -2477,7 +2627,7 @@ async fn handle_incoming_message(
         }
     };
 
-    if let Some(sender) = active.pending.lock().await.remove(&id) {
+    if let Some(sender) = active.requests.lock().await.pending.remove(&id) {
         let _ = sender.send(Ok(response));
     } else {
         debug!(server = %server, request_id = id, "ignoring stale LSP response");
@@ -2907,6 +3057,10 @@ enum ReadError {
     Io(io::Error),
     MissingContentLength,
     InvalidContentLength(String),
+    ResponseTooLarge {
+        response_bytes: usize,
+        max_response_bytes: usize,
+    },
     Json(serde_json::Error),
 }
 
@@ -2920,6 +3074,13 @@ impl fmt::Display for ReadError {
             Self::InvalidContentLength(value) => {
                 write!(formatter, "invalid Content-Length header `{value}`")
             }
+            Self::ResponseTooLarge {
+                response_bytes,
+                max_response_bytes,
+            } => write!(
+                formatter,
+                "response is {response_bytes} bytes, exceeding the {max_response_bytes}-byte limit"
+            ),
             Self::Json(source) => write!(formatter, "{source}"),
         }
     }
@@ -2930,13 +3091,16 @@ impl Error for ReadError {
         match self {
             Self::Io(source) => Some(source),
             Self::Json(source) => Some(source),
-            Self::MissingContentLength | Self::InvalidContentLength(_) => None,
+            Self::MissingContentLength
+            | Self::InvalidContentLength(_)
+            | Self::ResponseTooLarge { .. } => None,
         }
     }
 }
 
 async fn read_lsp_message(
     reader: &mut BufReader<ChildStdout>,
+    max_response_bytes: usize,
 ) -> Result<Option<JsonValue>, ReadError> {
     let mut content_length = None;
     let mut line = String::new();
@@ -2963,6 +3127,12 @@ async fn read_lsp_message(
 
     let content_length =
         content_length.ok_or(ReadError::MissingContentLength)?;
+    if content_length > max_response_bytes {
+        return Err(ReadError::ResponseTooLarge {
+            response_bytes: content_length,
+            max_response_bytes,
+        });
+    }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).await.map_err(ReadError::Io)?;
     serde_json::from_slice(&body)
@@ -2972,11 +3142,51 @@ async fn read_lsp_message(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::path::Path;
+
+    use serde_json::{Value as JsonValue, json};
+    use tokio::sync::mpsc;
+
+    use crate::config::Config;
 
     use super::{
-        Hover, ReadinessSource, ReadinessState, ReadinessTracker, ServerStatus,
+        ActiveServer, Hover, LspError, ReadinessSource, ReadinessState,
+        ReadinessTracker, ServerStatus,
     };
+
+    #[tokio::test]
+    async fn applies_outbound_queue_and_concurrency_limits() {
+        let config = Config::from_toml_str(
+            r#"
+[servers.test]
+command = "test-lsp"
+file_extensions = { ".test" = "test" }
+
+[servers.test.limits]
+outbound_queue_capacity = 1
+max_concurrent_requests = 2
+"#,
+        )
+        .unwrap();
+        let server = config.server("test").unwrap();
+        let (sender, _receiver) =
+            mpsc::channel(server.limits().outbound_queue_capacity());
+        let active = ActiveServer::new(server, Path::new("/project"), sender);
+
+        assert_eq!(active.request_permits.available_permits(), 2);
+        active
+            .send_notification("test/first", JsonValue::Null)
+            .await
+            .unwrap();
+        let error = active
+            .send_notification("test/second", JsonValue::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LspError::OutboundQueueFull { capacity: 1, .. }
+        ));
+    }
 
     #[test]
     fn readiness_prefers_health_failures_over_progress() {

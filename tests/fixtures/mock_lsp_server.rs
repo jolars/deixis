@@ -77,6 +77,9 @@ fn handle_request<R: BufRead>(
         "initialize" => {
             eprintln!("mock-lsp initializing");
             state.lock().unwrap().initialize_params = Some(params.clone());
+            if mode == "initialize-timeout" {
+                thread::sleep(Duration::from_millis(500));
+            }
             let text_document_sync = if mode.starts_with("document-incremental") {
                 json_object([
                     ("openClose", Json::Bool(true)),
@@ -297,13 +300,43 @@ fn handle_request<R: BufRead>(
                 .and_then(Json::as_u64)
                 .unwrap_or(250);
             let output = Arc::clone(output);
+            {
+                let mut state = state.lock().unwrap();
+                state.active_delays += 1;
+                state.max_active_delays =
+                    state.max_active_delays.max(state.active_delays);
+            }
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(delay_ms));
                 let _ = write_message(
                     &output,
                     response(id, json_object([("delayed", Json::Bool(true))])),
                 );
+                state.lock().unwrap().active_delays -= 1;
             });
+        }
+        "mock/concurrency" => {
+            let max_active_delays = state.lock().unwrap().max_active_delays;
+            write_message(
+                output,
+                response(
+                    id,
+                    json_object([(
+                        "max_active_delays",
+                        Json::Number(max_active_delays as i64),
+                    )]),
+                ),
+            )?;
+        }
+        "mock/largeResponse" => {
+            let bytes = params
+                .get("bytes")
+                .and_then(Json::as_u64)
+                .unwrap_or(8192) as usize;
+            write_message(
+                output,
+                response(id, Json::String("x".repeat(bytes))),
+            )?;
         }
         "mock/cancelled" => {
             let cancelled = !state.lock().unwrap().cancellations.is_empty();
@@ -477,6 +510,11 @@ fn handle_request<R: BufRead>(
                 )?;
                 return Ok(());
             }
+            let hover_value = if mode == "hover-large-response" {
+                "x".repeat(8_192)
+            } else {
+                "`answer`: the ultimate value".to_owned()
+            };
 
             write_message(
                 output,
@@ -489,9 +527,7 @@ fn handle_request<R: BufRead>(
                                 ("kind", Json::String("markdown".to_owned())),
                                 (
                                     "value",
-                                    Json::String(
-                                        "`answer`: the ultimate value".to_owned(),
-                                    ),
+                                    Json::String(hover_value),
                                 ),
                             ]),
                         ),
@@ -1662,6 +1698,8 @@ struct MockState {
     document_events: Vec<Json>,
     open_documents: BTreeSet<String>,
     diagnostic_requests: usize,
+    active_delays: usize,
+    max_active_delays: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

@@ -95,7 +95,7 @@ support the corresponding LSP method.
   explicit server override for ambiguous files.
 - [x] Fan out workspace operations concurrently while preserving deterministic
   output order and per-server provenance.
-- [ ] Bound queues, response sizes, concurrency, startup time, request time, and
+- [x] Bound queues, response sizes, concurrency, startup time, request time, and
   shutdown time with documented defaults.
 - [x] Track language-server readiness signals and distinguish transient startup
   empties from stable no-result responses.

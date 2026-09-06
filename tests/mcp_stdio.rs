@@ -866,6 +866,24 @@ async fn hover_failures_have_a_consistent_structured_shape()
         "main.rs",
     );
 
+    let response_too_large = call_hover_error_with_response_limit(
+        "hover-large-response",
+        "main.rs",
+        Some("let 🦀answer = 42;\n"),
+        0,
+        8,
+        1_000,
+        4_096,
+    )
+    .await?;
+    assert_tool_error(
+        &response_too_large,
+        "lsp_protocol_error",
+        Some("mock-lsp"),
+        Some("textDocument/hover"),
+        "main.rs",
+    );
+
     let lsp_error = call_hover_error(
         "hover-error",
         "main.rs",
@@ -1471,14 +1489,36 @@ async fn call_hover_error(
     character: u32,
     request_timeout_ms: u64,
 ) -> Result<CallToolResult, Box<dyn Error>> {
+    call_hover_error_with_response_limit(
+        mode,
+        path,
+        source,
+        line,
+        character,
+        request_timeout_ms,
+        16 * 1024 * 1024,
+    )
+    .await
+}
+
+async fn call_hover_error_with_response_limit(
+    mode: &str,
+    path: &str,
+    source: Option<&str>,
+    line: u32,
+    character: u32,
+    request_timeout_ms: u64,
+    max_response_bytes: usize,
+) -> Result<CallToolResult, Box<dyn Error>> {
     let root = unique_dir(mode)?;
     if let Some(source) = source {
         fs::write(root.join(path), source)?;
     }
-    let config_path = write_mock_config_for_mode_with_timeout(
+    let config_path = write_mock_config_for_mode_with_bounds(
         &root,
         mode,
         request_timeout_ms,
+        max_response_bytes,
     )?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
     command
@@ -1559,8 +1599,27 @@ fn write_mock_config_for_mode_with_timeout(
     mode: &str,
     request_timeout_ms: u64,
 ) -> Result<PathBuf, Box<dyn Error>> {
+    write_mock_config_for_mode_with_bounds(
+        root,
+        mode,
+        request_timeout_ms,
+        16 * 1024 * 1024,
+    )
+}
+
+fn write_mock_config_for_mode_with_bounds(
+    root: &std::path::Path,
+    mode: &str,
+    request_timeout_ms: u64,
+    max_response_bytes: usize,
+) -> Result<PathBuf, Box<dyn Error>> {
     let config_path = root.join("deixis.toml");
-    write_mock_config_to_with_timeout(&config_path, mode, request_timeout_ms)?;
+    write_mock_config_to_with_bounds(
+        &config_path,
+        mode,
+        request_timeout_ms,
+        max_response_bytes,
+    )?;
     Ok(config_path)
 }
 
@@ -1576,6 +1635,20 @@ fn write_mock_config_to_with_timeout(
     mode: &str,
     request_timeout_ms: u64,
 ) -> Result<(), Box<dyn Error>> {
+    write_mock_config_to_with_bounds(
+        config_path,
+        mode,
+        request_timeout_ms,
+        16 * 1024 * 1024,
+    )
+}
+
+fn write_mock_config_to_with_bounds(
+    config_path: &std::path::Path,
+    mode: &str,
+    request_timeout_ms: u64,
+    max_response_bytes: usize,
+) -> Result<(), Box<dyn Error>> {
     let server = support::mock_lsp_server()?;
     fs::write(
         config_path,
@@ -1589,6 +1662,9 @@ file_extensions = {{ ".rs" = "rust" }}
 [servers.mock-lsp.timeouts]
 request_ms = {request_timeout_ms}
 shutdown_ms = 1000
+
+[servers.mock-lsp.limits]
+max_response_bytes = {max_response_bytes}
 "#,
             support::toml_string(&server),
             serde_json::to_string(mode)?,

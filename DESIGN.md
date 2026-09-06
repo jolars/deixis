@@ -133,9 +133,21 @@ checkOnSave = true
 RUST_LOG = "info"
 
 [servers.rust.timeouts]
+startup_ms = 30000
 request_ms = 30000
 shutdown_ms = 5000
+
+[servers.rust.limits]
+outbound_queue_capacity = 64
+max_concurrent_requests = 16
+max_response_bytes = 16777216
 ```
+
+Bounds apply independently to each configured server. Initialization and
+ordinary requests default to 30 seconds, while graceful shutdown defaults to 5
+seconds. Each server admits at most 16 concurrent requests, buffers at most 64
+outbound messages, and accepts an LSP message body no larger than 16 MiB. Every
+value is configurable and must be greater than zero.
 
 Extension and glob values are the LSP language IDs used for document
 synchronization. Within one server, a matching glob takes precedence over an
@@ -266,7 +278,8 @@ Servers start lazily when routing selects them. Startup proceeds as follows:
 1. Spawn the configured command with piped stdin and stdout and inherited or
    piped stderr.
 2. Send `initialize` with the immutable project root, one workspace folder,
-   client identity, client capabilities, and configured initialization options.
+   client identity, client capabilities, and configured initialization options,
+   then wait no longer than the configured startup timeout.
 3. Record server identity, capabilities, text synchronization mode, and position
    encoding when the server reports them.
 4. Send `initialized`, then allow routed requests.
@@ -342,10 +355,14 @@ Tokio owns MCP I/O, child processes, timers, and LSP I/O. Requests to different
 servers may run concurrently. Within one server, outgoing requests are
 correlated by ID, while incoming notifications remain ordered.
 
-Every downstream request has a timeout and a cancellation path. MCP cancellation
+Every downstream request has a timeout and a cancellation path. Its deadline
+includes time spent waiting for a per-server concurrency slot. MCP cancellation
 forwards `$/cancelRequest` when the language server supports the request in
-flight. Dropped MCP connections trigger orderly child shutdown. Bounded channels
-prevent a noisy server from creating unbounded memory growth.
+flight. Dropped MCP connections trigger orderly child shutdown. Bounded
+per-server channels prevent outbound backlogs from creating unbounded memory
+growth; a full queue fails immediately. The LSP reader checks `Content-Length`
+before allocating or parsing a body and stops a transport that exceeds its
+configured response-size limit.
 
 Errors are translated at the MCP boundary with enough context to act on them:
 tool name, server name, method, project-relative path when applicable, and the
@@ -358,7 +375,7 @@ contains a stable `code`, `message`, and `tool`; it includes `server`, `method`,
 and `path` when those values are known. Timeouts add `timeoutMs`. Downstream
 JSON-RPC failures add an `lspError` object containing the server's numeric code,
 message, and optional data. The public codes are `invalid_path`,
-`invalid_position`, `unsupported_capability`, `request_timeout`,
+`invalid_position`, `unsupported_capability`, `request_timeout`, `server_busy`,
 `server_exited`, `lsp_error`, `server_start_failed`, `lsp_protocol_error`,
 `document_error`, `request_canceled`, `server_error`, `routing_error`,
 `no_server_configured`, and `unknown_server`. Malformed tool arguments remain

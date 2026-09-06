@@ -1000,6 +1000,7 @@ impl ToolError {
             | LspError::DocumentLanguageChanged { server, .. }
             | LspError::DocumentVersionOverflow { server, .. }
             | LspError::TransportClosed { server }
+            | LspError::OutboundQueueFull { server, .. }
             | LspError::Shutdown { server, .. } => {
                 result.server = Some(server.clone());
             }
@@ -1008,6 +1009,7 @@ impl ToolError {
                 result.method = Some((*method).to_owned());
             }
             LspError::ServerExited { server, method }
+            | LspError::ResponseTooLarge { server, method, .. }
             | LspError::RequestCanceled { server, method } => {
                 result.server = Some(server.clone());
                 result.method = Some(method.clone());
@@ -1059,13 +1061,15 @@ fn lsp_error_code(error: &LspError) -> &'static str {
         LspError::TransportClosed { .. } | LspError::ServerExited { .. } => {
             "server_exited"
         }
+        LspError::OutboundQueueFull { .. } => "server_busy",
         LspError::ResponseError { .. } => "lsp_error",
         LspError::Spawn { .. } | LspError::MissingPipe { .. } => {
             "server_start_failed"
         }
         LspError::EncodeMessage(_)
         | LspError::DecodeResult(_)
-        | LspError::InvalidDiagnosticReport { .. } => "lsp_protocol_error",
+        | LspError::InvalidDiagnosticReport { .. }
+        | LspError::ResponseTooLarge { .. } => "lsp_protocol_error",
         LspError::ReadDocument { .. }
         | LspError::DocumentSynchronizationClosed { .. }
         | LspError::DocumentLanguageChanged { .. }
@@ -1774,6 +1778,7 @@ fn error_output_schema() -> JsonValue {
                             "invalid_position",
                             "unsupported_capability",
                             "request_timeout",
+                            "server_busy",
                             "server_exited",
                             "lsp_error",
                             "server_start_failed",

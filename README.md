@@ -93,9 +93,31 @@ checkOnSave = true
 RUST_LOG = "info"
 
 [servers.rust.timeouts]
+startup_ms = 30000
 request_ms = 30000
 shutdown_ms = 5000
+
+[servers.rust.limits]
+outbound_queue_capacity = 64
+max_concurrent_requests = 16
+max_response_bytes = 16777216
 ```
+
+Every bound is per language server. The defaults are:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `timeouts.startup_ms` | 30,000 ms | Time allowed for the `initialize` response. |
+| `timeouts.request_ms` | 30,000 ms | Total time for an LSP request, including concurrency-slot wait. |
+| `timeouts.shutdown_ms` | 5,000 ms | Total graceful-shutdown wait before forced termination. |
+| `limits.outbound_queue_capacity` | 64 messages | Buffered messages waiting for child stdin. |
+| `limits.max_concurrent_requests` | 16 requests | In-flight requests, including requests waiting for responses. |
+| `limits.max_response_bytes` | 16 MiB | Largest accepted LSP `Content-Length` body. |
+
+All values must be greater than zero. A full outbound queue fails the operation
+instead of accumulating more memory. A response over the configured limit is a
+protocol error and makes that language-server transport unusable; shutdown then
+terminates the child within its configured bound.
 
 Configured commands are executed directly, never through a shell, and no
 command is inferred from project contents. Each server starts only when a routed
@@ -150,8 +172,9 @@ supplemented with the server, LSP method, project path, timeout, or downstream
 JSON-RPC error when applicable. Invalid arguments remain MCP `invalid_params`
 protocol errors.
 
-Startup sends `initialize` and `initialized`, records reported capabilities,
-correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,
+Startup sends `initialize` and `initialized` within the configured startup
+deadline, records reported capabilities, correlates request IDs, forwards
+timeout cancellation with `$/cancelRequest`,
 handles common server-to-client workspace messages, tracks dynamic registration
 state, tracks work-done progress and rust-analyzer server status, fails pending
 requests when a server exits, logs malformed server output without stopping the
