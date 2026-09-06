@@ -199,6 +199,14 @@ async fn configured_child_diagnostics_stay_on_stderr_with_server_name()
         tool_response["result"]["structuredContent"]["positionEncoding"],
         "utf-8"
     );
+    assert_eq!(
+        tool_response["result"]["structuredContent"]["readiness"],
+        json!({
+            "state": "unknown",
+            "source": "lifecycle",
+            "activeProgress": 0,
+        })
+    );
 
     drop(stdin);
     let remaining_stdout = read_remaining_stdout(stdout).await?;
@@ -483,6 +491,84 @@ async fn diagnostics_marks_missing_and_outdated_push_reports()
         assert_eq!(
             report["diagnostics"].as_array().map(Vec::len),
             Some(diagnostic_count),
+            "{mode}"
+        );
+
+        timeout(Duration::from_secs(10), client.cancel()).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn diagnostics_distinguishes_transient_and_stable_empty_reports()
+-> Result<(), Box<dyn Error>> {
+    for (mode, source) in [
+        ("diagnostics-pull-readiness-progress", "workDoneProgress"),
+        ("diagnostics-pull-readiness-server-status", "serverStatus"),
+    ] {
+        let root = unique_dir(mode)?;
+        fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+        let config_path = write_mock_config_for_mode(&root, mode)?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+        command
+            .arg("--root")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path);
+        let transport = TokioChildProcess::new(command)?;
+        let client =
+            timeout(Duration::from_secs(10), ().serve(transport)).await??;
+        let arguments =
+            json!({ "path": "main.rs" }).as_object().unwrap().clone();
+
+        let transient = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("diagnostics")
+                    .with_arguments(arguments.clone()),
+            ),
+        )
+        .await??;
+        let transient_report = transient
+            .structured_content
+            .as_ref()
+            .expect("diagnostics should be structured");
+        assert!(
+            transient_report["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(transient_report["readiness"]["state"], "busy", "{mode}");
+        assert_eq!(transient_report["readiness"]["source"], source, "{mode}");
+        assert_eq!(transient_report["resultStability"], "transient", "{mode}");
+        assert!(
+            transient.content[0]
+                .as_text()
+                .is_some_and(|content| content.text.contains("still working")),
+            "{mode}"
+        );
+
+        let stable = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("diagnostics")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+        let stable_report = stable
+            .structured_content
+            .as_ref()
+            .expect("diagnostics should be structured");
+        assert!(stable_report["diagnostics"].as_array().unwrap().is_empty());
+        assert_eq!(stable_report["readiness"]["state"], "ready", "{mode}");
+        assert_eq!(stable_report["readiness"]["source"], source, "{mode}");
+        assert_eq!(stable_report["resultStability"], "stable", "{mode}");
+        assert!(
+            stable.content[0]
+                .as_text()
+                .is_some_and(|content| content.text.contains("No diagnostics")),
             "{mode}"
         );
 

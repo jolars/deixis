@@ -9,7 +9,8 @@ use deixis::{
     cli::CliOptions,
     lsp::{
         DefinitionLocation, DiagnosticAvailability, DiagnosticSource,
-        LazyLanguageServer, LspError, ReferenceLocation,
+        LazyLanguageServer, LspError, ReadinessSource, ReadinessState,
+        ReferenceLocation, ResultStability,
     },
     positions::{Position, PositionEncoding, Range},
     project::StartupState,
@@ -141,6 +142,8 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(probe.references_dynamic_registration);
     assert!(probe.diagnostic_dynamic_registration);
     assert!(probe.diagnostic_version_support);
+    assert!(probe.work_done_progress);
+    assert!(probe.server_status_notification);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
     assert!(manager.dynamic_registrations().await.is_empty());
@@ -176,6 +179,65 @@ async fn pulls_and_caches_current_document_diagnostics()
     }
 
     manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tracks_progress_and_server_status_readiness()
+-> Result<(), Box<dyn Error>> {
+    for (mode, source) in [
+        (
+            "diagnostics-pull-readiness-progress",
+            ReadinessSource::WorkDoneProgress,
+        ),
+        (
+            "diagnostics-pull-readiness-server-status",
+            ReadinessSource::ServerStatus,
+        ),
+    ] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+
+        assert_eq!(
+            manager.status().await.readiness().state(),
+            ReadinessState::NotStarted,
+            "{mode}"
+        );
+
+        let first = manager.document_diagnostics("main.rs", "rust").await?;
+        assert!(first.diagnostics().is_empty(), "{mode}");
+        let busy = manager.status().await;
+        assert_eq!(busy.readiness().state(), ReadinessState::Busy, "{mode}");
+        assert_eq!(busy.readiness().source(), source, "{mode}");
+        assert_eq!(
+            busy.readiness().active_progress(),
+            usize::from(source == ReadinessSource::WorkDoneProgress),
+            "{mode}"
+        );
+        if source == ReadinessSource::ServerStatus {
+            assert_eq!(busy.readiness().health(), Some("ok"), "{mode}");
+            assert_eq!(busy.readiness().message(), Some("Indexing"), "{mode}");
+        }
+        assert_eq!(
+            busy.readiness().result_stability(),
+            ResultStability::Transient,
+            "{mode}"
+        );
+
+        let second = manager.document_diagnostics("main.rs", "rust").await?;
+        assert!(second.diagnostics().is_empty(), "{mode}");
+        let ready = manager.status().await;
+        assert_eq!(ready.readiness().state(), ReadinessState::Ready, "{mode}");
+        assert_eq!(ready.readiness().source(), source, "{mode}");
+        assert_eq!(ready.readiness().active_progress(), 0, "{mode}");
+        assert_eq!(
+            ready.readiness().result_stability(),
+            ResultStability::Stable,
+            "{mode}"
+        );
+
+        manager.shutdown().await?;
+    }
     Ok(())
 }
 
@@ -955,6 +1017,8 @@ struct ProbeResponse {
     references_dynamic_registration: bool,
     diagnostic_dynamic_registration: bool,
     diagnostic_version_support: bool,
+    work_done_progress: bool,
+    server_status_notification: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -122,7 +122,17 @@ push diagnostics. Its structured report identifies the configured server,
 source mechanism, synchronized document version, reported push version or pull
 result ID, range encoding, and whether the report is `current`, `stale`, or
 `unavailable`. Current ranges use UTF-8; stale push ranges retain the negotiated
-server encoding. Symbols and other semantic tools remain unshipped.
+server encoding.
+
+Deixis advertises LSP work-done progress support and rust-analyzer's server
+status notification, then reports the observed state through
+`deixis_server_status.readiness`. Empty current diagnostics, null hover results,
+and empty navigation results add the same `readiness` object plus a
+`resultStability` value. `transient` means the server is still working, `stable`
+means all observed work has finished, and `indeterminate` means the server has
+not supplied enough information. Deixis does not treat successful initialization
+alone as proof that semantic results are complete. Symbols and other semantic
+tools remain unshipped.
 
 Tool execution failures return `isError: true`, a concise text message, and a
 structured `error` object. Its stable `code`, `message`, and `tool` fields are
@@ -133,8 +143,9 @@ protocol errors.
 Startup sends `initialize` and `initialized`, records reported capabilities,
 correlates request IDs, forwards timeout cancellation with `$/cancelRequest`,
 handles common server-to-client workspace messages, tracks dynamic registration
-state, fails pending requests when a server exits, logs malformed server output
-without stopping the reader loop, rejects
+state, tracks work-done progress and rust-analyzer server status, fails pending
+requests when a server exits, logs malformed server output without stopping the
+reader loop, rejects
 `workspace/applyEdit` while read-only, and shuts down with `shutdown`, `exit`,
 and a bounded forced-kill fallback.
 

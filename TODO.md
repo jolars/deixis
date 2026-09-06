@@ -97,7 +97,7 @@ support the corresponding LSP method.
   output order and per-server provenance.
 - [ ] Bound queues, response sizes, concurrency, startup time, request time, and
   shutdown time with documented defaults.
-- [ ] Track language-server readiness signals and distinguish transient startup
+- [x] Track language-server readiness signals and distinguish transient startup
   empties from stable no-result responses.
 - [ ] Forward MCP cancellation to LSP.
 - [x] Fail all outstanding requests when a child exits.

@@ -196,6 +196,16 @@ ranges, symbol kinds, hover markup, diagnostic severities, and related
 information remain structured JSON. Each successful result also supplies a small
 textual representation for MCP clients that do not consume structured content.
 
+Deixis advertises `window.workDoneProgress` and the rust-analyzer
+`experimental.serverStatusNotification` extension. It tracks active work-done
+tokens and rust-analyzer's health and quiescence values. The lifecycle probe
+exposes the resulting `readiness` state and its source. When hover, navigation,
+references, or current diagnostics return no semantic result, their structured
+output also includes `readiness` and a derived `resultStability`: `transient`
+while observed work is active, `stable` after observed work has completed, and
+`indeterminate` when the server has emitted no usable readiness signal or
+reports degraded health. Initialization by itself leaves readiness `unknown`.
+
 Public positions use zero-based `line` and `character` fields. Input positions
 and ranges for readable project files use UTF-8 code-unit offsets so the same
 request and result are stable regardless of the selected language server. The
@@ -307,7 +317,9 @@ the newest known report with its server and version provenance.
 
 Stale reports are never silently presented as current. If a server has not yet
 published diagnostics for the synchronized version, the result says so rather
-than returning an unqualified empty list.
+than returning an unqualified empty list. A current but empty report is likewise
+qualified by server readiness, which distinguishes a startup-time empty from a
+stable no-diagnostic result when the server publishes readiness signals.
 
 ## Concurrency and failure handling
 

@@ -18,7 +18,8 @@ use tracing::info;
 use crate::{
     config::{Config, ConfigRouteError},
     lsp::{
-        DiagnosticAvailability, LazyLanguageServer, LspError, ServerSnapshot,
+        DiagnosticAvailability, LazyLanguageServer, LspError,
+        ReadinessSnapshot, ResultStability, ServerSnapshot,
     },
     positions::Position,
     project::{Project, ProjectPathError, StartupState},
@@ -350,10 +351,14 @@ impl DeixisServer {
                     })?;
                 (structured, text)
             }
-            None => (
-                json!({ "contents": null }),
-                "No hover information.".to_owned(),
-            ),
+            None => {
+                let readiness =
+                    language_server.status().await.readiness().clone();
+                let text = empty_result_text("hover information", &readiness);
+                let mut structured = json!({ "contents": null });
+                attach_empty_result_context(&mut structured, &readiness);
+                (structured, text)
+            }
         };
         let mut result = CallToolResult::structured(structured);
         result.content = vec![ContentBlock::text(text)];
@@ -470,8 +475,13 @@ impl DeixisServer {
                 )));
             }
         };
-        let text = if locations.is_empty() {
-            format!("No {}.", spec.plural)
+        let readiness = if locations.is_empty() {
+            Some(language_server.status().await.readiness().clone())
+        } else {
+            None
+        };
+        let text = if let Some(readiness) = &readiness {
+            empty_result_text(spec.plural, readiness)
         } else {
             locations
                 .iter()
@@ -485,7 +495,10 @@ impl DeixisServer {
                 None,
             )
         })?;
-        let structured = json!({ "locations": locations });
+        let mut structured = json!({ "locations": locations });
+        if let Some(readiness) = &readiness {
+            attach_empty_result_context(&mut structured, readiness);
+        }
         let mut result = CallToolResult::structured(structured);
         result.content = vec![ContentBlock::text(text)];
 
@@ -572,8 +585,13 @@ impl DeixisServer {
                 )));
             }
         };
-        let text = if references.is_empty() {
-            "No references.".to_owned()
+        let readiness = if references.is_empty() {
+            Some(language_server.status().await.readiness().clone())
+        } else {
+            None
+        };
+        let text = if let Some(readiness) = &readiness {
+            empty_result_text("references", readiness)
         } else {
             references
                 .iter()
@@ -587,9 +605,13 @@ impl DeixisServer {
                 None,
             )
         })?;
-        let mut result = CallToolResult::structured(json!({
+        let mut structured = json!({
             "locations": locations,
-        }));
+        });
+        if let Some(readiness) = &readiness {
+            attach_empty_result_context(&mut structured, readiness);
+        }
+        let mut result = CallToolResult::structured(structured);
         result.content = vec![ContentBlock::text(text)];
 
         Ok(result.into())
@@ -670,6 +692,14 @@ impl DeixisServer {
             }
         };
         let count = report.diagnostics().len();
+        let readiness = if report.availability()
+            == DiagnosticAvailability::Current
+            && count == 0
+        {
+            Some(language_server.status().await.readiness().clone())
+        } else {
+            None
+        };
         let text = match report.availability() {
             DiagnosticAvailability::Unavailable => {
                 format!("Diagnostics are unavailable for {}.", arguments.path)
@@ -685,9 +715,23 @@ impl DeixisServer {
                 ),
                 report.document_version(),
             ),
-            DiagnosticAvailability::Current if count == 0 => {
-                format!("No diagnostics for {}.", arguments.path)
-            }
+            DiagnosticAvailability::Current if count == 0 => match readiness
+                .as_ref()
+                .map(ReadinessSnapshot::result_stability)
+                .expect("current empty diagnostics should include readiness")
+            {
+                ResultStability::Stable => {
+                    format!("No diagnostics for {}.", arguments.path)
+                }
+                ResultStability::Transient => format!(
+                    "Diagnostics for {} may be incomplete; the language server is still working.",
+                    arguments.path
+                ),
+                ResultStability::Indeterminate => format!(
+                    "The language server returned no diagnostics for {}, but the result's stability is indeterminate.",
+                    arguments.path
+                ),
+            },
             DiagnosticAvailability::Current => format!(
                 "{} diagnostic{} for {}.",
                 count,
@@ -695,12 +739,15 @@ impl DeixisServer {
                 arguments.path,
             ),
         };
-        let structured = serde_json::to_value(report).map_err(|error| {
+        let mut structured = serde_json::to_value(report).map_err(|error| {
             McpError::internal_error(
                 format!("failed to encode diagnostics response: {error}"),
                 None,
             )
         })?;
+        if let Some(readiness) = &readiness {
+            attach_empty_result_context(&mut structured, readiness);
+        }
         let mut result = CallToolResult::structured(structured);
         result.content = vec![ContentBlock::text(text)];
 
@@ -1181,7 +1228,9 @@ fn hover_tool() -> Tool {
                 },
                 "required": ["start", "end"],
                 "additionalProperties": false
-            }
+            },
+            "readiness": readiness_schema(),
+            "resultStability": result_stability_schema()
         },
         "required": ["contents"],
         "additionalProperties": false
@@ -1251,7 +1300,9 @@ fn location_tool(spec: LocationToolSpec) -> Tool {
                     ],
                     "additionalProperties": false
                 }
-            }
+            },
+            "readiness": readiness_schema(),
+            "resultStability": result_stability_schema()
         },
         "required": ["locations"],
         "additionalProperties": false
@@ -1314,7 +1365,9 @@ fn references_tool() -> Tool {
                     "required": ["server", "uri", "range", "positionEncoding"],
                     "additionalProperties": false
                 }
-            }
+            },
+            "readiness": readiness_schema(),
+            "resultStability": result_stability_schema()
         },
         "required": ["locations"],
         "additionalProperties": false
@@ -1379,7 +1432,9 @@ fn diagnostics_tool() -> Tool {
                     "required": ["range"],
                     "additionalProperties": true
                 }
-            }
+            },
+            "readiness": readiness_schema(),
+            "resultStability": result_stability_schema()
         },
         "required": [
             "server",
@@ -1447,7 +1502,8 @@ fn status_output_schema() -> JsonValue {
                 "enum": ["utf-8", "utf-16", "utf-32", null]
             },
             "textDocumentSync": {},
-            "capabilities": { "type": "object" }
+            "capabilities": { "type": ["object", "null"] },
+            "readiness": readiness_schema()
         },
         "required": [
             "configuredName",
@@ -1456,7 +1512,8 @@ fn status_output_schema() -> JsonValue {
             "serverVersion",
             "positionEncoding",
             "textDocumentSync",
-            "capabilities"
+            "capabilities",
+            "readiness"
         ],
         "additionalProperties": false
     })
@@ -1466,6 +1523,36 @@ fn result_output_schema(success: JsonValue) -> Arc<JsonObject> {
     Arc::new(object_schema(json!({
         "oneOf": [success, error_output_schema()]
     })))
+}
+
+fn readiness_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "state": {
+                "enum": [
+                    "notStarted",
+                    "starting",
+                    "busy",
+                    "ready",
+                    "degraded",
+                    "unknown"
+                ]
+            },
+            "source": {
+                "enum": ["lifecycle", "workDoneProgress", "serverStatus"]
+            },
+            "health": { "enum": ["ok", "warning", "error"] },
+            "message": { "type": "string" },
+            "activeProgress": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["state", "source", "activeProgress"],
+        "additionalProperties": false
+    })
+}
+
+fn result_stability_schema() -> JsonValue {
+    json!({ "enum": ["stable", "transient", "indeterminate"] })
 }
 
 fn error_output_schema() -> JsonValue {
@@ -1533,7 +1620,34 @@ fn status_json(status: &ServerSnapshot) -> JsonValue {
             .map(|encoding| encoding.as_str()),
         "textDocumentSync": status.text_document_sync(),
         "capabilities": status.capabilities(),
+        "readiness": status.readiness(),
     })
+}
+
+fn attach_empty_result_context(
+    structured: &mut JsonValue,
+    readiness: &ReadinessSnapshot,
+) {
+    let object = structured
+        .as_object_mut()
+        .expect("successful tool output should be a JSON object");
+    object.insert("readiness".to_owned(), json!(readiness));
+    object.insert(
+        "resultStability".to_owned(),
+        json!(readiness.result_stability()),
+    );
+}
+
+fn empty_result_text(subject: &str, readiness: &ReadinessSnapshot) -> String {
+    match readiness.result_stability() {
+        ResultStability::Stable => format!("No {subject}."),
+        ResultStability::Transient => format!(
+            "No stable {subject} yet; the language server is still working."
+        ),
+        ResultStability::Indeterminate => format!(
+            "The language server returned no {subject}, but the result's stability is indeterminate."
+        ),
+    }
 }
 
 fn object_schema(schema: JsonValue) -> JsonObject {

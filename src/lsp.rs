@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt, io,
     path::{Path, PathBuf},
@@ -36,6 +36,7 @@ use crate::{
 
 const JSONRPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i64 = -32601;
+const INVALID_PARAMS: i64 = -32602;
 
 pub struct LazyLanguageServer {
     config: LanguageServerConfig,
@@ -69,7 +70,7 @@ impl LazyLanguageServer {
 
     pub async fn ensure_started(&self) -> Result<ServerSnapshot, LspError> {
         let active = self.active_server().await?;
-        Ok(active.status.lock().await.clone())
+        Ok(active.snapshot().await)
     }
 
     pub async fn synchronize_document(
@@ -481,7 +482,7 @@ impl LazyLanguageServer {
         };
 
         match active {
-            Some(active) => active.status.lock().await.clone(),
+            Some(active) => active.snapshot().await,
             None => ServerSnapshot::not_started(self.config.name()),
         }
     }
@@ -919,6 +920,7 @@ pub struct ServerSnapshot {
     capabilities: JsonValue,
     text_document_sync: Option<JsonValue>,
     position_encoding: Option<PositionEncoding>,
+    readiness: ReadinessSnapshot,
 }
 
 impl ServerSnapshot {
@@ -931,6 +933,7 @@ impl ServerSnapshot {
             capabilities: JsonValue::Null,
             text_document_sync: None,
             position_encoding: None,
+            readiness: ReadinessSnapshot::not_started(),
         }
     }
 
@@ -976,6 +979,7 @@ impl ServerSnapshot {
             capabilities,
             text_document_sync,
             position_encoding: Some(position_encoding),
+            readiness: ReadinessSnapshot::unknown(),
         })
     }
 
@@ -1005,6 +1009,205 @@ impl ServerSnapshot {
 
     pub fn position_encoding(&self) -> Option<PositionEncoding> {
         self.position_encoding
+    }
+
+    pub fn readiness(&self) -> &ReadinessSnapshot {
+        &self.readiness
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadinessState {
+    NotStarted,
+    Starting,
+    Busy,
+    Ready,
+    Degraded,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadinessSource {
+    Lifecycle,
+    WorkDoneProgress,
+    ServerStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResultStability {
+    Stable,
+    Transient,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessSnapshot {
+    state: ReadinessState,
+    source: ReadinessSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    active_progress: usize,
+}
+
+impl ReadinessSnapshot {
+    fn not_started() -> Self {
+        Self {
+            state: ReadinessState::NotStarted,
+            source: ReadinessSource::Lifecycle,
+            health: None,
+            message: None,
+            active_progress: 0,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            state: ReadinessState::Unknown,
+            source: ReadinessSource::Lifecycle,
+            health: None,
+            message: None,
+            active_progress: 0,
+        }
+    }
+
+    pub fn state(&self) -> ReadinessState {
+        self.state
+    }
+
+    pub fn source(&self) -> ReadinessSource {
+        self.source
+    }
+
+    pub fn health(&self) -> Option<&str> {
+        self.health.as_deref()
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    pub fn active_progress(&self) -> usize {
+        self.active_progress
+    }
+
+    pub fn result_stability(&self) -> ResultStability {
+        match self.state {
+            ReadinessState::Ready => ResultStability::Stable,
+            ReadinessState::Starting | ReadinessState::Busy => {
+                ResultStability::Transient
+            }
+            ReadinessState::NotStarted
+            | ReadinessState::Degraded
+            | ReadinessState::Unknown => ResultStability::Indeterminate,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServerStatus {
+    health: String,
+    quiescent: bool,
+    message: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ReadinessTracker {
+    initialized: bool,
+    progress_seen: bool,
+    active_progress: BTreeSet<String>,
+    server_status: Option<ServerStatus>,
+}
+
+impl ReadinessTracker {
+    fn mark_initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    fn start_progress(&mut self, token: String) {
+        self.progress_seen = true;
+        self.active_progress.insert(token);
+    }
+
+    fn finish_progress(&mut self, token: &str) {
+        self.progress_seen = true;
+        self.active_progress.remove(token);
+    }
+
+    fn record_server_status(&mut self, status: ServerStatus) {
+        self.server_status = Some(status);
+    }
+
+    fn snapshot(&self) -> ReadinessSnapshot {
+        let active_progress = self.active_progress.len();
+        if !self.initialized {
+            return ReadinessSnapshot {
+                state: ReadinessState::Starting,
+                source: ReadinessSource::Lifecycle,
+                health: None,
+                message: None,
+                active_progress,
+            };
+        }
+
+        if let Some(status) = &self.server_status
+            && status.health != "ok"
+        {
+            return ReadinessSnapshot {
+                state: ReadinessState::Degraded,
+                source: ReadinessSource::ServerStatus,
+                health: Some(status.health.clone()),
+                message: status.message.clone(),
+                active_progress,
+            };
+        }
+
+        if active_progress > 0 {
+            return ReadinessSnapshot {
+                state: ReadinessState::Busy,
+                source: ReadinessSource::WorkDoneProgress,
+                health: self
+                    .server_status
+                    .as_ref()
+                    .map(|status| status.health.clone()),
+                message: self
+                    .server_status
+                    .as_ref()
+                    .and_then(|status| status.message.clone()),
+                active_progress,
+            };
+        }
+
+        if let Some(status) = &self.server_status {
+            return ReadinessSnapshot {
+                state: if status.quiescent {
+                    ReadinessState::Ready
+                } else {
+                    ReadinessState::Busy
+                },
+                source: ReadinessSource::ServerStatus,
+                health: Some(status.health.clone()),
+                message: status.message.clone(),
+                active_progress,
+            };
+        }
+
+        if self.progress_seen {
+            return ReadinessSnapshot {
+                state: ReadinessState::Ready,
+                source: ReadinessSource::WorkDoneProgress,
+                health: None,
+                message: None,
+                active_progress,
+            };
+        }
+
+        ReadinessSnapshot::unknown()
     }
 }
 
@@ -1384,6 +1587,7 @@ impl RunningServer {
         let snapshot =
             ServerSnapshot::initialized(config.name(), &initialize_result)?;
         *self.active.status.lock().await = snapshot;
+        self.active.readiness.lock().await.mark_initialized();
         self.active
             .send_notification("initialized", json!({}))
             .await?;
@@ -1484,6 +1688,7 @@ struct ActiveServer {
     project_root: PathBuf,
     configuration: JsonValue,
     status: Arc<Mutex<ServerSnapshot>>,
+    readiness: Arc<Mutex<ReadinessTracker>>,
     diagnostics: Arc<Mutex<DiagnosticCache>>,
     registrations: Arc<Mutex<BTreeMap<String, JsonValue>>>,
     documents: Arc<Mutex<DocumentStore>>,
@@ -1514,10 +1719,17 @@ impl ActiveServer {
             status: Arc::new(Mutex::new(ServerSnapshot::not_started(
                 config.name(),
             ))),
+            readiness: Arc::new(Mutex::new(ReadinessTracker::default())),
             diagnostics: Arc::new(Mutex::new(DiagnosticCache::default())),
             registrations: Arc::new(Mutex::new(BTreeMap::new())),
             documents: Arc::new(Mutex::new(DocumentStore::default())),
         }
+    }
+
+    async fn snapshot(&self) -> ServerSnapshot {
+        let mut snapshot = self.status.lock().await.clone();
+        snapshot.readiness = self.readiness.lock().await.snapshot();
+        snapshot
     }
 
     async fn supports_method(
@@ -2167,6 +2379,23 @@ async fn handle_server_request(
                 ))
                 .await;
         }
+        "window/workDoneProgress/create" => {
+            let Some(token) = params.get("token").and_then(progress_token)
+            else {
+                let _ = active
+                    .send_message(error_response(
+                        id,
+                        INVALID_PARAMS,
+                        "work-done progress request omitted a valid token",
+                    ))
+                    .await;
+                return;
+            };
+            active.readiness.lock().await.start_progress(token);
+            let _ = active
+                .send_message(success_response(id, JsonValue::Null))
+                .await;
+        }
         "client/registerCapability" => {
             let mut registrations = active.registrations.lock().await;
             for registration in capability_items(&params, "registrations") {
@@ -2242,12 +2471,95 @@ async fn handle_server_notification(
         "window/logMessage" | "window/showMessage" | "window/logTrace" => {
             trace_server_message(server, method, &params);
         }
-        "$/progress" | "telemetry/event" => {
+        "$/progress" => {
+            record_progress(server, active, &params).await;
+        }
+        "experimental/serverStatus" => {
+            match serde_json::from_value::<ServerStatusParams>(params) {
+                Ok(params)
+                    if matches!(
+                        params.health.as_str(),
+                        "ok" | "warning" | "error"
+                    ) =>
+                {
+                    active.readiness.lock().await.record_server_status(
+                        ServerStatus {
+                            health: params.health,
+                            quiescent: params.quiescent,
+                            message: params.message,
+                        },
+                    );
+                }
+                Ok(params) => {
+                    warn!(
+                        server = %server,
+                        health = %params.health,
+                        "ignored server-status notification with unknown health"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        server = %server,
+                        %error,
+                        "ignored malformed server-status notification"
+                    );
+                }
+            }
+        }
+        "telemetry/event" => {
             debug!(server = %server, method, "ignored language server notification");
         }
         _ => {
             debug!(server = %server, method, "ignored language server notification");
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerStatusParams {
+    health: String,
+    quiescent: bool,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+async fn record_progress(
+    server: &str,
+    active: &ActiveServer,
+    params: &JsonValue,
+) {
+    let Some(token) = params.get("token").and_then(progress_token) else {
+        warn!(server = %server, "ignored progress notification without a valid token");
+        return;
+    };
+    let Some(kind) = params
+        .get("value")
+        .and_then(|value| value.get("kind"))
+        .and_then(JsonValue::as_str)
+    else {
+        warn!(server = %server, "ignored progress notification without a kind");
+        return;
+    };
+
+    let mut readiness = active.readiness.lock().await;
+    match kind {
+        "begin" | "report" => readiness.start_progress(token),
+        "end" => readiness.finish_progress(&token),
+        _ => warn!(
+            server = %server,
+            kind,
+            "ignored progress notification with an unknown kind"
+        ),
+    }
+}
+
+fn progress_token(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(value) => Some(format!("string:{value}")),
+        JsonValue::Number(value) if value.is_i64() || value.is_u64() => {
+            Some(format!("number:{value}"))
+        }
+        _ => None,
     }
 }
 
@@ -2354,6 +2666,12 @@ fn initialize_params(
             "name": workspace_name,
         }],
         "capabilities": {
+            "window": {
+                "workDoneProgress": true,
+            },
+            "experimental": {
+                "serverStatusNotification": true,
+            },
             "general": {
                 "positionEncodings": ["utf-8", "utf-16", "utf-32"],
             },
@@ -2518,7 +2836,29 @@ async fn read_lsp_message(
 mod tests {
     use serde_json::json;
 
-    use super::Hover;
+    use super::{
+        Hover, ReadinessSource, ReadinessState, ReadinessTracker, ServerStatus,
+    };
+
+    #[test]
+    fn readiness_prefers_health_failures_over_progress() {
+        let mut readiness = ReadinessTracker::default();
+        readiness.mark_initialized();
+        readiness.start_progress("string:index".to_owned());
+        readiness.record_server_status(ServerStatus {
+            health: "warning".to_owned(),
+            quiescent: false,
+            message: Some("workspace load failed".to_owned()),
+        });
+
+        let snapshot = readiness.snapshot();
+
+        assert_eq!(snapshot.state(), ReadinessState::Degraded);
+        assert_eq!(snapshot.source(), ReadinessSource::ServerStatus);
+        assert_eq!(snapshot.health(), Some("warning"));
+        assert_eq!(snapshot.message(), Some("workspace load failed"));
+        assert_eq!(snapshot.active_progress(), 1);
+    }
 
     #[test]
     fn preserves_structured_hover_markup_and_renders_its_text() {

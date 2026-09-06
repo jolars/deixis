@@ -38,10 +38,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else {
                 handle_notification(
                     &mode,
+                    &output,
                     &state,
                     method,
                     message.get("params").cloned().unwrap_or(Json::Null),
-                );
+                )?;
                 if method == "exit" && mode != "ignore-shutdown" {
                     return Ok(());
                 }
@@ -357,7 +358,8 @@ fn handle_request<R: BufRead>(
                 )?;
                 return Ok(());
             }
-            let result = if state.diagnostic_requests == 0 {
+            let first_request = state.diagnostic_requests == 0;
+            let result = if first_request {
                 if previous_result_id.is_some() {
                     drop(state);
                     write_message(
@@ -371,13 +373,15 @@ fn handle_request<R: BufRead>(
                     )?;
                     return Ok(());
                 }
+                let items = if mode.contains("readiness-") {
+                    Vec::new()
+                } else {
+                    vec![mock_diagnostic(6, 12)]
+                };
                 json_object([
                     ("kind", Json::String("full".to_owned())),
                     ("resultId", Json::String("pull-1".to_owned())),
-                    (
-                        "items",
-                        Json::Array(vec![mock_diagnostic(6, 12)]),
-                    ),
+                    ("items", Json::Array(items)),
                 ])
             } else {
                 if previous_result_id != Some("pull-1") {
@@ -400,6 +404,9 @@ fn handle_request<R: BufRead>(
             };
             state.diagnostic_requests += 1;
             drop(state);
+            if !first_request {
+                send_readiness_finished(mode, output)?;
+            }
             write_message(output, response(id, result))?;
         }
         "textDocument/hover" => {
@@ -761,13 +768,15 @@ fn handle_request<R: BufRead>(
 
 fn handle_notification(
     mode: &str,
+    output: &Arc<Mutex<io::Stdout>>,
     state: &Arc<Mutex<MockState>>,
     method: &str,
     params: Json,
-) {
+) -> Result<(), Box<dyn Error>> {
     match method {
         "initialized" => {
             state.lock().unwrap().initialized = true;
+            send_readiness_started(mode, output)?;
         }
         "$/cancelRequest" => {
             if let Some(id) = params.get("id").cloned() {
@@ -808,6 +817,91 @@ fn handle_notification(
         },
         _ => {}
     }
+
+    Ok(())
+}
+
+fn send_readiness_started(
+    mode: &str,
+    output: &Arc<Mutex<io::Stdout>>,
+) -> Result<(), Box<dyn Error>> {
+    if mode.ends_with("readiness-progress") {
+        write_message(
+            output,
+            request(
+                30,
+                "window/workDoneProgress/create",
+                json_object([(
+                    "token",
+                    Json::String("mock-index".to_owned()),
+                )]),
+            ),
+        )?;
+        write_message(
+            output,
+            notification(
+                "$/progress",
+                json_object([
+                    ("token", Json::String("mock-index".to_owned())),
+                    (
+                        "value",
+                        json_object([
+                            ("kind", Json::String("begin".to_owned())),
+                            ("title", Json::String("Indexing".to_owned())),
+                        ]),
+                    ),
+                ]),
+            ),
+        )?;
+    } else if mode.ends_with("readiness-server-status") {
+        write_message(
+            output,
+            notification(
+                "experimental/serverStatus",
+                json_object([
+                    ("health", Json::String("ok".to_owned())),
+                    ("quiescent", Json::Bool(false)),
+                    ("message", Json::String("Indexing".to_owned())),
+                ]),
+            ),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn send_readiness_finished(
+    mode: &str,
+    output: &Arc<Mutex<io::Stdout>>,
+) -> Result<(), Box<dyn Error>> {
+    if mode.ends_with("readiness-progress") {
+        write_message(
+            output,
+            notification(
+                "$/progress",
+                json_object([
+                    ("token", Json::String("mock-index".to_owned())),
+                    (
+                        "value",
+                        json_object([("kind", Json::String("end".to_owned()))]),
+                    ),
+                ]),
+            ),
+        )?;
+    } else if mode.ends_with("readiness-server-status") {
+        write_message(
+            output,
+            notification(
+                "experimental/serverStatus",
+                json_object([
+                    ("health", Json::String("ok".to_owned())),
+                    ("quiescent", Json::Bool(true)),
+                ]),
+            ),
+        )?;
+    }
+
+    Ok(())
 }
 
 fn probe_client<R: BufRead>(
@@ -965,6 +1059,8 @@ fn probe_client<R: BufRead>(
         references_dynamic_registration,
         diagnostic_dynamic_registration,
         diagnostic_version_support,
+        work_done_progress,
+        server_status_notification,
     ) = {
         let mut state = state.lock().unwrap();
         state.client_probe_complete = true;
@@ -1058,6 +1154,18 @@ fn probe_client<R: BufRead>(
             .and_then(|diagnostics| diagnostics.get("versionSupport"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let work_done_progress = capabilities
+            .get("window")
+            .and_then(|window| window.get("workDoneProgress"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let server_status_notification = capabilities
+            .get("experimental")
+            .and_then(|experimental| {
+                experimental.get("serverStatusNotification")
+            })
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         (
             position_encodings,
             dynamic_registration,
@@ -1073,6 +1181,8 @@ fn probe_client<R: BufRead>(
             references_dynamic_registration,
             diagnostic_dynamic_registration,
             diagnostic_version_support,
+            work_done_progress,
+            server_status_notification,
         )
     };
     Ok(json_object([
@@ -1202,6 +1312,11 @@ fn probe_client<R: BufRead>(
         (
             "diagnostic_version_support",
             Json::Bool(diagnostic_version_support),
+        ),
+        ("work_done_progress", Json::Bool(work_done_progress)),
+        (
+            "server_status_notification",
+            Json::Bool(server_status_notification),
         ),
     ]))
 }
