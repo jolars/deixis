@@ -12,8 +12,8 @@ memory, indexing, or agent framework around them.
 > [!NOTE]
 > The project is under active development. The binary manages explicitly
 > configured language servers for one project and exposes capability-gated
-> hover, definition, declaration, type-definition, and implementation
-> information through path-based routing.
+> hover, definition, declaration, type-definition, implementation, and
+> reference information through path-based routing.
 
 ## Direction
 
@@ -102,9 +102,9 @@ LSP operation needs it. A file pattern takes precedence over an extension within
 one server; the longest matching extension wins. A path that matches several
 servers is rejected unless the caller supplies the optional `server` override.
 
-Configured sessions advertise six read-only tools: `deixis_server_status`,
-`hover`, `definition`, `declaration`, `type_definition`, and `implementation`.
-Calling the lifecycle probe with
+Configured sessions advertise seven read-only tools: `deixis_server_status`,
+`hover`, `definition`, `declaration`, `type_definition`, `implementation`, and
+`references`. Calling the lifecycle probe with
 `{ "server": "rust", "start": true }` starts that server and returns its
 recorded status. Without `server`, it selects the first configured name in
 stable lexical order. The `hover` tool accepts a project-contained `path`, a
@@ -113,8 +113,10 @@ language identifier, synchronizes the document, checks the negotiated hover
 capability, and returns structured LSP markup with a concise text fallback.
 The four location tools accept the same arguments and normalize `Location` and
 `LocationLink` responses into one location shape with the configured source
-server, target URI, ranges, and target position encoding. References, symbols,
-diagnostics, and other semantic tools remain unshipped.
+server, target URI, ranges, and target position encoding. The `references` tool
+also requires an explicit `includeDeclaration` boolean and returns each
+`Location` with the configured source server, URI, range, and position encoding.
+Symbols, diagnostics, and other semantic tools remain unshipped.
 
 Tool execution failures return `isError: true`, a concise text message, and a
 structured `error` object. Its stable `code`, `message`, and `tool` fields are

@@ -28,6 +28,7 @@ const DECLARATION_TOOL: &str = "declaration";
 const DEFINITION_TOOL: &str = "definition";
 const TYPE_DEFINITION_TOOL: &str = "type_definition";
 const IMPLEMENTATION_TOOL: &str = "implementation";
+const REFERENCES_TOOL: &str = "references";
 
 #[derive(Clone, Copy)]
 enum LocationOperation {
@@ -158,6 +159,7 @@ impl ServerHandler for DeixisServer {
                 location_tool(DEFINITION_SPEC),
                 location_tool(TYPE_DEFINITION_SPEC),
                 location_tool(IMPLEMENTATION_SPEC),
+                references_tool(),
             ]
         };
         Ok(ListToolsResult::with_all_items(tools))
@@ -183,6 +185,7 @@ impl ServerHandler for DeixisServer {
             IMPLEMENTATION_TOOL => {
                 self.call_location(request, IMPLEMENTATION_SPEC).await
             }
+            REFERENCES_TOOL => self.call_references(request).await,
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -483,6 +486,109 @@ impl DeixisServer {
 
         Ok(result.into())
     }
+
+    async fn call_references(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, McpError> {
+        const METHOD: &str = "textDocument/references";
+
+        let arguments = request.arguments.unwrap_or_default();
+        let arguments = serde_json::from_value::<ReferencesArguments>(
+            JsonValue::Object(arguments),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid references arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate()?;
+        let Some(config) = self.config() else {
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    REFERENCES_TOOL,
+                    "no language server is configured",
+                )
+                .with_method(METHOD)
+                .with_path(&arguments.path),
+            ));
+        };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_path(
+                    REFERENCES_TOOL,
+                    METHOD,
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_route(
+                        REFERENCES_TOOL,
+                        METHOD,
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
+
+        let references = match language_server
+            .references(
+                file.absolute(),
+                route.language_id(),
+                arguments.position,
+                arguments.include_declaration,
+            )
+            .await
+        {
+            Ok(references) => references,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: REFERENCES_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some(METHOD),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
+            }
+        };
+        let text = if references.is_empty() {
+            "No references.".to_owned()
+        } else {
+            references
+                .iter()
+                .map(|reference| reference.text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let locations = serde_json::to_value(references).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode references response: {error}"),
+                None,
+            )
+        })?;
+        let mut result = CallToolResult::structured(json!({
+            "locations": locations,
+        }));
+        result.content = vec![ContentBlock::text(text)];
+
+        Ok(result.into())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -707,6 +813,38 @@ struct LocationArguments {
     #[serde(default)]
     server: Option<String>,
     position: Position,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReferencesArguments {
+    path: String,
+    #[serde(default)]
+    server: Option<String>,
+    position: Position,
+    include_declaration: bool,
+}
+
+impl ReferencesArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        if self.path.is_empty() {
+            return Err(McpError::invalid_params(
+                "invalid references arguments: `path` must not be empty",
+                None,
+            ));
+        }
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "invalid references arguments: `server` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl LocationArguments {
@@ -963,6 +1101,69 @@ fn location_tool(spec: LocationToolSpec) -> Tool {
                         "targetSelectionRange",
                         "targetPositionEncoding"
                     ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["locations"],
+        "additionalProperties": false
+    })))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    )
+}
+
+fn references_tool() -> Tool {
+    Tool::new(
+        REFERENCES_TOOL,
+        "Return references for a UTF-8 position in a project file.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative or root-contained absolute file path."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
+                },
+                "position": position_schema(),
+                "includeDeclaration": {
+                    "type": "boolean",
+                    "description": "Whether the declaration itself is included among the references."
+                }
+            },
+            "required": ["path", "position", "includeDeclaration"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(result_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "locations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "Configured name of the language server that returned this location."
+                        },
+                        "uri": { "type": "string" },
+                        "range": range_schema(),
+                        "positionEncoding": {
+                            "enum": ["utf-8", "utf-16", "utf-32"],
+                            "description": "Encoding used by character offsets in the range. UTF-8 is used whenever the target is a readable project file."
+                        }
+                    },
+                    "required": ["server", "uri", "range", "positionEncoding"],
                     "additionalProperties": false
                 }
             }

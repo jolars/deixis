@@ -73,7 +73,7 @@ matrix.
 ## 3. Read-only semantic coverage
 
 - [x] Add `declaration`, `type_definition`, and `implementation`.
-- [ ] Add references with explicit declaration inclusion.
+- [x] Add references with explicit declaration inclusion.
 - [ ] Add hierarchical document symbols and normalize flat-symbol responses.
 - [ ] Add workspace symbols, fan out across capable servers, and merge in stable
   configuration order.

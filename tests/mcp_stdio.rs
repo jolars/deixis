@@ -836,6 +836,159 @@ async fn new_location_tools_report_their_unsupported_capabilities()
 }
 
 #[tokio::test]
+async fn exposes_references_with_explicit_declaration_inclusion()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("references-locations-utf-16")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "references-locations-utf-16")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+    let references_tool = tools
+        .tools
+        .iter()
+        .find(|candidate| candidate.name == "references")
+        .expect("configured servers should expose references");
+    assert_eq!(
+        references_tool.input_schema.get("required"),
+        Some(&json!(["path", "position", "includeDeclaration"]))
+    );
+    assert_eq!(
+        references_tool
+            .input_schema
+            .get("properties")
+            .and_then(JsonValue::as_object)
+            .and_then(|properties| properties.get("includeDeclaration"))
+            .and_then(|include_declaration| include_declaration.get("type")),
+        Some(&json!("boolean"))
+    );
+    assert!(references_tool.output_schema.is_some());
+    assert_eq!(
+        references_tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+
+    for (include_declaration, expected_len) in [(false, 1), (true, 2)] {
+        let arguments = json!({
+            "path": "main.rs",
+            "position": { "line": 0, "character": 8 },
+            "includeDeclaration": include_declaration,
+        })
+        .as_object()
+        .expect("references arguments should be an object")
+        .clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("references")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+
+        assert_eq!(result.is_error, Some(false));
+        let locations = result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("locations"))
+            .and_then(JsonValue::as_array)
+            .expect("references should return locations");
+        assert_eq!(locations.len(), expected_len);
+        assert_eq!(
+            locations.last().expect("a reference")["server"],
+            "mock-lsp"
+        );
+        assert_eq!(
+            locations.last().expect("a reference")["range"],
+            json!({
+                "start": { "line": 0, "character": 8 },
+                "end": { "line": 0, "character": 14 },
+            })
+        );
+        assert_eq!(
+            locations.last().expect("a reference")["positionEncoding"],
+            "utf-8"
+        );
+    }
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn references_reports_an_unsupported_capability()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("references-unsupported")?;
+    fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "references-unsupported")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 4 },
+        "includeDeclaration": true,
+    })
+    .as_object()
+    .expect("references arguments should be an object")
+    .clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("references").with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/error/code")),
+        Some(&json!("unsupported_capability"))
+    );
+    assert_eq!(
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/error/method")),
+        Some(&json!("textDocument/references"))
+    );
+    assert_eq!(
+        result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.pointer("/error/tool")),
+        Some(&json!("references"))
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn routes_hover_to_the_server_selected_by_the_file_extension()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("multi-server-routing")?;

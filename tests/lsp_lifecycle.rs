@@ -7,7 +7,9 @@ use std::{
 
 use deixis::{
     cli::CliOptions,
-    lsp::{DefinitionLocation, LazyLanguageServer, LspError},
+    lsp::{
+        DefinitionLocation, LazyLanguageServer, LspError, ReferenceLocation,
+    },
     positions::{Position, PositionEncoding, Range},
     project::StartupState,
 };
@@ -135,6 +137,7 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(probe.type_definition_link_support);
     assert!(probe.implementation_dynamic_registration);
     assert!(probe.implementation_link_support);
+    assert!(probe.references_dynamic_registration);
 
     assert_eq!(manager.diagnostics().await.len(), 1);
     assert!(manager.dynamic_registrations().await.is_empty());
@@ -592,6 +595,82 @@ async fn rejects_new_location_operations_before_synchronizing_when_unsupported()
 }
 
 #[tokio::test]
+async fn normalizes_references_and_forwards_declaration_inclusion()
+-> Result<(), Box<dyn Error>> {
+    for mode in ["references-locations-utf-16", "references-options"] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+        for (include_declaration, expected_len) in [(false, 1), (true, 2)] {
+            let references = manager
+                .references(
+                    "main.rs",
+                    "rust",
+                    Position::new(0, 8),
+                    include_declaration,
+                )
+                .await?;
+
+            assert_eq!(references.len(), expected_len, "{mode}");
+            assert_eq!(
+                references.last(),
+                Some(&ReferenceLocation {
+                    server: "mock-lsp".to_owned(),
+                    uri: references.last().expect("a reference").uri.clone(),
+                    range: Range::new(
+                        Position::new(0, 8),
+                        Position::new(0, 14),
+                    ),
+                    position_encoding: PositionEncoding::Utf8,
+                }),
+                "{mode}"
+            );
+            assert!(
+                references
+                    .last()
+                    .expect("a reference")
+                    .uri
+                    .ends_with("/main.rs"),
+                "{mode}"
+            );
+            if include_declaration {
+                assert_eq!(
+                    references[0].range,
+                    Range::new(Position::new(0, 0), Position::new(0, 3)),
+                    "{mode}"
+                );
+            }
+        }
+
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_references_before_synchronizing_when_unsupported()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("references-unsupported", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let error = manager
+        .references("main.rs", "rust", Position::new(0, 8), true)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::UnsupportedCapability { .. }));
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert!(probe.events.is_empty());
+    assert_eq!(probe.open_documents, 0);
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn continues_after_malformed_server_output() -> Result<(), Box<dyn Error>>
 {
     let manager = configured_manager("malformed", 1_000, 1_000)?;
@@ -757,6 +836,7 @@ struct ProbeResponse {
     type_definition_link_support: bool,
     implementation_dynamic_registration: bool,
     implementation_link_support: bool,
+    references_dynamic_registration: bool,
 }
 
 #[derive(Debug, Deserialize)]

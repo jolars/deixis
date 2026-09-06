@@ -100,6 +100,7 @@ fn handle_request<R: BufRead>(
                 | "definition-locations-utf-16"
                 | "definition-project-target-utf-16"
                 | "definition-external-utf-16"
+                | "references-locations-utf-16"
                 | "type-definition-locations-utf-16" => {
                     Some(Json::String("utf-16".to_owned()))
                 }
@@ -150,6 +151,14 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let references_provider = match mode {
+                "references-unsupported" => Json::Bool(false),
+                "references-options" => json_object([(
+                    "workDoneProgress",
+                    Json::Bool(true),
+                )]),
+                _ => Json::Bool(true),
+            };
             let mut capabilities = vec![
                 ("declarationProvider".to_owned(), declaration_provider),
                 ("definitionProvider".to_owned(), definition_provider),
@@ -158,6 +167,7 @@ fn handle_request<R: BufRead>(
                     "implementationProvider".to_owned(),
                     implementation_provider,
                 ),
+                ("referencesProvider".to_owned(), references_provider),
                 ("textDocumentSync".to_owned(), text_document_sync),
                 (
                     "typeDefinitionProvider".to_owned(),
@@ -373,6 +383,111 @@ fn handle_request<R: BufRead>(
                     ]),
                 ),
             )?;
+        }
+        "textDocument/references" => {
+            if mode == "references-unsupported" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "references request bypassed capability gate".to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let expected_character = if mode.ends_with("utf-16") {
+                6
+            } else if mode.ends_with("utf-32") {
+                5
+            } else {
+                8
+            };
+            let position = params.get("position");
+            let line = position
+                .and_then(|position| position.get("line"))
+                .and_then(Json::as_i64);
+            let character = position
+                .and_then(|position| position.get("character"))
+                .and_then(Json::as_i64);
+            let include_declaration = params
+                .get("context")
+                .and_then(|context| context.get("includeDeclaration"))
+                .and_then(Json::as_bool);
+            if line != Some(0)
+                || character != Some(expected_character)
+                || include_declaration.is_none()
+            {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32602,
+                        format!(
+                            "expected references position 0:{expected_character} and explicit declaration context, got {line:?}:{character:?} and {include_declaration:?}"
+                        ),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let source_uri = params
+                .get("textDocument")
+                .and_then(|document| document.get("uri"))
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            let mut locations = Vec::new();
+            if include_declaration == Some(true) {
+                locations.push(json_object([
+                    ("uri", Json::String(source_uri.to_owned())),
+                    (
+                        "range",
+                        json_object([
+                            (
+                                "start",
+                                json_object([
+                                    ("line", Json::Number(0)),
+                                    ("character", Json::Number(0)),
+                                ]),
+                            ),
+                            (
+                                "end",
+                                json_object([
+                                    ("line", Json::Number(0)),
+                                    ("character", Json::Number(3)),
+                                ]),
+                            ),
+                        ]),
+                    ),
+                ]));
+            }
+            locations.push(json_object([
+                ("uri", Json::String(source_uri.to_owned())),
+                (
+                    "range",
+                    json_object([
+                        (
+                            "start",
+                            json_object([
+                                ("line", Json::Number(0)),
+                                ("character", Json::Number(expected_character)),
+                            ]),
+                        ),
+                        (
+                            "end",
+                            json_object([
+                                ("line", Json::Number(0)),
+                                (
+                                    "character",
+                                    Json::Number(expected_character + 6),
+                                ),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]));
+            write_message(output, response(id, Json::Array(locations)))?;
         }
         "textDocument/declaration"
         | "textDocument/definition"
@@ -723,6 +838,7 @@ fn probe_client<R: BufRead>(
         type_definition_link_support,
         implementation_dynamic_registration,
         implementation_link_support,
+        references_dynamic_registration,
     ) = {
         let mut state = state.lock().unwrap();
         state.client_probe_complete = true;
@@ -796,6 +912,12 @@ fn probe_client<R: BufRead>(
             .and_then(|implementation| implementation.get("linkSupport"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let references_dynamic_registration = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("references"))
+            .and_then(|references| references.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
         (
             position_encodings,
             dynamic_registration,
@@ -808,6 +930,7 @@ fn probe_client<R: BufRead>(
             type_definition_link_support,
             implementation_dynamic_registration,
             implementation_link_support,
+            references_dynamic_registration,
         )
     };
     Ok(json_object([
@@ -925,6 +1048,10 @@ fn probe_client<R: BufRead>(
         (
             "implementation_link_support",
             Json::Bool(implementation_link_support),
+        ),
+        (
+            "references_dynamic_registration",
+            Json::Bool(references_dynamic_registration),
         ),
     ]))
 }

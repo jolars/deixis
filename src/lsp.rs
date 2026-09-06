@@ -212,6 +212,79 @@ impl LazyLanguageServer {
         .await
     }
 
+    pub async fn references(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        include_declaration: bool,
+    ) -> Result<Vec<ReferenceLocation>, LspError> {
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server().await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_method(
+                "textDocument/references",
+                snapshot.capabilities().get("referencesProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: "textDocument/references",
+            });
+        }
+
+        let document = active.synchronize_document(file, language_id).await?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+        let lsp_position = document
+            .to_lsp_position(position, encoding)
+            .map_err(|source| LspError::PositionConversion {
+                server: self.config.name().to_owned(),
+                path: document.absolute_path().to_path_buf(),
+                source,
+            })?;
+        let value = active
+            .request_value(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": document.uri() },
+                    "position": lsp_position,
+                    "context": {
+                        "includeDeclaration": include_declaration,
+                    },
+                }),
+                self.config.timeouts().request(),
+            )
+            .await?;
+        let response: Option<Vec<Location>> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+
+        let mut references = Vec::new();
+        for location in response.into_iter().flatten() {
+            let target = self
+                .normalize_location_target(
+                    &document,
+                    &location.uri,
+                    location.range,
+                    location.range,
+                    encoding,
+                )
+                .await?;
+            references.push(ReferenceLocation {
+                server: self.config.name().to_owned(),
+                uri: location.uri,
+                range: target.range,
+                position_encoding: target.position_encoding,
+            });
+        }
+
+        Ok(references)
+    }
+
     async fn location_request(
         &self,
         path: impl AsRef<Path>,
@@ -464,6 +537,30 @@ impl DefinitionLocation {
             range.end.line,
             range.end.character,
             self.target_position_encoding,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceLocation {
+    pub server: String,
+    pub uri: String,
+    pub range: Range,
+    pub position_encoding: PositionEncoding,
+}
+
+impl ReferenceLocation {
+    pub fn text(&self) -> String {
+        format!(
+            "{}: {}:{}:{}-{}:{} ({})",
+            self.server,
+            self.uri,
+            self.range.start.line,
+            self.range.start.character,
+            self.range.end.line,
+            self.range.end.character,
+            self.position_encoding,
         )
     }
 }
@@ -1907,6 +2004,9 @@ fn initialize_params(
                 "implementation": {
                     "dynamicRegistration": true,
                     "linkSupport": true,
+                },
+                "references": {
+                    "dynamicRegistration": true,
                 },
                 "typeDefinition": {
                     "dynamicRegistration": true,
