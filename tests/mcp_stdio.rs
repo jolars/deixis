@@ -284,6 +284,160 @@ async fn discovers_the_user_config_without_fixing_the_project_root()
 }
 
 #[tokio::test]
+async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("workspace-symbol-fanout")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let barrier = root.join("workspace-symbol-barrier");
+    let config_path = write_workspace_symbol_config(&root, &barrier)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+    let tool = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "workspace_symbols")
+        .expect("configured servers should expose workspace symbols");
+    assert_eq!(tool.input_schema.get("required"), Some(&json!(["query"])));
+    assert!(tool.output_schema.is_some());
+    assert_eq!(
+        tool.annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+
+    let arguments = json!({ "query": "answer" }).as_object().unwrap().clone();
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(false));
+    let structured = result.structured_content.as_ref().unwrap();
+    let symbols = structured["symbols"].as_array().unwrap();
+    assert_eq!(symbols.len(), 2);
+    assert_eq!(symbols[0]["server"], "alpha");
+    assert_eq!(symbols[0]["name"], "alphaSymbol");
+    assert_eq!(symbols[0]["kind"], 12);
+    assert_eq!(symbols[0]["tags"], json!([1]));
+    assert_eq!(symbols[0]["deprecated"], true);
+    assert_eq!(symbols[0]["containerName"], "mock crate");
+    assert_eq!(
+        symbols[0]["location"]["range"],
+        json!({
+            "start": { "line": 0, "character": 8 },
+            "end": { "line": 0, "character": 14 },
+        })
+    );
+    assert_eq!(symbols[0]["positionEncoding"], "utf-8");
+    assert_eq!(symbols[0]["data"]["query"], "answer");
+    assert_eq!(symbols[0]["x-mock-extension"], true);
+    assert_eq!(symbols[1]["server"], "zeta");
+    assert_eq!(symbols[1]["name"], "zetaSymbol");
+    assert!(barrier.exists(), "the release server should have run");
+    let text = result.content[0].as_text().unwrap().text.as_str();
+    assert!(
+        text.lines()
+            .next()
+            .unwrap()
+            .starts_with("alpha: alphaSymbol")
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_symbols_reports_when_no_server_supports_the_method()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("workspace-symbol-unsupported")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "workspace-symbol-unsupported")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({ "query": "answer" }).as_object().unwrap().clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(true));
+    let error = &result.structured_content.as_ref().unwrap()["error"];
+    assert_eq!(error["code"], "unsupported_capability");
+    assert_eq!(error["tool"], "workspace_symbols");
+    assert_eq!(error["server"], "mock-lsp");
+    assert_eq!(error["method"], "workspace/symbol");
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_symbols_skip_servers_without_the_capability()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("workspace-symbol-mixed-capabilities")?;
+    fs::write(root.join("main.rs"), "fn answer() {}\n")?;
+    let config_path = write_mixed_workspace_symbol_config(&root)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({ "query": "" }).as_object().unwrap().clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(false));
+    let symbols = result.structured_content.as_ref().unwrap()["symbols"]
+        .as_array()
+        .unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0]["server"], "zeta");
+    assert_eq!(symbols[0]["name"], "zetaSymbol");
+    assert_eq!(symbols[0]["data"]["query"], "");
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn hover_returns_structured_markup_across_position_encodings()
 -> Result<(), Box<dyn Error>> {
     for mode in [
@@ -1441,6 +1595,82 @@ shutdown_ms = 1000
         ),
     )?;
     Ok(())
+}
+
+fn write_workspace_symbol_config(
+    root: &std::path::Path,
+    barrier: &std::path::Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let config_path = root.join("deixis.toml");
+    let server = support::mock_lsp_server()?;
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[servers.zeta]
+command = {}
+args = ["--mode", "workspace-symbol-release"]
+file_extensions = {{ ".py" = "python" }}
+
+[servers.zeta.environment]
+DEIXIS_MOCK_WORKSPACE_ROLE = "release"
+DEIXIS_MOCK_WORKSPACE_BARRIER = {}
+DEIXIS_MOCK_WORKSPACE_NAME = "zetaSymbol"
+
+[servers.zeta.timeouts]
+request_ms = 1000
+shutdown_ms = 1000
+
+[servers.alpha]
+command = {}
+args = ["--mode", "workspace-symbol-wait-utf-16"]
+file_extensions = {{ ".rs" = "rust" }}
+
+[servers.alpha.environment]
+DEIXIS_MOCK_WORKSPACE_ROLE = "wait"
+DEIXIS_MOCK_WORKSPACE_BARRIER = {}
+DEIXIS_MOCK_WORKSPACE_NAME = "alphaSymbol"
+
+[servers.alpha.timeouts]
+request_ms = 1000
+shutdown_ms = 1000
+"#,
+            support::toml_string(&server),
+            support::toml_string(barrier),
+            support::toml_string(&server),
+            support::toml_string(barrier),
+        ),
+    )?;
+    Ok(config_path)
+}
+
+fn write_mixed_workspace_symbol_config(
+    root: &std::path::Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let config_path = root.join("deixis.toml");
+    let server = support::mock_lsp_server()?;
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[servers.alpha]
+command = {}
+args = ["--mode", "workspace-symbol-unsupported"]
+file_extensions = {{ ".rs" = "rust" }}
+
+[servers.zeta]
+command = {}
+args = ["--mode", "normal"]
+file_extensions = {{ ".py" = "python" }}
+
+[servers.zeta.environment]
+DEIXIS_MOCK_WORKSPACE_NAME = "zetaSymbol"
+"#,
+            support::toml_string(&server),
+            support::toml_string(&server),
+        ),
+    )?;
+    Ok(config_path)
 }
 
 async fn write_json_line(

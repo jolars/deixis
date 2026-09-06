@@ -20,7 +20,9 @@ synchronize project-contained documents and translate negotiated position
 encodings. Hover returns structured markup; navigation normalizes LSP location
 variants and retains configured-server provenance. Diagnostics prefers pull
 reports when advertised and otherwise exposes cached push reports with explicit
-freshness. Every tool includes a concise text fallback.
+freshness. Workspace-symbol search fans out concurrently across capable
+servers, then merges results in stable lexical server-name order with explicit
+provenance. Every tool includes a concise text fallback.
 Nothing in this document should be read as already implemented unless it is
 also marked complete in `TODO.md`.
 
@@ -139,9 +141,9 @@ Extension and glob values are the LSP language IDs used for document
 synchronization. Within one server, a matching glob takes precedence over an
 extension, and the longest matching extension wins. Matching routes in several
 servers are an error unless the caller supplies an explicit server name. This
-keeps routing independent of TOML table order. Workspace-wide operations will
-fan out to all capable configured servers and merge results in stable lexical
-server-name order, retaining the originating server name.
+keeps routing independent of TOML table order. Workspace-wide operations fan
+out concurrently to all capable configured servers and merge results in stable
+lexical server-name order, retaining the originating server name.
 
 Commands run directly, without a shell. They inherit the Deixis environment plus
 explicit overrides. Configuration never causes package installation, network
@@ -150,10 +152,11 @@ access, or command interpolation.
 ## MCP surface
 
 Without selected configuration, the current server advertises no tools. With
-configuration, it advertises eight read-only tools: `deixis_server_status`,
+configuration, it advertises nine read-only tools: `deixis_server_status`,
 `hover`, `definition`, `declaration`, `type_definition`, `implementation`,
-`references`, and `diagnostics`. The probe accepts an optional server name and
-`start` flag; without a name, it uses the first name in stable lexical order.
+`references`, `diagnostics`, and `workspace_symbols`. The probe accepts an
+optional server name and `start` flag; without a name, it uses the first name in
+stable lexical order.
 The position-based semantic tools take a root-contained path, a zero-based
 UTF-8 position, and an optional server override. They resolve the path before
 routing, infer the language ID, synchronize the document, verify the
@@ -182,9 +185,21 @@ retain the negotiated server encoding because the old source text is not
 available for sound conversion. Reports preserve diagnostic extension fields
 and identify both their source and position encoding.
 
+The `workspace_symbols` tool requires a query string, including an empty string
+when the caller wants all symbols. It starts and queries every configured server
+concurrently, skips servers that do not advertise `workspace/symbol`, and
+merges each server's response in stable lexical server-name order. If no server
+supports the method, it returns an `unsupported_capability` error. Each symbol
+includes the configured server name and its LSP name, kind, location, tags,
+container, deprecation marker, data, and extension fields when present. Location
+ranges in readable project files are translated to UTF-8; other locations
+retain the server's negotiated encoding. Deixis advertises workspace-symbol
+kind and tag support, but not lazy resolve support, so returned locations must
+include a range.
+
 The semantic tool set remains read-only. Planned additions are:
 
-- `document_symbols` and `workspace_symbols`.
+- `document_symbols`.
 
 MCP hosts already namespace tools by server, so tool names do not repeat an
 `lsp_` prefix. Every handler checks the downstream server capability before

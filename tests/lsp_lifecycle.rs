@@ -140,6 +140,10 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(probe.implementation_dynamic_registration);
     assert!(probe.implementation_link_support);
     assert!(probe.references_dynamic_registration);
+    assert!(probe.workspace_symbol_dynamic_registration);
+    assert_eq!(probe.workspace_symbol_kind_count, 26);
+    assert!(probe.workspace_symbol_tag_support);
+    assert!(!probe.workspace_symbol_resolve_support);
     assert!(probe.diagnostic_dynamic_registration);
     assert!(probe.diagnostic_version_support);
     assert!(probe.work_done_progress);
@@ -1015,6 +1019,10 @@ struct ProbeResponse {
     implementation_dynamic_registration: bool,
     implementation_link_support: bool,
     references_dynamic_registration: bool,
+    workspace_symbol_dynamic_registration: bool,
+    workspace_symbol_kind_count: usize,
+    workspace_symbol_tag_support: bool,
+    workspace_symbol_resolve_support: bool,
     diagnostic_dynamic_registration: bool,
     diagnostic_version_support: bool,
     work_done_progress: bool,

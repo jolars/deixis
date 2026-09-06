@@ -75,7 +75,7 @@ matrix.
 - [x] Add `declaration`, `type_definition`, and `implementation`.
 - [x] Add references with explicit declaration inclusion.
 - [ ] Add hierarchical document symbols and normalize flat-symbol responses.
-- [ ] Add workspace symbols, fan out across capable servers, and merge in stable
+- [x] Add workspace symbols, fan out across capable servers, and merge in stable
   configuration order.
 - [x] Cache versioned push diagnostics and implement pull diagnostics when
   advertised. Mark unavailable or stale reports explicitly.
@@ -93,7 +93,7 @@ support the corresponding LSP method.
 - [x] Manage several lazy language-server processes under one project.
 - [x] Route file operations by extension and glob language maps, with an
   explicit server override for ambiguous files.
-- [ ] Fan out workspace operations concurrently while preserving deterministic
+- [x] Fan out workspace operations concurrently while preserving deterministic
   output order and per-server provenance.
 - [ ] Bound queues, response sizes, concurrency, startup time, request time, and
   shutdown time with documented defaults.

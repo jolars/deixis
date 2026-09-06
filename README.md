@@ -13,7 +13,8 @@ memory, indexing, or agent framework around them.
 > The project is under active development. The binary manages explicitly
 > configured language servers for one project and exposes capability-gated
 > hover, definition, declaration, type-definition, implementation, and
-> reference information and diagnostics through path-based routing.
+> reference information and diagnostics through path-based routing, plus
+> concurrent workspace-symbol search across capable servers.
 
 ## Direction
 
@@ -102,14 +103,14 @@ LSP operation needs it. A file pattern takes precedence over an extension within
 one server; the longest matching extension wins. A path that matches several
 servers is rejected unless the caller supplies the optional `server` override.
 
-Configured sessions advertise eight read-only tools: `deixis_server_status`,
+Configured sessions advertise nine read-only tools: `deixis_server_status`,
 `hover`, `definition`, `declaration`, `type_definition`, `implementation`,
-`references`, and `diagnostics`. Calling the lifecycle probe with
-`{ "server": "rust", "start": true }` starts that server and returns its
-recorded status. Without `server`, it selects the first configured name in
-stable lexical order. The `hover` tool accepts a project-contained `path`, a
-zero-based UTF-8 `position`, and an optional `server`; Deixis infers the LSP
-language identifier, synchronizes the document, checks the negotiated hover
+`references`, `diagnostics`, and `workspace_symbols`. Calling the lifecycle
+probe with `{ "server": "rust", "start": true }` starts that server and
+returns its recorded status. Without `server`, it selects the first configured
+name in stable lexical order. The `hover` tool accepts a project-contained
+`path`, a zero-based UTF-8 `position`, and an optional `server`; Deixis infers
+the LSP language identifier, synchronizes the document, checks the negotiated hover
 capability, and returns structured LSP markup with a concise text fallback.
 The four location tools accept the same arguments and normalize `Location` and
 `LocationLink` responses into one location shape with the configured source
@@ -124,6 +125,15 @@ result ID, range encoding, and whether the report is `current`, `stale`, or
 `unavailable`. Current ranges use UTF-8; stale push ranges retain the negotiated
 server encoding.
 
+The `workspace_symbols` tool sends its required `query` to every configured
+server that advertises `workspace/symbol`. Requests run concurrently, while
+their merged symbols remain grouped in stable lexical server-name order. Each
+symbol names its originating server, preserves LSP metadata and extension
+fields, and reports the encoding of its location range. Ranges for readable
+project files are normalized to UTF-8. Servers without the capability are
+skipped unless none support the method, in which case the tool returns an
+`unsupported_capability` error.
+
 Deixis advertises LSP work-done progress support and rust-analyzer's server
 status notification, then reports the observed state through
 `deixis_server_status.readiness`. Empty current diagnostics, null hover results,
@@ -131,8 +141,8 @@ and empty navigation results add the same `readiness` object plus a
 `resultStability` value. `transient` means the server is still working, `stable`
 means all observed work has finished, and `indeterminate` means the server has
 not supplied enough information. Deixis does not treat successful initialization
-alone as proof that semantic results are complete. Symbols and other semantic
-tools remain unshipped.
+alone as proof that semantic results are complete. Document symbols and other
+semantic tools remain unshipped.
 
 Tool execution failures return `isError: true`, a concise text message, and a
 structured `error` object. Its stable `code`, `message`, and `tool` fields are

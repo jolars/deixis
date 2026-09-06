@@ -3,10 +3,12 @@ use std::{
     env,
     error::Error,
     fmt,
+    fs,
     io::{self, BufRead, Write},
+    path::Path,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -103,6 +105,7 @@ fn handle_request<R: BufRead>(
                 | "definition-project-target-utf-16"
                 | "definition-external-utf-16"
                 | "references-locations-utf-16"
+                | "workspace-symbol-wait-utf-16"
                 | "type-definition-locations-utf-16" => {
                     Some(Json::String("utf-16".to_owned()))
                 }
@@ -161,6 +164,8 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let workspace_symbol_provider =
+                Json::Bool(mode != "workspace-symbol-unsupported");
             let diagnostic_provider = mode
                 .starts_with("diagnostics-pull")
                 .then(|| {
@@ -183,6 +188,10 @@ fn handle_request<R: BufRead>(
                 (
                     "typeDefinitionProvider".to_owned(),
                     type_definition_provider,
+                ),
+                (
+                    "workspaceSymbolProvider".to_owned(),
+                    workspace_symbol_provider,
                 ),
             ];
             if let Some(diagnostic_provider) = diagnostic_provider {
@@ -732,6 +741,100 @@ fn handle_request<R: BufRead>(
             };
             write_message(output, response(id, result))?;
         }
+        "workspace/symbol" => {
+            if mode == "workspace-symbol-unsupported" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "workspace symbol request bypassed capability gate"
+                            .to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let query = params
+                .get("query")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            let role = env::var("DEIXIS_MOCK_WORKSPACE_ROLE")
+                .unwrap_or_else(|_| "normal".to_owned());
+            if role == "release" {
+                if let Ok(barrier) =
+                    env::var("DEIXIS_MOCK_WORKSPACE_BARRIER")
+                {
+                    fs::write(barrier, b"released")?;
+                }
+            } else if role == "wait" {
+                let barrier = env::var("DEIXIS_MOCK_WORKSPACE_BARRIER")?;
+                let deadline = Instant::now() + Duration::from_millis(750);
+                while !Path::new(&barrier).exists() && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if !Path::new(&barrier).exists() {
+                    write_message(
+                        output,
+                        error_response(
+                            id,
+                            -32043,
+                            "workspace symbol fan-out was not concurrent"
+                                .to_owned(),
+                        ),
+                    )?;
+                    return Ok(());
+                }
+            }
+
+            let initialize_params = state
+                .lock()
+                .unwrap()
+                .initialize_params
+                .clone()
+                .unwrap_or(Json::Null);
+            let root_uri = initialize_params
+                .get("rootUri")
+                .and_then(Json::as_str)
+                .unwrap_or("file:///mock");
+            let name = env::var("DEIXIS_MOCK_WORKSPACE_NAME")
+                .unwrap_or_else(|_| "mockSymbol".to_owned());
+            let (start, end) = if mode == "workspace-symbol-wait-utf-16" {
+                (6, 12)
+            } else {
+                (0, 3)
+            };
+            let symbol = json_object([
+                ("name", Json::String(name)),
+                ("kind", Json::Number(12)),
+                ("tags", Json::Array(vec![Json::Number(1)])),
+                ("deprecated", Json::Bool(true)),
+                ("containerName", Json::String("mock crate".to_owned())),
+                (
+                    "location",
+                    json_object([
+                        (
+                            "uri",
+                            Json::String(format!(
+                                "{}/main.rs",
+                                root_uri.trim_end_matches('/')
+                            )),
+                        ),
+                        ("range", mock_range(start, end)),
+                    ]),
+                ),
+                (
+                    "data",
+                    json_object([
+                        ("query", Json::String(query.to_owned())),
+                        ("extension", Json::Bool(true)),
+                    ]),
+                ),
+                ("x-mock-extension", Json::Bool(true)),
+            ]);
+            write_message(output, response(id, Json::Array(vec![symbol])))?;
+        }
         "shutdown" => {
             if mode == "ignore-shutdown" {
                 loop {
@@ -1057,6 +1160,10 @@ fn probe_client<R: BufRead>(
         implementation_dynamic_registration,
         implementation_link_support,
         references_dynamic_registration,
+        workspace_symbol_dynamic_registration,
+        workspace_symbol_kind_count,
+        workspace_symbol_tag_support,
+        workspace_symbol_resolve_support,
         diagnostic_dynamic_registration,
         diagnostic_version_support,
         work_done_progress,
@@ -1140,6 +1247,27 @@ fn probe_client<R: BufRead>(
             .and_then(|references| references.get("dynamicRegistration"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let workspace_symbol = capabilities
+            .get("workspace")
+            .and_then(|workspace| workspace.get("symbol"));
+        let workspace_symbol_dynamic_registration = workspace_symbol
+            .and_then(|symbol| symbol.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let workspace_symbol_kind_count = workspace_symbol
+            .and_then(|symbol| symbol.get("symbolKind"))
+            .and_then(|kind| kind.get("valueSet"))
+            .and_then(Json::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let workspace_symbol_tag_support = workspace_symbol
+            .and_then(|symbol| symbol.get("tagSupport"))
+            .and_then(|support| support.get("valueSet"))
+            .and_then(Json::as_array)
+            .is_some_and(|tags| tags.as_slice() == [Json::Number(1)]);
+        let workspace_symbol_resolve_support = workspace_symbol
+            .and_then(|symbol| symbol.get("resolveSupport"))
+            .is_some();
         let diagnostics = capabilities
             .get("textDocument")
             .and_then(|text_document| text_document.get("diagnostic"));
@@ -1179,6 +1307,10 @@ fn probe_client<R: BufRead>(
             implementation_dynamic_registration,
             implementation_link_support,
             references_dynamic_registration,
+            workspace_symbol_dynamic_registration,
+            workspace_symbol_kind_count,
+            workspace_symbol_tag_support,
+            workspace_symbol_resolve_support,
             diagnostic_dynamic_registration,
             diagnostic_version_support,
             work_done_progress,
@@ -1306,6 +1438,22 @@ fn probe_client<R: BufRead>(
             Json::Bool(references_dynamic_registration),
         ),
         (
+            "workspace_symbol_dynamic_registration",
+            Json::Bool(workspace_symbol_dynamic_registration),
+        ),
+        (
+            "workspace_symbol_kind_count",
+            Json::Number(workspace_symbol_kind_count as i64),
+        ),
+        (
+            "workspace_symbol_tag_support",
+            Json::Bool(workspace_symbol_tag_support),
+        ),
+        (
+            "workspace_symbol_resolve_support",
+            Json::Bool(workspace_symbol_resolve_support),
+        ),
+        (
             "diagnostic_dynamic_registration",
             Json::Bool(diagnostic_dynamic_registration),
         ),
@@ -1347,6 +1495,25 @@ fn mock_diagnostic(start: i64, end: i64) -> Json {
         (
             "data",
             json_object([("extension", Json::Bool(true))]),
+        ),
+    ])
+}
+
+fn mock_range(start: i64, end: i64) -> Json {
+    json_object([
+        (
+            "start",
+            json_object([
+                ("line", Json::Number(0)),
+                ("character", Json::Number(start)),
+            ]),
+        ),
+        (
+            "end",
+            json_object([
+                ("line", Json::Number(0)),
+                ("character", Json::Number(end)),
+            ]),
         ),
     ])
 }

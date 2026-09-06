@@ -13,6 +13,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use tokio::task::JoinSet;
 use tracing::info;
 
 use crate::{
@@ -33,6 +34,7 @@ const TYPE_DEFINITION_TOOL: &str = "type_definition";
 const IMPLEMENTATION_TOOL: &str = "implementation";
 const REFERENCES_TOOL: &str = "references";
 const DIAGNOSTICS_TOOL: &str = "diagnostics";
+const WORKSPACE_SYMBOLS_TOOL: &str = "workspace_symbols";
 
 #[derive(Clone, Copy)]
 enum LocationOperation {
@@ -165,6 +167,7 @@ impl ServerHandler for DeixisServer {
                 location_tool(IMPLEMENTATION_SPEC),
                 references_tool(),
                 diagnostics_tool(),
+                workspace_symbols_tool(),
             ]
         };
         Ok(ListToolsResult::with_all_items(tools))
@@ -192,6 +195,9 @@ impl ServerHandler for DeixisServer {
             }
             REFERENCES_TOOL => self.call_references(request).await,
             DIAGNOSTICS_TOOL => self.call_diagnostics(request).await,
+            WORKSPACE_SYMBOLS_TOOL => {
+                self.call_workspace_symbols(request).await
+            }
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
     }
@@ -753,6 +759,122 @@ impl DeixisServer {
 
         Ok(result.into())
     }
+
+    async fn call_workspace_symbols(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, McpError> {
+        const METHOD: &str = "workspace/symbol";
+
+        let arguments = serde_json::from_value::<WorkspaceSymbolsArguments>(
+            JsonValue::Object(request.arguments.unwrap_or_default()),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid workspace symbols arguments: {error}"),
+                None,
+            )
+        })?;
+        if self.language_servers.is_empty() {
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    WORKSPACE_SYMBOLS_TOOL,
+                    "no language server is configured",
+                )
+                .with_method(METHOD),
+            ));
+        }
+
+        let mut tasks = JoinSet::new();
+        for (name, language_server) in &self.language_servers {
+            let name = name.clone();
+            let language_server = Arc::clone(language_server);
+            let query = arguments.query.clone();
+            tasks.spawn(async move {
+                let result = language_server.workspace_symbols(&query).await;
+                (name, result)
+            });
+        }
+
+        let mut outcomes = BTreeMap::new();
+        while let Some(outcome) = tasks.join_next().await {
+            let (name, result) = outcome.map_err(|error| {
+                McpError::internal_error(
+                    format!("workspace symbol task failed: {error}"),
+                    None,
+                )
+            })?;
+            outcomes.insert(name, result);
+        }
+
+        let mut symbols = Vec::new();
+        let mut first_unsupported = None;
+        let mut capable_servers = 0_usize;
+        for name in self.language_servers.keys() {
+            let outcome = outcomes.remove(name).expect(
+                "every workspace symbol task should produce an outcome",
+            );
+            match outcome {
+                Ok(mut server_symbols) => {
+                    capable_servers += 1;
+                    symbols.append(&mut server_symbols);
+                }
+                Err(error @ LspError::UnsupportedCapability { .. }) => {
+                    if first_unsupported.is_none() {
+                        first_unsupported = Some(error);
+                    }
+                }
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_lsp(
+                        ToolContext {
+                            tool: WORKSPACE_SYMBOLS_TOOL,
+                            server: Some(name),
+                            method: Some(METHOD),
+                            path: None,
+                        },
+                        &error,
+                    )));
+                }
+            }
+        }
+
+        if capable_servers == 0 {
+            let error = first_unsupported.expect(
+                "every configured server should have returned an outcome",
+            );
+            return Ok(error_result(ToolError::from_lsp(
+                ToolContext {
+                    tool: WORKSPACE_SYMBOLS_TOOL,
+                    server: None,
+                    method: Some(METHOD),
+                    path: None,
+                },
+                &error,
+            )));
+        }
+
+        let text = if symbols.is_empty() {
+            "No workspace symbols.".to_owned()
+        } else {
+            symbols
+                .iter()
+                .map(|symbol| symbol.text())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let symbols = serde_json::to_value(symbols).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode workspace symbols: {error}"),
+                None,
+            )
+        })?;
+        let mut result =
+            CallToolResult::structured(json!({ "symbols": symbols }));
+        result.content = vec![ContentBlock::text(text)];
+
+        Ok(result.into())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -996,6 +1118,12 @@ struct DiagnosticsArguments {
     path: String,
     #[serde(default)]
     server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSymbolsArguments {
+    query: String,
 }
 
 impl DiagnosticsArguments {
@@ -1447,6 +1575,84 @@ fn diagnostics_tool() -> Tool {
             "positionEncoding",
             "diagnostics"
         ],
+        "additionalProperties": false
+    })))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    )
+}
+
+fn workspace_symbols_tool() -> Tool {
+    Tool::new(
+        WORKSPACE_SYMBOLS_TOOL,
+        "Return project-wide symbols from all capable configured language servers in stable server-name order.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Query passed to each capable language server. An empty string requests all symbols."
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(result_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "symbols": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "Configured name of the language server that returned this symbol."
+                        },
+                        "name": { "type": "string" },
+                        "kind": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 26
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        },
+                        "deprecated": { "type": "boolean" },
+                        "containerName": { "type": "string" },
+                        "location": {
+                            "type": "object",
+                            "properties": {
+                                "uri": { "type": "string" },
+                                "range": range_schema()
+                            },
+                            "required": ["uri", "range"],
+                            "additionalProperties": true
+                        },
+                        "positionEncoding": {
+                            "enum": ["utf-8", "utf-16", "utf-32"],
+                            "description": "Encoding used by character offsets in the location range. UTF-8 is used whenever the location is a readable project file."
+                        },
+                        "data": {}
+                    },
+                    "required": [
+                        "server",
+                        "name",
+                        "kind",
+                        "location",
+                        "positionEncoding"
+                    ],
+                    "additionalProperties": true
+                }
+            }
+        },
+        "required": ["symbols"],
         "additionalProperties": false
     })))
     .with_annotations(

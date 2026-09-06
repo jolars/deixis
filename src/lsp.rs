@@ -320,6 +320,67 @@ impl LazyLanguageServer {
         }
     }
 
+    pub async fn workspace_symbols(
+        &self,
+        query: &str,
+    ) -> Result<Vec<WorkspaceSymbol>, LspError> {
+        const METHOD: &str = "workspace/symbol";
+
+        let active = self.active_server().await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_method(
+                METHOD,
+                snapshot.capabilities().get("workspaceSymbolProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: METHOD,
+            });
+        }
+
+        let value = active
+            .request_value(
+                METHOD,
+                json!({ "query": query }),
+                self.config.timeouts().request(),
+            )
+            .await?;
+        let response: Option<Vec<RawWorkspaceSymbol>> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+        let mut symbols = Vec::new();
+        for symbol in response.into_iter().flatten() {
+            let target = self
+                .normalize_file_target(
+                    &symbol.location.uri,
+                    symbol.location.range,
+                    symbol.location.range,
+                    encoding,
+                )
+                .await?;
+            let mut fields = symbol.fields;
+            fields.remove("server");
+            fields.remove("positionEncoding");
+            symbols.push(WorkspaceSymbol {
+                server: self.config.name().to_owned(),
+                name: symbol.name,
+                kind: symbol.kind,
+                location: WorkspaceSymbolLocation {
+                    uri: symbol.location.uri,
+                    range: target.range,
+                    fields: symbol.location.fields,
+                },
+                position_encoding: target.position_encoding,
+                fields,
+            });
+        }
+
+        Ok(symbols)
+    }
+
     async fn location_request(
         &self,
         path: impl AsRef<Path>,
@@ -432,6 +493,17 @@ impl LazyLanguageServer {
             );
         }
 
+        self.normalize_file_target(uri, range, selection_range, encoding)
+            .await
+    }
+
+    async fn normalize_file_target(
+        &self,
+        uri: &str,
+        range: Range,
+        selection_range: Range,
+        encoding: PositionEncoding,
+    ) -> Result<DefinitionTarget, LspError> {
         let Some(path) = Url::parse(uri)
             .ok()
             .filter(|uri| uri.scheme() == "file")
@@ -583,6 +655,61 @@ pub struct ReferenceLocation {
     pub uri: String,
     pub range: Range,
     pub position_encoding: PositionEncoding,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSymbol {
+    pub server: String,
+    pub name: String,
+    pub kind: u32,
+    pub location: WorkspaceSymbolLocation,
+    pub position_encoding: PositionEncoding,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+impl WorkspaceSymbol {
+    pub fn text(&self) -> String {
+        let range = self.location.range;
+        format!(
+            "{}: {} (kind {}) at {}:{}:{}-{}:{} ({})",
+            self.server,
+            self.name,
+            self.kind,
+            self.location.uri,
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+            self.position_encoding,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkspaceSymbolLocation {
+    pub uri: String,
+    pub range: Range,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWorkspaceSymbol {
+    name: String,
+    kind: u32,
+    location: RawWorkspaceSymbolLocation,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWorkspaceSymbolLocation {
+    uri: String,
+    range: Range,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
 }
 
 impl ReferenceLocation {
@@ -2680,6 +2807,17 @@ fn initialize_params(
                 "workspaceFolders": true,
                 "didChangeConfiguration": {
                     "dynamicRegistration": true,
+                },
+                "symbol": {
+                    "dynamicRegistration": true,
+                    "symbolKind": {
+                        "valueSet": [
+                            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                            14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                            25, 26
+                        ],
+                    },
+                    "tagSupport": { "valueSet": [1] },
                 },
             },
             "textDocument": {
