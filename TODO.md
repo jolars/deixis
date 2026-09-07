@@ -21,6 +21,25 @@ artifacts; the locked test suite passes on Linux, macOS, and Windows; each
 artifact is traceable to its source; and the registry entry advertises only the
 shipped stdio surface.
 
+## Agent-facing query ergonomics
+
+- [ ] Define and enforce output budgets for high-cardinality results. Add
+  limits and continuation metadata to references and symbol queries; let text
+  fallbacks summarize rather than duplicate every structured item, and report
+  when a result was truncated.
+- [ ] Add optional, tightly bounded source context to root-contained navigation
+  results so an agent can often assess a location without another broad file
+  read.
+- [ ] Retry retriggerable LSP cancellations, including error `-32802` with
+  `retriggerRequest`, after a bounded readiness wait. Preserve the caller's
+  deadline and cancellation, and report the terminal failure clearly.
+- [ ] Add incoming and outgoing call hierarchy behind negotiated server
+  capabilities, with the same result limits as references.
+- [ ] Add signature help behind negotiated server capabilities, with concise
+  text and structured parameter information.
+- [ ] Present `document_symbols` as an explicit file-outline operation rather
+  than a default navigation step in agent guidance and tool documentation.
+
 ## Evaluation
 
 - [x] Add a randomized agent-level harness that separates Deixis availability
@@ -28,6 +47,15 @@ shipped stdio surface.
   and patches.
 - [x] Curate and validate a pinned ten-task Rust pilot from SWE-bench
   Multilingual, including isolated base/gold grading.
+- [ ] Revise the Deixis treatment to target definitions, type definitions,
+  implementations, references, and post-edit diagnostics. Do not require
+  document-symbol calls or any Deixis call when a task has no semantic
+  navigation need.
+- [ ] Record per-call MCP latency, result size, item count, and failure status so
+  token and time overhead can be attributed to individual operations.
+- [ ] Calibrate the revised treatment on three to five navigation-heavy tasks
+  involving cross-module references, traits or interfaces, re-exports, or name
+  collisions before running the full pilot.
 - [ ] Run the pilot and publish the first benchmark results with pinned Codex,
   Deixis, and language-server versions.
 - [ ] Expand the task set beyond Rust before drawing multilingual conclusions.
