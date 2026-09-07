@@ -1,0 +1,18 @@
+schema_version = 1
+source_repository = "https://github.com/SWE-bench/swe-bench-multilingual-tasks"
+source_revision = "6e08cbcd763c869abd7aae4bcb9e1b3991180777"
+selection_seed = 20260907
+selection_rule = "Rust tasks with nonempty PASS_TO_PASS tests; one seeded draw per repository, then a second seeded draw from the three largest eligible repository pools; replace a task that fails offline base/gold verification with the next unselected task from that repository in lexical order."
+
+task_ids = [
+  "astral-sh__ruff-15330",
+  "astral-sh__ruff-15543",
+  "burntsushi__ripgrep-2576",
+  "nushell__nushell-13605",
+  "sharkdp__bat-2201",
+  "sharkdp__bat-2260",
+  "tokio-rs__axum-734",
+  "tokio-rs__tokio-6603",
+  "tokio-rs__tokio-6724",
+  "uutils__coreutils-6690",
+]

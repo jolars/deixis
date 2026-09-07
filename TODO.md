@@ -26,8 +26,11 @@ shipped stdio surface.
 - [x] Add a randomized agent-level harness that separates Deixis availability
   from LSP-directed instructions and records success, tokens, time, tool calls,
   and patches.
-- [ ] Curate a multilingual pilot task set and publish the first benchmark
-  results with pinned Codex, Deixis, and language-server versions.
+- [x] Curate and validate a pinned ten-task Rust pilot from SWE-bench
+  Multilingual, including isolated base/gold grading.
+- [ ] Run the pilot and publish the first benchmark results with pinned Codex,
+  Deixis, and language-server versions.
+- [ ] Expand the task set beyond Rust before drawing multilingual conclusions.
 
 ## Mutating operations
 

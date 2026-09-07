@@ -50,6 +50,11 @@ ARMS = (
     Arm("instruction_only", deixis_available=False, instructed=True),
     Arm("deixis_instructed", deixis_available=True, instructed=True),
 )
+USAGE_BILLED_CREDENTIALS = (
+    "AZURE_OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+)
 ARM_BY_NAME = {arm.name: arm for arm in ARMS}
 
 
@@ -390,6 +395,8 @@ def build_codex_command(config: BenchmarkConfig, arm: Arm, worktree: Path) -> li
         'web_search="disabled"',
         "-c",
         "agents.max_threads=1",
+        "-c",
+        'forced_login_method="chatgpt"',
     ]
     if arm.deixis_available:
         deixis_args = (
@@ -596,13 +603,33 @@ def _validate_static(config: BenchmarkConfig, output: Path | None = None) -> Non
             )
 
 
-def _validate_codex_home(path: Path) -> None:
+def _validate_codex_home(path: Path, codex_command: str) -> None:
     if not path.is_dir():
         raise BenchmarkError(f"benchmark Codex home does not exist: {path}")
     instructions = path / "AGENTS.md"
     if instructions.exists():
         raise BenchmarkError(
             f"benchmark Codex home must not contain AGENTS.md: {instructions}"
+        )
+    environment = os.environ.copy()
+    for name in USAGE_BILLED_CREDENTIALS:
+        environment.pop(name, None)
+    environment["CODEX_HOME"] = str(path)
+    try:
+        completed = subprocess.run(
+            [codex_command, "login", "status"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+    except OSError as error:
+        raise BenchmarkError(f"cannot inspect Codex authentication: {error}") from error
+    status = f"{completed.stdout}\n{completed.stderr}".strip()
+    if completed.returncode != 0 or "Logged in using ChatGPT" not in status:
+        raise BenchmarkError(
+            "benchmark Codex home must be authenticated with ChatGPT; "
+            f"codex login status reported: {status or 'no status'}"
         )
 
 
@@ -839,6 +866,8 @@ def _task_environment(
     environment = os.environ.copy()
     environment.update(config.environment)
     environment.update(task.environment)
+    for name in USAGE_BILLED_CREDENTIALS:
+        environment.pop(name, None)
     environment["NO_COLOR"] = "1"
     if codex_home is not None:
         environment["CODEX_HOME"] = str(codex_home)
@@ -1022,7 +1051,7 @@ def run_experiment(
         raise BenchmarkError("arm selection is empty")
     selected = dataclasses.replace(config, tasks=tasks, arms=arms)
     _validate_static(selected, output)
-    _validate_codex_home(codex_home)
+    _validate_codex_home(codex_home, config.codex_command)
     commits = {task.id: _resolve_commit(task) for task in tasks}
     schedule = build_schedule(tasks, arms, config.repetitions, config.seed)
 

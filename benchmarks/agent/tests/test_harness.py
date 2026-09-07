@@ -11,9 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from harness import (
     ARMS,
     BenchmarkConfig,
+    BenchmarkError,
     Task,
     _run_codex,
     _run_trial,
+    _task_environment,
+    _validate_codex_home,
     build_codex_command,
     build_schedule,
     collect_event_metrics,
@@ -128,6 +131,70 @@ class CommandTests(unittest.TestCase):
             'developer_instructions="Use typed LSP tools when available."',
             rendered,
         )
+
+    def test_command_forces_chatgpt_authentication(self) -> None:
+        command = build_codex_command(self.config, ARMS[0], Path("/work/tree"))
+
+        self.assertIn('forced_login_method="chatgpt"', command)
+
+    def test_environment_removes_usage_billed_api_credentials(self) -> None:
+        task = Task("one", Path("/repo"), "HEAD", "Fix it", ("test",))
+
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "do-not-use",
+                "AZURE_OPENAI_API_KEY": "do-not-use",
+                "CODEX_API_KEY": "do-not-use",
+            },
+        ):
+            environment = _task_environment(self.config, task, Path("/codex-home"))
+
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("AZURE_OPENAI_API_KEY", environment)
+        self.assertNotIn("CODEX_API_KEY", environment)
+        self.assertEqual(environment["CODEX_HOME"], "/codex-home")
+
+    def test_codex_home_requires_chatgpt_authentication(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch("harness.subprocess.run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess(
+                args=["codex", "login", "status"],
+                returncode=0,
+                stdout="Logged in using an API key\n",
+                stderr="",
+            )
+
+            with self.assertRaisesRegex(BenchmarkError, "ChatGPT"):
+                _validate_codex_home(Path(temporary_directory), "codex")
+
+    def test_authentication_check_hides_api_credentials(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.dict(
+                os.environ,
+                {
+                    "OPENAI_API_KEY": "do-not-use",
+                    "CODEX_API_KEY": "do-not-use",
+                },
+            ),
+            patch("harness.subprocess.run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess(
+                args=["codex", "login", "status"],
+                returncode=0,
+                stdout="Logged in using ChatGPT\n",
+                stderr="",
+            )
+
+            _validate_codex_home(Path(temporary_directory), "codex")
+
+        environment = run.call_args.kwargs["env"]
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("CODEX_API_KEY", environment)
+        self.assertEqual(environment["CODEX_HOME"], temporary_directory)
 
 
 class EventMetricTests(unittest.TestCase):

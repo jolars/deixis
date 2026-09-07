@@ -30,6 +30,7 @@ only.
 
 - Python 3.11 or newer;
 - Git;
+- Docker, for the pinned SWE-bench evaluator images;
 - Codex CLI;
 - a pinned Deixis executable; and
 - every language server named by the Deixis configuration.
@@ -40,14 +41,25 @@ Build the executable that the experiment should measure:
 cargo build --release --locked
 ```
 
-Create a dedicated Codex home outside this repository and authenticate it. It
-must not contain an `AGENTS.md`; otherwise, personal instructions could affect
-the experiment. Do not commit its authentication files.
+Create a dedicated Codex home outside this repository and copy the existing
+ChatGPT authentication into it. It must not contain an `AGENTS.md`; otherwise,
+personal instructions could affect the experiment. Do not commit its
+authentication files.
 
 ```console
-mkdir -m 700 ../codex-benchmark-home
-CODEX_HOME="$(realpath ../codex-benchmark-home)" codex login
+install -d -m 700 ../codex-benchmark-home
+install -m 600 ~/.codex/auth.json ../codex-benchmark-home/auth.json
+env -u OPENAI_API_KEY -u AZURE_OPENAI_API_KEY -u CODEX_API_KEY \
+  CODEX_HOME=../codex-benchmark-home codex login status
 ```
+
+The status command must report `Logged in using ChatGPT`. The harness removes
+usage-billed API-key environment variables, forces `forced_login_method` to
+`chatgpt`, and checks the login status before it creates an output directory.
+It fails closed rather than falling back to API-key billing. Codex still
+connects to the Codex service under the ChatGPT subscription; this is not an
+offline model benchmark. See the [OpenAI authentication documentation] for the
+distinction between ChatGPT and API-key authentication.
 
 The runner uses `--ignore-user-config`, `--ignore-rules`, `--ephemeral`, a
 workspace-write sandbox, no approvals, no web search, and one agent thread. It
@@ -61,6 +73,7 @@ overrides used for the factorial arms.
 
 [Codex non-interactive mode documentation]: https://learn.chatgpt.com/docs/non-interactive-mode
 [Codex configuration reference]: https://learn.chatgpt.com/docs/config-file/config-reference
+[OpenAI authentication documentation]: https://learn.chatgpt.com/docs/auth
 
 ## Define tasks
 
@@ -89,6 +102,47 @@ before Codex starts. The evaluation command must return
 `expected_evaluation_exit_code` after Codex exits. Per-task environment values
 are inherited by the precheck, Codex, and evaluator. Keep secrets out of the
 manifest.
+
+## Prepare the Rust pilot
+
+The checked-in [Rust pilot suite](swebench-rust-pilot.toml) selects ten real
+Rust issues from seven repositories in SWE-bench Multilingual. The source
+revision, selection seed, selection rule, task IDs, Docker image IDs, task-asset
+checksums, Deixis binary hash, and `rust-analyzer` version are recorded. A task
+that cannot reproduce its base and gold outcomes without network access is
+rejected deterministically.
+
+Build Deixis, then materialize the source snapshots and evaluator assets
+outside this repository:
+
+```console
+cargo build --release --locked
+python3 benchmarks/agent/swebench.py prepare \
+  benchmarks/agent/swebench-rust-pilot.toml \
+  --destination ../deixis-benchmark-data \
+  --manifest benchmarks/agent/benchmark.toml \
+  --deixis-command target/release/deixis
+```
+
+Preparation pulls the official task images, confirms that each image is at the
+declared base commit, removes the original Git history and remotes, and creates
+a fresh single-commit snapshot. This prevents the agent from recovering the
+future fixing commit from Git. The generated manifest is intentionally ignored
+because it contains machine-specific absolute paths.
+
+Verify every fixture before spending model tokens:
+
+```console
+for task in ../deixis-benchmark-data/assets/*/task.json; do
+  python3 benchmarks/agent/swebench.py verify --task "$task" || exit
+done
+```
+
+Verification runs the untouched base and the official gold patch in the pinned
+image with networking disabled. The gold patch is fetched from the pinned task
+source only for this check and is never stored in the agent-visible snapshot.
+The normal evaluator applies only the candidate worktree patch, then grades the
+declared fail-to-pass and pass-to-pass tests.
 
 ## Run an experiment
 
@@ -129,7 +183,7 @@ python3 benchmarks/agent/harness.py run \
 ```
 
 Run arms sequentially. The harness randomizes task and arm order within each
-repetition, which reduces—but does not eliminate—time-varying API load and
+repetition, which reduces—but does not eliminate—time-varying service load and
 machine-cache effects.
 
 ## Artifacts and summaries
@@ -183,8 +237,8 @@ administrative entries.
 Treat task success under fixed time limits as the primary outcome. Token and
 time comparisons among successful runs alone are susceptible to selection
 bias, so also report total tokens and total agent time per solved task. Classify
-API outages and process-launch failures as infrastructure failures rather than
-task failures, and rerun those cells in a new experiment directory.
+service outages and process-launch failures as infrastructure failures rather
+than task failures, and rerun those cells in a new experiment directory.
 
 For a pilot, use 8-12 tasks and two repetitions. A stronger result needs more
 tasks, multiple independent repetitions, pinned tool versions, and a recorded
