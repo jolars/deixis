@@ -230,9 +230,11 @@ when both arms solve the task. Use `runs.jsonl` for task-clustered bootstrap
 intervals or a mixed-effects analysis.
 
 Worktrees are retained because the patch and result should remain auditable.
-Remove them with `git worktree remove` from each source repository when the
-experiment is no longer needed; use `git worktree prune` to clean stale
-administrative entries.
+Ignored build artifacts are removed after evaluation so a long experiment does
+not retain a separate Cargo build tree for every trial. Remove the worktrees
+with `git worktree remove` from each source repository when the experiment is
+no longer needed; use `git worktree prune` to clean stale administrative
+entries.
 
 ## Interpreting results
 

@@ -382,7 +382,12 @@ class TrialTests(unittest.TestCase):
                 check=True,
             )
             (repository / "value.txt").write_text("old\n", encoding="utf-8")
-            subprocess.run(["git", "add", "value.txt"], cwd=repository, check=True)
+            (repository / ".gitignore").write_text("/build-output/\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "value.txt", ".gitignore"],
+                cwd=repository,
+                check=True,
+            )
             subprocess.run(
                 ["git", "commit", "--quiet", "-m", "fixture"],
                 cwd=repository,
@@ -429,6 +434,8 @@ import sys
 from pathlib import Path
 sys.stdin.read()
 Path("value.txt").write_text("new\\n")
+Path("build-output").mkdir()
+Path("build-output/cache").write_text("large generated artifact\\n")
 print(json.dumps({
     "type": "turn.completed",
     "usage": {
@@ -462,7 +469,9 @@ print(json.dumps({
                 encoding="utf-8"
             )
             self.assertIn("+new", patch_text)
-            self.assertTrue((Path(result["artifact_directory"]) / "worktree").is_dir())
+            worktree = Path(result["artifact_directory"]) / "worktree"
+            self.assertTrue(worktree.is_dir())
+            self.assertFalse((worktree / "build-output").exists())
 
 
 if __name__ == "__main__":

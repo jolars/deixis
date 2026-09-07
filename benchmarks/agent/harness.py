@@ -863,6 +863,10 @@ def _capture_patch(worktree: Path, commit: str, artifact_directory: Path) -> Non
     )
 
 
+def _clean_ignored_artifacts(worktree: Path) -> None:
+    _run_checked(["git", "-C", str(worktree), "clean", "-fdX"])
+
+
 def _task_environment(
     config: BenchmarkConfig, task: Task, codex_home: Path | None = None
 ) -> dict[str, str]:
@@ -940,6 +944,7 @@ def _run_trial(
         artifact_directory / "evaluation.stdout",
         artifact_directory / "evaluation.stderr",
     )
+    _clean_ignored_artifacts(worktree)
     success = (
         not codex["timed_out"]
         and codex["exit_code"] == 0
