@@ -1,0 +1,39 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jolars/deixis",
+  "title": "Deixis",
+  "description": "Typed LSP operations for MCP clients.",
+  "version": "0.2.0",
+  "websiteUrl": "https://github.com/jolars/deixis",
+  "repository": {
+    "url": "https://github.com/jolars/deixis",
+    "source": "github",
+    "id": "1355949005"
+  },
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "deixis",
+      "version": "0.2.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--root",
+          "description": "Absolute path to the project root.",
+          "format": "filepath",
+          "isRequired": true
+        },
+        {
+          "type": "named",
+          "name": "--config",
+          "description": "Path to the Deixis language-server configuration.",
+          "format": "filepath",
+          "isRequired": true
+        }
+      ]
+    }
+  ]
+}

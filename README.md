@@ -93,8 +93,11 @@ nix run github:jolars/deixis -- --root /path/to/project --config /path/to/config
 Rust 1.98.0 or newer is required:
 
 ```console
-cargo install --git https://github.com/jolars/deixis --locked
+cargo install deixis --locked
 ```
+
+The crates.io package belongs to the MCP Registry identity
+`mcp-name: io.github.jolars/deixis`.
 
 To build a checkout instead:
 
