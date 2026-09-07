@@ -25,7 +25,7 @@ A configured Deixis session exposes ten read-only MCP tools:
   | `references`           | Find references, with explicit declaration inclusion.       |
   | `diagnostics`          | Request pull diagnostics or return cached push diagnostics. |
   | `document_symbols`     | Return a normalized hierarchy of symbols in a file.         |
-  | `workspace_symbols`    | Search every capable configured server concurrently.        |
+  | `workspace_symbols`    | Search attached servers, or one explicitly named server.    |
 
 Deixis negotiates UTF-8, UTF-16, and UTF-32 positions, synchronizes documents
 from disk before file-scoped requests, gates every operation on the language
@@ -259,8 +259,9 @@ configured `server` name. Position-based tools also accept:
 
 Both values are zero-based; `character` is a UTF-8 byte offset. If several
 servers match a file, supply `server` or make the configuration routes unique.
-`workspace_symbols` instead fans out to all capable servers and merges results
-in stable server-name order.
+Without a `server`, `workspace_symbols` fans out to capable attached servers
+without starting others and merges results in stable server-name order. Supply
+`server` to query that server alone, starting it if necessary.
 
 Successful calls return structured JSON and a concise text fallback. Tool
 failures return `isError: true` with a stable structured error code. Null or

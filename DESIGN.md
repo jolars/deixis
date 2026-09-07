@@ -161,9 +161,11 @@ Extension and glob values are the LSP language IDs used for document
 synchronization. Within one server, a matching glob takes precedence over an
 extension, and the longest matching extension wins. Matching routes in several
 servers are an error unless the caller supplies an explicit server name. This
-keeps routing independent of TOML table order. Workspace-wide operations fan
-out concurrently to all capable configured servers and merge results in stable
-lexical server-name order, retaining the originating server name.
+keeps routing independent of TOML table order. By default, workspace-symbol
+requests fan out concurrently to capable attached servers without starting
+others. An explicit server selects that server alone and may start it. Merged
+results use stable lexical server-name order and retain the originating server
+name.
 
 Commands run directly, without a shell. They inherit the Deixis environment plus
 explicit overrides. Configuration never causes package installation, network
@@ -220,16 +222,17 @@ encoding. Ranges in readable project files are translated to UTF-8, while
 other locations retain the negotiated server encoding.
 
 The `workspace_symbols` tool requires a query string, including an empty string
-when the caller wants all symbols. It starts and queries every configured server
-concurrently, skips servers that do not advertise `workspace/symbol`, and
-merges each server's response in stable lexical server-name order. If no server
-supports the method, it returns an `unsupported_capability` error. Each symbol
-includes the configured server name and its LSP name, kind, location, tags,
-container, deprecation marker, data, and extension fields when present. Location
-ranges in readable project files are translated to UTF-8; other locations
-retain the server's negotiated encoding. Deixis advertises workspace-symbol
-kind and tag support, but not lazy resolve support, so returned locations must
-include a range.
+when the caller wants all symbols. Without a server name, it concurrently
+queries the attached servers and does not start any others. With a server name,
+it queries that server alone, starting it if necessary. Incapable selected
+servers are skipped, and responses are merged in stable lexical server-name
+order. If none of the selected servers supports the method, the tool returns an
+`unsupported_capability` error. Each symbol includes the configured server name
+and its LSP name, kind, location, tags, container, deprecation marker, data, and
+extension fields when present. Location ranges in readable project files are
+translated to UTF-8; other locations retain the server's negotiated encoding.
+Deixis advertises workspace-symbol kind and tag support, but not lazy resolve
+support, so returned locations must include a range.
 
 MCP hosts already namespace tools by server, so tool names do not repeat an
 `lsp_` prefix. Every handler checks the downstream server capability before

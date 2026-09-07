@@ -574,6 +574,105 @@ async fn unqualified_server_status_summarizes_every_configured_server()
 }
 
 #[tokio::test]
+async fn workspace_symbols_do_not_start_unattached_servers_by_default()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("workspace-symbol-attached-scope")?;
+    let config_path = write_mixed_workspace_symbol_config(&root)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let arguments = json!({ "query": "" }).as_object().unwrap().clone();
+    let default_result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(default_result.is_error, Some(false));
+    assert_eq!(
+        default_result.content[0].as_text().unwrap().text,
+        "No attached language servers."
+    );
+    assert_eq!(
+        default_result.structured_content,
+        Some(json!({ "symbols": [] }))
+    );
+
+    let status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+    )
+    .await??;
+    assert_eq!(
+        status.content[0].as_text().unwrap().text,
+        "alpha: not started\nzeta: not started"
+    );
+
+    let unknown_arguments = json!({
+        "query": "",
+        "server": "unknown",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let unknown_result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols")
+                .with_arguments(unknown_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(unknown_result.is_error, Some(true));
+    let error = &unknown_result.structured_content.as_ref().unwrap()["error"];
+    assert_eq!(error["code"], "unknown_server");
+    assert_eq!(error["server"], "unknown");
+
+    let explicit_arguments = json!({
+        "query": "",
+        "server": "zeta",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let explicit_result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols")
+                .with_arguments(explicit_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(explicit_result.is_error, Some(false));
+    assert_eq!(
+        explicit_result.structured_content.as_ref().unwrap()["symbols"][0]["server"],
+        "zeta"
+    );
+
+    let status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+    )
+    .await??;
+    assert_eq!(
+        status.content[0].as_text().unwrap().text,
+        "alpha: not started\nzeta: running"
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_only_tools_accept_null_and_empty_lsp_results()
 -> Result<(), Box<dyn Error>> {
     for mode in ["semantic-responses-null", "semantic-responses-empty"] {
@@ -669,6 +768,7 @@ async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("workspace-symbol-fanout")?;
     fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    fs::write(root.join("main.py"), "let xxanswer = 42; xx\n")?;
     let barrier = root.join("workspace-symbol-barrier");
     let config_path = write_workspace_symbol_config(&root, &barrier)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
@@ -689,6 +789,12 @@ async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
         .find(|tool| tool.name == "workspace_symbols")
         .expect("configured servers should expose workspace symbols");
     assert_eq!(tool.input_schema.get("required"), Some(&json!(["query"])));
+    assert!(
+        tool.input_schema
+            .get("properties")
+            .and_then(JsonValue::as_object)
+            .is_some_and(|properties| properties.contains_key("server"))
+    );
     assert!(tool.output_schema.is_some());
     assert_eq!(
         tool.annotations
@@ -696,6 +802,19 @@ async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
             .and_then(|annotations| annotations.read_only_hint),
         Some(true)
     );
+
+    for path in ["main.rs", "main.py"] {
+        let arguments = json!({ "path": path }).as_object().unwrap().clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("document_symbols")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+        assert_eq!(result.is_error, Some(false), "{path}");
+    }
 
     let arguments = json!({ "query": "answer" }).as_object().unwrap().clone();
     let result = timeout(
@@ -747,7 +866,8 @@ async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
 async fn one_server_failure_does_not_block_or_corrupt_another_server()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("workspace-symbol-failure-isolation")?;
-    fs::write(root.join("main.py"), "let 🦀answer = 42;\n")?;
+    fs::write(root.join("main.rs"), "let xxanswer = 42; xx\n")?;
+    fs::write(root.join("main.py"), "let xxanswer = 42; xx\n")?;
     let completed = root.join("healthy-server-completed");
     let config_path = write_failure_isolation_config(&root, &completed)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
@@ -759,6 +879,19 @@ async fn one_server_failure_does_not_block_or_corrupt_another_server()
     let transport = TokioChildProcess::new(command)?;
     let client =
         timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    for path in ["main.rs", "main.py"] {
+        let arguments = json!({ "path": path }).as_object().unwrap().clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("document_symbols")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+        assert_eq!(result.is_error, Some(false), "{path}");
+    }
 
     let arguments = json!({ "query": "answer" }).as_object().unwrap().clone();
     let failed_fanout = timeout(
@@ -831,7 +964,13 @@ async fn workspace_symbols_reports_when_no_server_supports_the_method()
     let transport = TokioChildProcess::new(command)?;
     let client =
         timeout(Duration::from_secs(10), ().serve(transport)).await??;
-    let arguments = json!({ "query": "answer" }).as_object().unwrap().clone();
+    let arguments = json!({
+        "query": "answer",
+        "server": "mock-lsp",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
 
     let result = timeout(
         Duration::from_secs(10),
@@ -857,7 +996,8 @@ async fn workspace_symbols_reports_when_no_server_supports_the_method()
 async fn workspace_symbols_skip_servers_without_the_capability()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("workspace-symbol-mixed-capabilities")?;
-    fs::write(root.join("main.rs"), "fn answer() {}\n")?;
+    fs::write(root.join("main.rs"), "let xxanswer = 42; xx\n")?;
+    fs::write(root.join("main.py"), "let xxanswer = 42; xx\n")?;
     let config_path = write_mixed_workspace_symbol_config(&root)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
     command
@@ -868,6 +1008,19 @@ async fn workspace_symbols_skip_servers_without_the_capability()
     let transport = TokioChildProcess::new(command)?;
     let client =
         timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    for path in ["main.rs", "main.py"] {
+        let arguments = json!({ "path": path }).as_object().unwrap().clone();
+        let result = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("document_symbols")
+                    .with_arguments(arguments),
+            ),
+        )
+        .await??;
+        assert_eq!(result.is_error, Some(false), "{path}");
+    }
+
     let arguments = json!({ "query": "" }).as_object().unwrap().clone();
 
     let result = timeout(

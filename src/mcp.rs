@@ -918,6 +918,7 @@ impl DeixisServer {
                 None,
             )
         })?;
+        arguments.validate()?;
         if self.language_servers.is_empty() {
             return Ok(error_result(
                 ToolError::new(
@@ -929,10 +930,39 @@ impl DeixisServer {
             ));
         }
 
+        let mut selected_servers = BTreeMap::new();
+        if let Some(name) = arguments.server.as_deref() {
+            let Some(language_server) = self.language_servers.get(name) else {
+                return Ok(error_result(
+                    ToolError::new(
+                        "unknown_server",
+                        WORKSPACE_SYMBOLS_TOOL,
+                        format!("server `{name}` is not configured"),
+                    )
+                    .with_server(name)
+                    .with_method(METHOD),
+                ));
+            };
+            selected_servers
+                .insert(name.to_owned(), Arc::clone(language_server));
+        } else {
+            for (name, language_server) in &self.language_servers {
+                if language_server.status().await.attached() {
+                    selected_servers
+                        .insert(name.clone(), Arc::clone(language_server));
+                }
+            }
+        }
+
+        if selected_servers.is_empty() {
+            return Ok(success_result(
+                json!({ "symbols": [] }),
+                "No attached language servers.",
+            ));
+        }
+
         let mut tasks = JoinSet::new();
-        for (name, language_server) in &self.language_servers {
-            let name = name.clone();
-            let language_server = Arc::clone(language_server);
+        for (name, language_server) in selected_servers {
             let query = arguments.query.clone();
             let cancellation = cancellation.clone();
             tasks.spawn(async move {
@@ -957,10 +987,7 @@ impl DeixisServer {
         let mut symbols = Vec::new();
         let mut first_unsupported = None;
         let mut capable_servers = 0_usize;
-        for name in self.language_servers.keys() {
-            let outcome = outcomes.remove(name).expect(
-                "every workspace symbol task should produce an outcome",
-            );
+        for (name, outcome) in outcomes {
             match outcome {
                 Ok(mut server_symbols) => {
                     capable_servers += 1;
@@ -975,7 +1002,7 @@ impl DeixisServer {
                     return Ok(error_result(ToolError::from_lsp(
                         ToolContext {
                             tool: WORKSPACE_SYMBOLS_TOOL,
-                            server: Some(name),
+                            server: Some(&name),
                             method: Some(METHOD),
                             path: None,
                         },
@@ -987,7 +1014,7 @@ impl DeixisServer {
 
         if capable_servers == 0 {
             let error = first_unsupported.expect(
-                "every configured server should have returned an outcome",
+                "every selected server should have returned an outcome",
             );
             return Ok(error_result(ToolError::from_lsp(
                 ToolContext {
@@ -1285,9 +1312,27 @@ struct DocumentSymbolsArguments {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspaceSymbolsArguments {
     query: String,
+    #[serde(default)]
+    server: Option<String>,
+}
+
+impl WorkspaceSymbolsArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                "invalid workspace symbols arguments: `server` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DocumentSymbolsArguments {
@@ -1901,13 +1946,18 @@ fn document_symbols_output_schema() -> Arc<JsonObject> {
 fn workspace_symbols_tool() -> Tool {
     Tool::new(
         WORKSPACE_SYMBOLS_TOOL,
-        "Return project-wide symbols from all capable configured language servers in stable server-name order.",
+        "Return project-wide symbols from attached language servers, or from one named server.",
         object_schema(json!({
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Query passed to each capable language server. An empty string requests all symbols."
+                    "description": "Query passed to each selected language server. An empty string requests all symbols."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server to query, starting it if necessary. Omit it to query attached servers without starting others."
                 }
             },
             "required": ["query"],

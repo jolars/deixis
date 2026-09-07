@@ -102,9 +102,10 @@ Deixis will not send a request and guess from the response. Check
 `deixis_server_status`, server initialization logs, and the language server's
 own documentation.
 
-For `workspace_symbols`, incapable servers are skipped. The tool returns an
-unsupported-capability error only when no configured server supports the
-operation.
+For `workspace_symbols`, incapable selected servers are skipped. Without a
+`server`, the selected set consists only of attached servers; with one, only
+that server is selected. The tool returns an unsupported-capability error only
+when none of the selected servers supports the operation.
 
 ## Requests time out or the server is busy
 
