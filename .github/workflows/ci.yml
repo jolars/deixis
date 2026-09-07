@@ -58,6 +58,20 @@ jobs:
           key: ${{ matrix.os }}
       - run: cargo test --all-targets --locked
 
+  benchmark-test:
+    name: agent benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s benchmarks/agent/tests -v
+
   registry-metadata:
     name: MCP Registry metadata
     runs-on: ubuntu-latest
@@ -75,7 +89,7 @@ jobs:
   versionary:
     name: versionary
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fmt, clippy, docs, test, registry-metadata]
+    needs: [fmt, clippy, docs, test, benchmark-test, registry-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: write

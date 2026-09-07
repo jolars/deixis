@@ -337,6 +337,11 @@ cargo test --test real_language_servers -- --ignored --test-threads=1
 Executable paths may be overridden with `DEIXIS_TYPESCRIPT_LANGUAGE_SERVER`,
 `DEIXIS_PYRIGHT_LANGSERVER`, `DEIXIS_GOPLS`, `DEIXIS_CLANGD`, and `DEIXIS_DENO`.
 
+The [agent benchmark](benchmarks/agent/README.md) runs paired Codex trials with
+Deixis available or absent and with neutral or LSP-directed instructions. It
+records task success, model tokens, wall time, MCP calls, patches, and raw event
+streams in isolated Git worktrees.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete development gate.
 
 ## License

@@ -3,6 +3,10 @@
 **/*.rs.bk
 **/mutants.out*/
 
+# Python
+__pycache__/
+*.py[cod]
+
 # devenv and direnv
 .devenv*
 .direnv/
@@ -32,3 +36,4 @@ devenv.local.yaml
 /.beads
 /plans/
 /worktrees/
+/benchmarks/agent/benchmark.toml

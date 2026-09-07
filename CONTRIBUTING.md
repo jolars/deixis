@@ -9,8 +9,8 @@ Discuss changes that alter those boundaries before building on them.
 ## Development environment
 
 The repository pins Rust 1.98.0 in `rust-toolchain.toml`. The preferred
-environment is devenv, which supplies `go-task`, `cargo-audit`, `cargo-deny`,
-clippy, rustfmt, and the repository's pre-commit hooks.
+environment is devenv, which supplies `go-task`, Python, `cargo-audit`,
+`cargo-deny`, clippy, rustfmt, and the repository's pre-commit hooks.
 
 Run the complete local gate with:
 
@@ -24,6 +24,7 @@ The individual commands are:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --locked
+python3 -m unittest discover -s benchmarks/agent/tests -v
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 

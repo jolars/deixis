@@ -1,0 +1,54 @@
+schema_version = 1
+
+# Pin these for the entire experiment.
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+repetitions = 2
+seed = 20260907
+agent_timeout_seconds = 1200
+evaluation_timeout_seconds = 1200
+
+codex_command = "codex"
+deixis_command = "../../target/release/deixis"
+deixis_config = "../../examples/config.toml"
+
+arms = [
+  "control",
+  "deixis_available",
+  "instruction_only",
+  "deixis_instructed",
+]
+
+instruction = """
+Use typed LSP tools for definitions, references, implementations, symbols,
+hover information, and diagnostics when they are available and relevant.
+Otherwise, use ordinary repository tools.
+"""
+
+[environment]
+RUST_BACKTRACE = "1"
+
+[[tasks]]
+id = "rust-cross-file"
+repository = "/absolute/path/to/a/local/repository"
+revision = "parent-of-the-fixing-commit"
+prompt = """
+Fix the bug described below. Add or update tests as appropriate, and run the
+relevant test suite before finishing.
+
+Paste the original issue statement here without file paths from the eventual
+fix or other solution leakage.
+"""
+precheck_command = ["cargo", "test", "--test", "held_out_regression"]
+expected_precheck_exit_code = 101
+evaluation_command = ["cargo", "test", "--test", "held_out_regression"]
+expected_evaluation_exit_code = 0
+tags = ["rust", "semantic", "cross-file"]
+
+[[tasks]]
+id = "rust-local-control"
+repository = "/absolute/path/to/a/second/local/repository"
+revision = "parent-of-the-fixing-commit"
+prompt_file = "tasks/rust-local-control.md"
+evaluation_command = ["cargo", "test", "localized_regression"]
+tags = ["rust", "localized", "control"]

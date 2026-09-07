@@ -16,6 +16,11 @@ tasks:
     cmds:
       - cargo test --all-targets --locked
 
+  benchmark-test:
+    desc: Test the agent benchmark harness.
+    cmds:
+      - python3 -m unittest discover -s benchmarks/agent/tests -v
+
   compatibility:
     desc: Test against the real language-server compatibility matrix.
     cmds:
@@ -28,4 +33,4 @@ tasks:
 
   check:
     desc: Run the same checks as CI.
-    deps: [fmt, lint, test, docs]
+    deps: [fmt, lint, test, benchmark-test, docs]

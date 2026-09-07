@@ -21,6 +21,14 @@ artifacts; the locked test suite passes on Linux, macOS, and Windows; each
 artifact is traceable to its source; and the registry entry advertises only the
 shipped stdio surface.
 
+## Evaluation
+
+- [x] Add a randomized agent-level harness that separates Deixis availability
+  from LSP-directed instructions and records success, tokens, time, tool calls,
+  and patches.
+- [ ] Curate a multilingual pilot task set and publish the first benchmark
+  results with pinned Codex, Deixis, and language-server versions.
+
 ## Mutating operations
 
 - [x] Specify the `WorkspaceEdit` safety contract in `DESIGN.md`: preview,

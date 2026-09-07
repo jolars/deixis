@@ -5,6 +5,7 @@
     cargo-audit
     cargo-deny
     go-task
+    python3
   ];
 
   languages.rust = {
