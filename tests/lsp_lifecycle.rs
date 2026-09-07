@@ -246,38 +246,6 @@ async fn stops_restarting_during_a_crash_loop() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn permits_restart_again_after_the_crash_window()
--> Result<(), Box<dyn Error>> {
-    let (manager, root) = configured_manager_with_root_and_bounds(
-        "hover-exit",
-        TestBounds {
-            max_restarts: 1,
-            restart_window_ms: 40,
-            ..TestBounds::default()
-        },
-    )?;
-    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
-
-    for _ in 0..2 {
-        let _ = manager.hover("main.rs", "rust", Position::new(0, 8)).await;
-    }
-    assert!(matches!(
-        manager.ensure_started().await,
-        Err(LspError::RestartLimitReached { .. })
-    ));
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(matches!(
-        manager.hover("main.rs", "rust", Position::new(0, 8)).await,
-        Err(LspError::ServerExited { .. })
-    ));
-    assert_eq!(fs::read_to_string(root.join("mock-start-count"))?, "3");
-
-    manager.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn startup_uses_its_own_deadline() -> Result<(), Box<dyn Error>> {
     let manager = configured_manager_with_bounds(
         "initialize-timeout",

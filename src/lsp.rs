@@ -56,7 +56,38 @@ struct LifecycleState {
     running: Option<RunningServer>,
     start_attempted: bool,
     stopped: bool,
-    restart_attempts: VecDeque<Instant>,
+    restart_history: RestartHistory,
+}
+
+#[derive(Default)]
+struct RestartHistory {
+    attempts: VecDeque<Instant>,
+}
+
+impl RestartHistory {
+    fn try_record(
+        &mut self,
+        now: Instant,
+        max_restarts: usize,
+        window: Duration,
+    ) -> bool {
+        while self
+            .attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= window)
+        {
+            self.attempts.pop_front();
+        }
+        if self.attempts.len() >= max_restarts {
+            return false;
+        }
+        self.attempts.push_back(now);
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.attempts.len()
+    }
 }
 
 impl LazyLanguageServer {
@@ -1149,12 +1180,11 @@ impl LazyLanguageServer {
         if restarting {
             let now = Instant::now();
             let restart = self.config.restart();
-            while state.restart_attempts.front().is_some_and(|attempt| {
-                now.duration_since(*attempt) >= restart.window()
-            }) {
-                state.restart_attempts.pop_front();
-            }
-            if state.restart_attempts.len() >= restart.max_restarts() {
+            if !state.restart_history.try_record(
+                now,
+                restart.max_restarts(),
+                restart.window(),
+            ) {
                 let stderr = match state.running.as_ref() {
                     Some(running) => running.active.stderr_context().await,
                     None => None,
@@ -1173,14 +1203,13 @@ impl LazyLanguageServer {
                     stderr,
                 });
             }
-            state.restart_attempts.push_back(now);
         }
 
         if let Some(running) = state.running.take() {
             let stderr = running.active.stderr_context().await;
             warn!(
                 server = %self.config.name(),
-                restart_attempt = state.restart_attempts.len(),
+                restart_attempt = state.restart_history.len(),
                 failure = ?failure,
                 stderr = stderr.as_deref().unwrap_or("<none>"),
                 "restarting language server after transport failure"
@@ -4271,17 +4300,32 @@ async fn read_lsp_message(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, sync::Arc};
+    use std::{path::Path, sync::Arc, time::Duration};
 
     use serde_json::{Value as JsonValue, json};
-    use tokio::sync::mpsc;
+    use tokio::{sync::mpsc, time::Instant};
 
     use crate::config::Config;
 
     use super::{
         ActiveServer, Hover, LspError, ReadinessSource, ReadinessState,
-        ReadinessTracker, ServerStatus, StderrCapture,
+        ReadinessTracker, RestartHistory, ServerStatus, StderrCapture,
     };
+
+    #[test]
+    fn restart_history_allows_restarts_at_the_window_boundary() {
+        let mut history = RestartHistory::default();
+        let started = Instant::now();
+        let window = Duration::from_millis(40);
+
+        assert!(history.try_record(started, 1, window));
+        assert!(!history.try_record(
+            started + Duration::from_millis(39),
+            1,
+            window
+        ));
+        assert!(history.try_record(started + window, 1, window));
+    }
 
     #[tokio::test]
     async fn applies_outbound_queue_and_concurrency_limits() {
