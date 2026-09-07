@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if let Some(method) = message.get("method").and_then(Json::as_str) {
             if let Some(id) = message.get("id").cloned() {
+                let params_present = message.get("params").is_some();
                 handle_request(
                     &mode,
                     &output,
@@ -40,14 +41,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     id,
                     method,
                     message.get("params").cloned().unwrap_or(Json::Null),
+                    params_present,
                 )?;
+                if method == "shutdown" && mode == "exit-during-shutdown" {
+                    return Ok(());
+                }
             } else {
+                let params_present = message.get("params").is_some();
                 handle_notification(
                     &mode,
                     &output,
                     &state,
                     method,
                     message.get("params").cloned().unwrap_or(Json::Null),
+                    params_present,
                 )?;
                 if method == "exit" && mode != "ignore-shutdown" {
                     return Ok(());
@@ -89,6 +96,7 @@ fn handle_request<R: BufRead>(
     id: Json,
     method: &str,
     params: Json,
+    params_present: bool,
 ) -> Result<(), Box<dyn Error>> {
     match method {
         "initialize" => {
@@ -1114,10 +1122,24 @@ fn handle_request<R: BufRead>(
             write_message(output, response(id, result))?;
         }
         "shutdown" => {
+            if mode == "exit-during-shutdown" {
+                return Ok(());
+            }
             if mode == "ignore-shutdown" {
                 loop {
                     thread::sleep(Duration::from_secs(60));
                 }
+            }
+            if mode == "strict-shutdown-params" && params_present {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32602,
+                        "shutdown must omit params".to_owned(),
+                    ),
+                )?;
+                return Ok(());
             }
             let mut state = state.lock().unwrap();
             if !state.open_documents.is_empty() {
@@ -1153,6 +1175,7 @@ fn handle_notification(
     state: &Arc<Mutex<MockState>>,
     method: &str,
     params: Json,
+    params_present: bool,
 ) -> Result<(), Box<dyn Error>> {
     match method {
         "initialized" => {
@@ -1215,9 +1238,16 @@ fn handle_notification(
             }
             state.document_events.push(notification(method, params));
         }
-        "exit" if mode == "ignore-shutdown" => loop {
-            thread::sleep(Duration::from_secs(60));
-        },
+        "exit" => {
+            if mode == "ignore-shutdown" {
+                loop {
+                    thread::sleep(Duration::from_secs(60));
+                }
+            }
+            if mode == "strict-shutdown-params" && params_present {
+                return Err("exit must omit params".into());
+            }
+        }
         _ => {}
     }
 
@@ -1412,8 +1442,14 @@ fn probe_client<R: BufRead>(
     )?;
     let show_message = read_response(input, 15)?;
 
-    write_message(output, request(16, "mock/unknownClientRequest", Json::Null))?;
-    let unknown = read_response(input, 16)?;
+    write_message(
+        output,
+        request(16, "workspace/diagnostic/refresh", Json::Null),
+    )?;
+    let diagnostic_refresh = read_response(input, 16)?;
+
+    write_message(output, request(17, "mock/unknownClientRequest", Json::Null))?;
+    let unknown = read_response(input, 17)?;
 
     write_message(
         output,
@@ -1816,6 +1852,10 @@ fn probe_client<R: BufRead>(
         (
             "diagnostic_version_support",
             Json::Bool(diagnostic_version_support),
+        ),
+        (
+            "diagnostic_refresh",
+            Json::Bool(diagnostic_refresh.get("result") == Some(&Json::Null)),
         ),
         ("work_done_progress", Json::Bool(work_done_progress)),
         (

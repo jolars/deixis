@@ -113,7 +113,7 @@ state, block unrelated servers, reorder notifications, or leak a child process.
 ## 5. Compatibility and usability
 
 - [x] Test the first routed tool manually against rust-analyzer.
-- [ ] Test against a TypeScript server, Pyright, gopls, clangd, and one language
+- [x] Test against a TypeScript server, Pyright, gopls, clangd, and one language
   server with unusual initialization requirements.
 - [ ] Document installation, full MCP client configuration, strict TOML schema,
   logging, timeouts, and troubleshooting.

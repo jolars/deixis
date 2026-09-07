@@ -16,6 +16,11 @@ tasks:
     cmds:
       - cargo test --all-targets --locked
 
+  compatibility:
+    desc: Test against the real language-server compatibility matrix.
+    cmds:
+      - nix develop .#compatibility --command cargo test --test real_language_servers -- --ignored --test-threads=1
+
   docs:
     desc: Build Rust documentation.
     cmds:

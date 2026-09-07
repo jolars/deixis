@@ -51,6 +51,21 @@ cargo test --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
+The opt-in compatibility suite exercises real TypeScript Language Server,
+Pyright, gopls, clangd, and Deno processes. Deno covers a server started through
+a subcommand with required initialization options. Nix supplies the versions
+pinned by `flake.lock`:
+
+```console
+task compatibility
+```
+
+Without Nix, install those five servers and run
+`cargo test --test real_language_servers -- --ignored --test-threads=1`.
+`DEIXIS_TYPESCRIPT_LANGUAGE_SERVER`, `DEIXIS_PYRIGHT_LANGSERVER`,
+`DEIXIS_GOPLS`, `DEIXIS_CLANGD`, and `DEIXIS_DENO` may override their respective
+executable paths.
+
 To run the current server with the current directory as the immutable project
 root:
 
@@ -203,9 +218,9 @@ Startup sends `initialize` and `initialized` within the configured startup
 deadline, records reported capabilities, correlates request IDs, forwards
 MCP client and timeout cancellation with `$/cancelRequest`,
 handles common server-to-client workspace messages, tracks dynamic registration
-state, tracks work-done progress and rust-analyzer server status, fails pending
-requests when a server exits, logs malformed server output without stopping the
-reader loop, rejects
+state, acknowledges diagnostic-refresh requests, tracks work-done progress and
+rust-analyzer server status, fails pending requests when a server exits, logs
+malformed server output without stopping the reader loop, rejects
 `workspace/applyEdit` while read-only, and shuts down with `shutdown`, `exit`,
 and a bounded forced-kill fallback.
 
@@ -222,10 +237,12 @@ filesystem rules, and file URIs normalize Windows backslashes while preserving
 drive-letter paths. Tests compile the portable mock language-server fixture with
 the platform executable suffix, including `.exe` on Windows.
 
-The shutdown sequence is platform-neutral at the protocol level: Deixis sends
-`shutdown`, sends `exit`, waits for the child, and uses Tokio's platform
-termination primitive if the configured timeout expires. The CI test matrix runs
-`cargo test --all-targets --locked` on Ubuntu, macOS, and Windows.
+The shutdown sequence is platform-neutral at the protocol level: Deixis sends a
+parameterless `shutdown`, sends a parameterless `exit` after the response, waits
+for the child, and uses Tokio's platform termination primitive if the configured
+timeout expires. A server that exits cleanly while handling `shutdown` is also
+accepted. The CI test matrix runs `cargo test --all-targets --locked` on Ubuntu,
+macOS, and Windows.
 
 ## Nix
 

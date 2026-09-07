@@ -97,6 +97,30 @@
         default = self.packages.${system}.deixis;
       });
 
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        in
+        {
+          compatibility = pkgs.mkShell {
+            packages = with pkgs; [
+              clang-tools
+              deno
+              go
+              gopls
+              pyright
+              toolchain
+              typescript-language-server
+            ];
+          };
+        }
+      );
+
       formatter = forAllSystems (system: (import nixpkgs { inherit system; }).nixfmt);
 
       homeManagerModules = {

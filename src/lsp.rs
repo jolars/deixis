@@ -2362,9 +2362,8 @@ impl RunningServer {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let shutdown_response_received = match self
             .active
-            .request_value(
+            .request_value_without_params(
                 "shutdown",
-                JsonValue::Null,
                 remaining,
                 &CancellationToken::new(),
             )
@@ -2372,13 +2371,24 @@ impl RunningServer {
         {
             Ok(_) => true,
             Err(LspError::RequestTimeout { .. }) => false,
+            Err(LspError::ServerExited { .. }) => {
+                let (forced, exit_status) = self.wait_or_kill(deadline).await?;
+                *self.active.status.lock().await =
+                    ServerSnapshot::not_started(&self.active.name);
+                self.join_io_tasks(deadline).await;
+                return Ok(ShutdownOutcome::stopped(
+                    false,
+                    forced,
+                    exit_status,
+                ));
+            }
             Err(error) => {
                 let _ = self.force_stop(shutdown_timeout).await;
                 return Err(error);
             }
         };
 
-        let _ = self.active.send_notification("exit", JsonValue::Null).await;
+        let _ = self.active.send_notification_without_params("exit").await;
         let (forced, exit_status) = self.wait_or_kill(deadline).await?;
         *self.active.status.lock().await =
             ServerSnapshot::not_started(&self.active.name);
@@ -2894,6 +2904,37 @@ impl ActiveServer {
         request_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<JsonValue, LspError> {
+        self.request_value_with_optional_params(
+            method,
+            Some(params),
+            request_timeout,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn request_value_without_params(
+        &self,
+        method: &str,
+        request_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<JsonValue, LspError> {
+        self.request_value_with_optional_params(
+            method,
+            None,
+            request_timeout,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn request_value_with_optional_params(
+        &self,
+        method: &str,
+        params: Option<JsonValue>,
+        request_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<JsonValue, LspError> {
         if cancellation.is_cancelled() {
             return Err(LspError::RequestCanceled {
                 server: self.name.clone(),
@@ -2939,12 +2980,14 @@ impl ActiveServer {
             requests.pending.insert(id, sender);
         }
 
-        let message = json!({
+        let mut message = json!({
             "jsonrpc": JSONRPC_VERSION,
             "id": id,
             "method": method,
-            "params": params,
         });
+        if let Some(params) = params {
+            message["params"] = params;
+        }
         if let Err(error) = self.send_message(message).await {
             self.requests.lock().await.pending.remove(&id);
             return Err(error);
@@ -3023,6 +3066,17 @@ impl ActiveServer {
             "jsonrpc": JSONRPC_VERSION,
             "method": method,
             "params": params,
+        }))
+        .await
+    }
+
+    async fn send_notification_without_params(
+        &self,
+        method: &str,
+    ) -> Result<(), LspError> {
+        self.send_message(json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "method": method,
         }))
         .await
     }
@@ -3339,6 +3393,11 @@ async fn handle_server_request(
         "workspace/configuration" => {
             let result = configuration_response(&active.configuration, &params);
             let _ = active.send_message(success_response(id, result)).await;
+        }
+        "workspace/diagnostic/refresh" => {
+            let _ = active
+                .send_message(success_response(id, JsonValue::Null))
+                .await;
         }
         "workspace/workspaceFolders" => {
             let uri = path_to_file_uri(&active.project_root);

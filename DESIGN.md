@@ -253,6 +253,12 @@ observed work has completed, and `indeterminate` when the server has emitted no
 usable readiness signal or reports degraded health. Initialization by itself
 leaves readiness `unknown`.
 
+Deixis acknowledges `workspace/diagnostic/refresh` when a server sends it, but
+does not advertise proactive refresh support. Diagnostics remain
+request-driven, and the next tool call asks the server for the current report.
+This defensive acknowledgement is required for compatibility with Pyright after
+it dynamically registers pull diagnostics.
+
 Public positions use zero-based `line` and `character` fields. Input positions
 and ranges for readable project files use UTF-8 code-unit offsets so the same
 request and result are stable regardless of the selected language server. The
@@ -445,10 +451,12 @@ with `rustc` and appends `std::env::consts::EXE_SUFFIX`, so Windows uses `.exe`
 while Unix-like systems use no suffix.
 
 The shutdown contract is the same on Linux, macOS, and Windows: send
-`shutdown`, send `exit`, wait for the child, and use Tokio's platform-specific
-kill primitive after the configured timeout. The GitHub Actions test matrix runs
-`cargo test --all-targets --locked` on Ubuntu, macOS, and Windows; formatting,
-Clippy, and rustdoc checks run on Ubuntu.
+parameterless `shutdown`, send parameterless `exit` after its response, wait for
+the child, and use Tokio's platform-specific kill primitive after the configured
+timeout. A server that exits cleanly while handling `shutdown` is accepted even
+if it omits the response. The GitHub Actions test matrix runs `cargo test
+--all-targets --locked` on Ubuntu, macOS, and Windows; formatting, Clippy, and
+rustdoc checks run on Ubuntu.
 
 ## Testing strategy
 
@@ -460,7 +468,8 @@ permanent test layers are:
   routing, diagnostics, cancellation, and malformed-message tests;
 - focused unit tests for configuration, path containment, position conversion,
   document versions, and result normalization; and
-- optional manual compatibility tests against real language servers.
+- opt-in compatibility tests against real TypeScript Language Server, Pyright,
+  gopls, clangd, and Deno processes supplied by a pinned Nix shell.
 
 CI must not download language servers or depend on network services. The mock
 server is part of the workspace and behaves identically on Linux, macOS, and

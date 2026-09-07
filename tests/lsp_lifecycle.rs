@@ -520,6 +520,7 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(!probe.workspace_symbol_resolve_support);
     assert!(probe.diagnostic_dynamic_registration);
     assert!(probe.diagnostic_version_support);
+    assert!(probe.diagnostic_refresh);
     assert!(probe.work_done_progress);
     assert!(probe.server_status_notification);
 
@@ -1524,6 +1525,32 @@ async fn clean_shutdown_does_not_wait_for_full_timeout()
 }
 
 #[tokio::test]
+async fn shutdown_and_exit_omit_parameters() -> Result<(), Box<dyn Error>> {
+    let manager = configured_manager("strict-shutdown-params", 1_000, 1_000)?;
+
+    manager.ensure_started().await?;
+    let outcome = manager.shutdown().await?;
+
+    assert!(outcome.shutdown_response_received());
+    assert!(outcome.exit_status().is_some_and(|status| status.success()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepts_a_clean_exit_while_awaiting_shutdown_response()
+-> Result<(), Box<dyn Error>> {
+    let manager = configured_manager("exit-during-shutdown", 1_000, 1_000)?;
+
+    manager.ensure_started().await?;
+    let outcome = manager.shutdown().await?;
+
+    assert!(!outcome.shutdown_response_received());
+    assert!(!outcome.forced());
+    assert!(outcome.exit_status().is_some_and(|status| status.success()));
+    Ok(())
+}
+
+#[tokio::test]
 async fn force_kills_an_unresponsive_server_on_shutdown()
 -> Result<(), Box<dyn Error>> {
     let manager = configured_manager("ignore-shutdown", 1_000, 100)?;
@@ -1743,6 +1770,7 @@ struct ProbeResponse {
     workspace_symbol_resolve_support: bool,
     diagnostic_dynamic_registration: bool,
     diagnostic_version_support: bool,
+    diagnostic_refresh: bool,
     work_done_progress: bool,
     server_status_notification: bool,
 }
