@@ -781,13 +781,9 @@ impl LazyLanguageServer {
                 encoding,
             ));
         };
-        if !path.starts_with(self.project.root()) {
-            return Ok(DefinitionTarget::unconverted(
-                range,
-                selection_range,
-                encoding,
-            ));
-        }
+        // Canonical resolution performs the containment check. A lexical
+        // prefix check rejects equivalent paths such as Windows file URLs,
+        // which omit the canonical path's verbatim prefix.
         let Ok(file) = self.project.resolve_file(&path) else {
             return Ok(DefinitionTarget::unconverted(
                 range,

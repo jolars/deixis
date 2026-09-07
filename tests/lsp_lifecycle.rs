@@ -627,7 +627,10 @@ async fn distinguishes_current_stale_and_unavailable_push_diagnostics()
     let source = root.join("main.rs");
     fs::write(&source, "let answer = 42;\n")?;
     manager.ensure_started().await?;
-    let uri = url::Url::from_file_path(&source).unwrap().to_string();
+    let canonical_source = fs::canonicalize(&source)?;
+    let uri = url::Url::from_file_path(canonical_source)
+        .unwrap()
+        .to_string();
 
     let publish = |version: Option<i32>, message: &str| {
         let mut params = json!({
