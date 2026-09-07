@@ -7,8 +7,8 @@ capabilities without adding another filesystem, shell, editor, index, or memory
 layer.
 
 > [!WARNING]
-> Deixis is pre-alpha. The read-only tool set works, but no release binaries or
-> stability guarantees are available yet.
+> Deixis is pre-alpha. The read-only tool set works, but no stability guarantees
+> are available yet.
 
 ## Capabilities
 
@@ -37,9 +37,36 @@ See [DESIGN.md](DESIGN.md) for the protocol and architecture and
 
 ## Installation
 
-Deixis currently installs from source. Language servers are separate programs;
-install the ones you configure and make them visible in the environment of the
-MCP host.
+Language servers are separate programs; install the ones you configure and make
+them visible in the environment of the MCP host.
+
+### Prebuilt binaries
+
+The [latest GitHub release] provides archives for x86-64 and ARM64 Linux, Intel
+and Apple silicon macOS, and x86-64 Windows. Linux releases include both glibc
+and static musl builds.
+
+Install the appropriate release automatically on Linux or macOS:
+
+```console
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/jolars/deixis/releases/latest/download/deixis-installer.sh | sh
+```
+
+Or from PowerShell on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/jolars/deixis/releases/latest/download/deixis-installer.ps1 | iex"
+```
+
+The installers place `deixis` in Cargo's binary directory. Each release also
+includes SHA-256 checksums and GitHub build attestations. Verify a downloaded
+archive with:
+
+```console
+gh attestation verify deixis-aarch64-apple-darwin.tar.xz --repo jolars/deixis
+```
+
+[latest GitHub release]: https://github.com/jolars/deixis/releases/latest
 
 ### Nix
 

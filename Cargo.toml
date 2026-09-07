@@ -45,3 +45,8 @@ tokio = { version = "1.53.1", features = ["process", "time"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

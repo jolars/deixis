@@ -11,8 +11,8 @@ belongs in the [changelog](CHANGELOG.md) and Git history.
   watcher is adopted, specify overflow, rename, deletion, symlink, ignore, and
   cross-platform behavior before implementation; otherwise, record the reason
   for deferral in `DESIGN.md`.
-- [ ] Produce release binaries for Linux, macOS, and Windows after the source
-  build is stable. Publish checksums and provenance with every artifact.
+- [x] Automate release binaries for Linux, macOS, and Windows. Publish SHA-256
+  checksums and GitHub build attestations with every artifact.
 - [ ] Publish the first functional read-only release and add its MCP Registry
   metadata.
 
