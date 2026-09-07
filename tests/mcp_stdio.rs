@@ -289,7 +289,7 @@ async fn discovers_the_user_config_without_fixing_the_project_root()
 }
 
 #[tokio::test]
-async fn every_tool_has_a_stable_text_fallback_and_structured_output()
+async fn semantic_tools_have_stable_text_fallbacks_and_structured_output()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("stable-text-renderers")?;
     fs::write(root.join("main.rs"), "let answer = 42; xx\n")?;
@@ -458,6 +458,456 @@ async fn every_tool_has_a_stable_text_fallback_and_structured_output()
             _ => assert_eq!(structured["locations"][0]["server"], "mock-lsp"),
         }
     }
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rename_tools_publish_their_safety_contracts()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("rename-tool-contracts")?;
+    let config_path = write_mock_config(&root)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--allow-mutation");
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+
+    let prepare = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "prepare_rename")
+        .expect("configured servers should expose prepare_rename");
+    assert_eq!(
+        prepare.input_schema.get("required"),
+        Some(&json!(["path", "position"]))
+    );
+    assert_eq!(
+        prepare
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+
+    let preview = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "preview_rename")
+        .expect("configured servers should expose preview_rename");
+    assert_eq!(
+        preview.input_schema.get("required"),
+        Some(&json!(["path", "position", "newName"]))
+    );
+    assert_eq!(
+        preview
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+
+    let apply = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "apply_rename")
+        .expect("configured servers should expose apply_rename");
+    assert_eq!(
+        apply.input_schema.get("required"),
+        Some(&json!(["previewId"]))
+    );
+    let annotations = apply
+        .annotations
+        .as_ref()
+        .expect("apply_rename should publish annotations");
+    assert_eq!(annotations.read_only_hint, Some(false));
+    assert_eq!(annotations.destructive_hint, Some(true));
+    assert_eq!(annotations.idempotent_hint, Some(false));
+    assert_eq!(annotations.open_world_hint, Some(false));
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mutation_is_disabled_by_default() -> Result<(), Box<dyn Error>> {
+    let root = unique_dir("mutation-disabled")?;
+    let config_path = write_mock_config(&root)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+    assert!(tools.tools.iter().any(|tool| tool.name == "preview_rename"));
+    assert!(tools.tools.iter().all(|tool| tool.name != "apply_rename"));
+
+    let error = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("apply_rename")),
+    )
+    .await?
+    .expect_err("disabled mutation must not be callable");
+    assert!(error.to_string().contains("-32601"), "{error}");
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn previews_and_applies_a_multi_file_rename_exactly_once()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("rename-multi-file")?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+    fs::write(root.join("other.rs"), "old();\n")?;
+    let config_path = write_mock_config_for_mode(&root, "rename-multi-file")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--allow-mutation");
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let prepare_arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 4 },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let prepared = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("prepare_rename")
+                .with_arguments(prepare_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(prepared.is_error, Some(false));
+    assert_eq!(prepared.structured_content.as_ref().unwrap()["valid"], true);
+    assert_eq!(
+        prepared.structured_content.as_ref().unwrap()["placeholder"],
+        "old"
+    );
+
+    let preview_arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 4 },
+        "newName": "fresh",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let preview = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("preview_rename")
+                .with_arguments(preview_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(preview.is_error, Some(false));
+    let structured = preview.structured_content.as_ref().unwrap();
+    assert_eq!(structured["fileCount"], 2);
+    assert_eq!(structured["editCount"], 2);
+    assert_eq!(structured["files"][0]["path"], "main.rs");
+    assert_eq!(structured["files"][1]["path"], "other.rs");
+    let preview_id = structured["previewId"]
+        .as_str()
+        .expect("a nonempty rename should create a preview")
+        .to_owned();
+    let text = &preview.content[0].as_text().unwrap().text;
+    assert!(text.contains("--- a/main.rs"), "{text}");
+    assert!(text.contains("+++ b/other.rs"), "{text}");
+    assert!(text.contains("apply_rename"), "{text}");
+    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "let old = 1;\n");
+    assert_eq!(fs::read_to_string(root.join("other.rs"))?, "old();\n");
+
+    let apply_arguments = json!({ "previewId": preview_id })
+        .as_object()
+        .unwrap()
+        .clone();
+    let applied = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("apply_rename")
+                .with_arguments(apply_arguments.clone()),
+        ),
+    )
+    .await??;
+    assert_eq!(applied.is_error, Some(false));
+    let structured = applied.structured_content.as_ref().unwrap();
+    assert_eq!(structured["applied"], true);
+    assert_eq!(structured["fileCount"], 2);
+    assert_eq!(structured["editCount"], 2);
+    assert_eq!(structured["warnings"], json!([]));
+    assert_eq!(
+        fs::read_to_string(root.join("main.rs"))?,
+        "let fresh = 1;\n"
+    );
+    assert_eq!(fs::read_to_string(root.join("other.rs"))?, "fresh();\n");
+    assert!(fs::read_dir(&root)?.all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".deixis-")
+    }));
+
+    let repeated = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("apply_rename")
+                .with_arguments(apply_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(repeated.is_error, Some(true));
+    assert_eq!(
+        repeated.structured_content.as_ref().unwrap()["error"]["code"],
+        "invalid_preview"
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refuses_a_stale_rename_preview_without_partial_changes()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("rename-conflict")?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+    fs::write(root.join("other.rs"), "old();\n")?;
+    let config_path = write_mock_config_for_mode(&root, "rename-multi-file")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--allow-mutation");
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let preview_arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 4 },
+        "newName": "fresh",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let preview = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("preview_rename")
+                .with_arguments(preview_arguments),
+        ),
+    )
+    .await??;
+    let preview_id = preview.structured_content.as_ref().unwrap()["previewId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::write(root.join("other.rs"), "changed externally\n")?;
+
+    let apply_arguments = json!({ "previewId": preview_id })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("apply_rename")
+                .with_arguments(apply_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["error"]["code"],
+        "edit_conflict"
+    );
+    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "let old = 1;\n");
+    assert_eq!(
+        fs::read_to_string(root.join("other.rs"))?,
+        "changed externally\n"
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refreshes_open_documents_after_applying_a_rename()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("rename-refresh")?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+    let config_path = write_mock_config_for_mode(&root, "rename-buffer-state")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--allow-mutation");
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let preview = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("preview_rename").with_arguments(
+                json!({
+                    "path": "main.rs",
+                    "position": { "line": 0, "character": 4 },
+                    "newName": "fresh",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        ),
+    )
+    .await??;
+    let preview_id = preview.structured_content.as_ref().unwrap()["previewId"]
+        .as_str()
+        .unwrap();
+    let applied = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("apply_rename").with_arguments(
+                json!({ "previewId": preview_id })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        ),
+    )
+    .await??;
+    assert_eq!(applied.is_error, Some(false));
+
+    let symbols = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("workspace_symbols").with_arguments(
+                json!({ "query": "" }).as_object().unwrap().clone(),
+            ),
+        ),
+    )
+    .await??;
+    assert_eq!(symbols.is_error, Some(false));
+    assert_eq!(
+        symbols.structured_content.as_ref().unwrap()["symbols"][0]["name"],
+        "fresh"
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn treats_empty_rename_edit_arrays_as_no_changes()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("rename-empty")?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+    let config_path = write_mock_config_for_mode(&root, "rename-empty")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--allow-mutation");
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let preview = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("preview_rename").with_arguments(
+                json!({
+                    "path": "main.rs",
+                    "position": { "line": 0, "character": 4 },
+                    "newName": "fresh",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        ),
+    )
+    .await??;
+
+    assert_eq!(preview.is_error, Some(false));
+    let structured = preview.structured_content.as_ref().unwrap();
+    assert_eq!(structured["previewId"], JsonValue::Null);
+    assert_eq!(structured["fileCount"], 0);
+    assert_eq!(structured["editCount"], 0);
+    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "let old = 1;\n");
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_rename_resource_operations_at_the_mcp_boundary()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("rename-resource")?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+    let config_path = write_mock_config_for_mode(&root, "rename-resource")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 4 },
+        "newName": "fresh",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("preview_rename")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["error"]["code"],
+        "invalid_workspace_edit"
+    );
+    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "let old = 1;\n");
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())

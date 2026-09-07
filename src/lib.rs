@@ -5,3 +5,4 @@ pub mod lsp;
 pub mod mcp;
 pub mod positions;
 pub mod project;
+pub mod workspace_edits;

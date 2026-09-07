@@ -10,11 +10,16 @@ use std::{
 pub struct CliOptions {
     config_path: Option<PathBuf>,
     root: Option<PathBuf>,
+    allow_mutation: bool,
 }
 
 impl CliOptions {
     pub fn new(config_path: Option<PathBuf>, root: Option<PathBuf>) -> Self {
-        Self { config_path, root }
+        Self {
+            config_path,
+            root,
+            allow_mutation: false,
+        }
     }
 
     pub fn parse_env() -> Result<Self, CliError> {
@@ -44,6 +49,11 @@ impl CliOptions {
             } else if let Some(value) = inline_value(arg.as_os_str(), "--root=")
             {
                 set_path(&mut options.root, "--root", value)?;
+            } else if arg.as_os_str() == OsStr::new("--allow-mutation") {
+                if options.allow_mutation {
+                    return Err(CliError::DuplicateOption("--allow-mutation"));
+                }
+                options.allow_mutation = true;
             } else {
                 return Err(CliError::UnknownArgument(arg));
             }
@@ -58,6 +68,10 @@ impl CliOptions {
 
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    pub fn allow_mutation(&self) -> bool {
+        self.allow_mutation
     }
 }
 
@@ -138,11 +152,14 @@ mod tests {
             "--config",
             "deixis.toml",
             "--root=/workspace/project",
+            "--allow-mutation",
         ])
         .unwrap();
 
         assert_eq!(options.config_path(), Some(Path::new("deixis.toml")));
         assert_eq!(options.root(), Some(Path::new("/workspace/project")));
+        assert!(options.allow_mutation());
+        assert!(!CliOptions::default().allow_mutation());
     }
 
     #[test]
@@ -167,5 +184,13 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(error, CliError::DuplicateOption("--root"));
+
+        let error = CliOptions::parse_from([
+            "deixis",
+            "--allow-mutation",
+            "--allow-mutation",
+        ])
+        .unwrap_err();
+        assert_eq!(error, CliError::DuplicateOption("--allow-mutation"));
     }
 }

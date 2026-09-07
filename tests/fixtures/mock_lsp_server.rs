@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
     fmt,
@@ -177,6 +177,14 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let rename_provider = match mode {
+                "rename-unsupported" => Json::Bool(false),
+                "rename-no-prepare" => Json::Bool(true),
+                _ => json_object([
+                    ("prepareProvider", Json::Bool(true)),
+                    ("workDoneProgress", Json::Bool(true)),
+                ]),
+            };
             let document_symbol_provider =
                 Json::Bool(mode != "document-symbols-unsupported");
             let workspace_symbol_provider =
@@ -203,6 +211,7 @@ fn handle_request<R: BufRead>(
                     implementation_provider,
                 ),
                 ("referencesProvider".to_owned(), references_provider),
+                ("renameProvider".to_owned(), rename_provider),
                 ("textDocumentSync".to_owned(), text_document_sync),
                 (
                     "typeDefinitionProvider".to_owned(),
@@ -793,6 +802,194 @@ fn handle_request<R: BufRead>(
             };
             write_message(output, response(id, result))?;
         }
+        "textDocument/prepareRename" => {
+            if mode == "rename-unsupported" || mode == "rename-no-prepare" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "prepare rename request bypassed capability gate"
+                            .to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+            let position = params.get("position").cloned().unwrap_or(Json::Null);
+            let start = position.get("character").and_then(Json::as_i64).unwrap_or(0);
+            let line = position.get("line").and_then(Json::as_i64).unwrap_or(0);
+            let result = match mode {
+                "prepare-rename-null" => Json::Null,
+                "prepare-rename-default" => {
+                    json_object([("defaultBehavior", Json::Bool(true))])
+                }
+                "prepare-rename-range" => json_object([
+                    (
+                        "start",
+                        json_object([
+                            ("line", Json::Number(line)),
+                            ("character", Json::Number(start)),
+                        ]),
+                    ),
+                    (
+                        "end",
+                        json_object([
+                            ("line", Json::Number(line)),
+                            ("character", Json::Number(start + 3)),
+                        ]),
+                    ),
+                ]),
+                _ => json_object([
+                    (
+                        "range",
+                        json_object([
+                            (
+                                "start",
+                                json_object([
+                                    ("line", Json::Number(line)),
+                                    ("character", Json::Number(start)),
+                                ]),
+                            ),
+                            (
+                                "end",
+                                json_object([
+                                    ("line", Json::Number(line)),
+                                    ("character", Json::Number(start + 3)),
+                                ]),
+                            ),
+                        ]),
+                    ),
+                    ("placeholder", Json::String("old".to_owned())),
+                ]),
+            };
+            write_message(output, response(id, result))?;
+        }
+        "textDocument/rename" => {
+            if mode == "rename-unsupported" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "rename request bypassed capability gate".to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+            if mode == "rename-null" {
+                write_message(output, response(id, Json::Null))?;
+                return Ok(());
+            }
+            let source_uri = params
+                .get("textDocument")
+                .and_then(|document| document.get("uri"))
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            if mode == "rename-delayed"
+                && let Ok(barrier) = env::var("DEIXIS_MOCK_RENAME_BARRIER")
+            {
+                fs::write(barrier, b"received")?;
+            }
+            if mode == "rename-resource" {
+                write_message(
+                    output,
+                    response(
+                        id,
+                        json_object([(
+                            "documentChanges",
+                            Json::Array(vec![json_object([
+                                ("kind", Json::String("delete".to_owned())),
+                                ("uri", Json::String(source_uri.to_owned())),
+                            ])]),
+                        )]),
+                    ),
+                )?;
+                return Ok(());
+            }
+            if mode == "rename-empty" {
+                write_message(
+                    output,
+                    response(
+                        id,
+                        json_object([(
+                            "changes",
+                            Json::Object(vec![(
+                                source_uri.to_owned(),
+                                Json::Array(Vec::new()),
+                            )]),
+                        )]),
+                    ),
+                )?;
+                return Ok(());
+            }
+            let position = params.get("position");
+            let line = position
+                .and_then(|position| position.get("line"))
+                .and_then(Json::as_i64)
+                .unwrap_or(0);
+            let character = position
+                .and_then(|position| position.get("character"))
+                .and_then(Json::as_i64)
+                .unwrap_or(0);
+            let new_name = params
+                .get("newName")
+                .and_then(Json::as_str)
+                .unwrap_or("new");
+            let text_edit = json_object([
+                (
+                    "range",
+                    json_object([
+                        (
+                            "start",
+                            json_object([
+                                ("line", Json::Number(line)),
+                                ("character", Json::Number(character)),
+                            ]),
+                        ),
+                        (
+                            "end",
+                            json_object([
+                                ("line", Json::Number(line)),
+                                ("character", Json::Number(character + 3)),
+                            ]),
+                        ),
+                    ]),
+                ),
+                ("newText", Json::String(new_name.to_owned())),
+            ]);
+            let mut changes = vec![(
+                source_uri.to_owned(),
+                Json::Array(vec![text_edit]),
+            )];
+            if mode == "rename-multi-file" {
+                let other_uri = source_uri
+                    .rsplit_once('/')
+                    .map_or_else(
+                        || format!("{source_uri}.other"),
+                        |(parent, _)| format!("{parent}/other.rs"),
+                    );
+                changes.push((
+                    other_uri,
+                    Json::Array(vec![json_object([
+                        ("range", mock_range(0, 3)),
+                        ("newText", Json::String(new_name.to_owned())),
+                    ])]),
+                ));
+            }
+            let result = response(
+                id,
+                json_object([("changes", Json::Object(changes))]),
+            );
+            if mode == "rename-delayed" {
+                let output = Arc::clone(output);
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(150));
+                    let _ = write_message(&output, result);
+                });
+            } else {
+                write_message(output, result)?;
+            }
+        }
         "textDocument/documentSymbol" => {
             if mode == "document-symbols-unsupported" {
                 write_message(
@@ -1062,8 +1259,20 @@ fn handle_request<R: BufRead>(
                 .get("rootUri")
                 .and_then(Json::as_str)
                 .unwrap_or("file:///mock");
-            let name = env::var("DEIXIS_MOCK_WORKSPACE_NAME")
-                .unwrap_or_else(|_| "mockSymbol".to_owned());
+            let name = if mode == "rename-buffer-state" {
+                state
+                    .lock()
+                    .unwrap()
+                    .document_texts
+                    .values()
+                    .find_map(|text| {
+                        text.contains("fresh").then(|| "fresh".to_owned())
+                    })
+                    .unwrap_or_else(|| "old".to_owned())
+            } else {
+                env::var("DEIXIS_MOCK_WORKSPACE_NAME")
+                    .unwrap_or_else(|_| "mockSymbol".to_owned())
+            };
             let (start, end) = if mode == "workspace-symbol-wait-utf-16" {
                 (6, 12)
             } else {
@@ -1217,15 +1426,39 @@ fn handle_notification(
                 .and_then(Json::as_str)
             {
                 state.open_documents.insert(uri.to_owned());
+                if let Some(text) = params
+                    .get("textDocument")
+                    .and_then(|document| document.get("text"))
+                    .and_then(Json::as_str)
+                {
+                    state
+                        .document_texts
+                        .insert(uri.to_owned(), text.to_owned());
+                }
             }
             state.document_events.push(notification(method, params));
         }
         "textDocument/didChange" => {
-            state
-                .lock()
-                .unwrap()
-                .document_events
-                .push(notification(method, params));
+            let mut state = state.lock().unwrap();
+            if let (Some(uri), Some(text)) = (
+                params
+                    .get("textDocument")
+                    .and_then(|document| document.get("uri"))
+                    .and_then(Json::as_str),
+                params
+                    .get("contentChanges")
+                    .and_then(|changes| match changes {
+                        Json::Array(changes) => changes.first(),
+                        _ => None,
+                    })
+                    .and_then(|change| change.get("text"))
+                    .and_then(Json::as_str),
+            ) {
+                state
+                    .document_texts
+                    .insert(uri.to_owned(), text.to_owned());
+            }
+            state.document_events.push(notification(method, params));
         }
         "textDocument/didClose" => {
             let mut state = state.lock().unwrap();
@@ -1235,6 +1468,7 @@ fn handle_notification(
                 .and_then(Json::as_str)
             {
                 state.open_documents.remove(uri);
+                state.document_texts.remove(uri);
             }
             state.document_events.push(notification(method, params));
         }
@@ -1507,6 +1741,11 @@ fn probe_client<R: BufRead>(
         workspace_symbol_resolve_support,
         diagnostic_dynamic_registration,
         diagnostic_version_support,
+        workspace_edit_document_changes,
+        workspace_edit_failure_handling,
+        rename_dynamic_registration,
+        rename_prepare_support,
+        rename_prepare_support_default_behavior,
         work_done_progress,
         server_status_notification,
     ) = {
@@ -1649,6 +1888,32 @@ fn probe_client<R: BufRead>(
             .and_then(|diagnostics| diagnostics.get("versionSupport"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let workspace_edit = capabilities
+            .get("workspace")
+            .and_then(|workspace| workspace.get("workspaceEdit"));
+        let workspace_edit_document_changes = workspace_edit
+            .and_then(|workspace_edit| workspace_edit.get("documentChanges"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let workspace_edit_failure_handling = workspace_edit
+            .and_then(|workspace_edit| workspace_edit.get("failureHandling"))
+            .cloned()
+            .unwrap_or(Json::Null);
+        let rename = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("rename"));
+        let rename_dynamic_registration = rename
+            .and_then(|rename| rename.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let rename_prepare_support = rename
+            .and_then(|rename| rename.get("prepareSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let rename_prepare_support_default_behavior = rename
+            .and_then(|rename| rename.get("prepareSupportDefaultBehavior"))
+            .cloned()
+            .unwrap_or(Json::Null);
         let work_done_progress = capabilities
             .get("window")
             .and_then(|window| window.get("workDoneProgress"))
@@ -1685,6 +1950,11 @@ fn probe_client<R: BufRead>(
             workspace_symbol_resolve_support,
             diagnostic_dynamic_registration,
             diagnostic_version_support,
+            workspace_edit_document_changes,
+            workspace_edit_failure_handling,
+            rename_dynamic_registration,
+            rename_prepare_support,
+            rename_prepare_support_default_behavior,
             work_done_progress,
             server_status_notification,
         )
@@ -1852,6 +2122,26 @@ fn probe_client<R: BufRead>(
         (
             "diagnostic_version_support",
             Json::Bool(diagnostic_version_support),
+        ),
+        (
+            "workspace_edit_document_changes",
+            Json::Bool(workspace_edit_document_changes),
+        ),
+        (
+            "workspace_edit_failure_handling",
+            workspace_edit_failure_handling,
+        ),
+        (
+            "rename_dynamic_registration",
+            Json::Bool(rename_dynamic_registration),
+        ),
+        (
+            "rename_prepare_support",
+            Json::Bool(rename_prepare_support),
+        ),
+        (
+            "rename_prepare_support_default_behavior",
+            rename_prepare_support_default_behavior,
         ),
         (
             "diagnostic_refresh",
@@ -2068,6 +2358,7 @@ struct MockState {
     cancellations: BTreeSet<String>,
     document_events: Vec<Json>,
     open_documents: BTreeSet<String>,
+    document_texts: BTreeMap<String, String>,
     diagnostic_requests: usize,
     active_delays: usize,
     max_active_delays: usize,

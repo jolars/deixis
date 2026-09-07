@@ -23,16 +23,17 @@ shipped stdio surface.
 
 ## Mutating operations
 
-- [ ] Specify the `WorkspaceEdit` safety contract in `DESIGN.md`: preview,
+- [x] Specify the `WorkspaceEdit` safety contract in `DESIGN.md`: preview,
   authorization, version and content conflict detection, root containment,
   resource operations, atomic application, rollback, and failure reporting.
-- [ ] Build and test the internal validation and preview path before advertising
+- [x] Build and test the internal validation and preview path before advertising
   a mutating MCP tool.
-- [ ] Add prepare-rename and rename only after the edit contract is accepted.
+- [x] Add prepare-rename and rename only after the edit contract is accepted.
 - [ ] Add code-action discovery separately from code-action application.
 - [ ] Consider formatting only if whole-document edits fit the same safety
   contract.
-- [ ] Keep query-only deployments able to omit every mutation capability.
+- [x] Keep the default runtime query-only and gate mutation behind the explicit
+  `--allow-mutation` CLI flag.
 
 Acceptance: no edit is applied without an inspectable preview and explicit
 authorization; stale inputs fail without partial writes; rollback behavior is

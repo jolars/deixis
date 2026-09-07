@@ -13,9 +13,9 @@ parse explicit or user-owned startup configuration, negotiate an MCP session
 over stdio, report its name and version, route a project file to a server, start
 that server on demand, handle common server-to-client messages, continue after
 malformed server output, and shut down all started servers with a bounded
-forced-kill fallback. A configured session
-exposes the read-only `deixis_server_status` lifecycle probe and
-capability-gated navigation tools and a `diagnostics` tool. The semantic tools
+forced-kill fallback. A configured session exposes the read-only
+`deixis_server_status` lifecycle probe, capability-gated navigation tools, a
+`diagnostics` tool, and a guarded symbol-rename workflow. The semantic tools
 synchronize project-contained documents and translate negotiated position
 encodings. Hover returns structured markup; navigation normalizes LSP location
 variants and retains configured-server provenance. Diagnostics prefers pull
@@ -23,8 +23,9 @@ reports when advertised and otherwise exposes cached push reports with explicit
 freshness. Workspace-symbol search fans out concurrently across capable
 servers, then merges results in stable lexical server-name order with explicit
 provenance. Document symbols preserve server-provided hierarchies and normalize
-legacy flat responses to a common node shape. Every tool includes a concise
-text fallback.
+legacy flat responses to a common node shape. Rename separates validation and
+preview from an explicitly authorized, one-shot application. Every tool
+includes a concise text fallback.
 The status above and the user-facing capability list in `README.md` distinguish
 shipped behavior from future design. `TODO.md` contains only open work; Git
 history and `CHANGELOG.md` record completed development.
@@ -102,7 +103,7 @@ layer. It is not part of the first functional release.
 The invocation is:
 
 ```console
-deixis [--root <project>] [--config <config.toml>]
+deixis [--root <project>] [--config <config.toml>] [--allow-mutation]
 ```
 
 `--root` defaults to the current directory. The selected path is canonicalized
@@ -113,7 +114,9 @@ precedence over the platform user configuration directory. On Linux, that is
 configuration directories when `XDG_CONFIG_HOME` is unset. Deixis never
 discovers configuration in the project tree, so cloned content cannot silently
 authorize an executable command. Language-server definitions remain
-declarative TOML.
+declarative TOML. Mutation is disabled by default. `--allow-mutation` is an
+explicit, process-lifetime opt-in that adds mutating tools to the advertised and
+callable MCP surface.
 
 Configuration parsing rejects unknown fields. A server entry contains the
 following explicit concepts:
@@ -174,15 +177,18 @@ access, or command interpolation.
 ## MCP surface
 
 Without selected configuration, the current server advertises no tools. With
-configuration, it advertises ten read-only tools: `deixis_server_status`,
+configuration, it advertises twelve read-only tools: `deixis_server_status`,
 `hover`, `definition`, `declaration`, `type_definition`, `implementation`,
-`references`, `diagnostics`, `document_symbols`, and `workspace_symbols`. The
-probe accepts an optional server name and `start` flag. Without a name, it
-returns every configured server in stable lexical order with a compact `not
-started`, `running`, or `attached` state. `Attached` means that Deixis has
-synchronized at least one document with the current server process. With a
-name, the probe returns the detailed lifecycle, readiness, negotiated encoding,
-and capabilities for that server. Starting a server requires its explicit name.
+`references`, `diagnostics`, `document_symbols`, `workspace_symbols`,
+`prepare_rename`, and `preview_rename`. Starting Deixis with
+`--allow-mutation` advertises and enables `apply_rename` as a thirteenth tool.
+The probe accepts an optional server name and `start` flag.
+Without a name, it returns every configured server in stable lexical order with
+a compact `not started`, `running`, or `attached` state. `Attached` means that
+Deixis has synchronized at least one document with the current server process.
+With a name, the probe returns the detailed lifecycle, readiness, negotiated
+encoding, and capabilities for that server. Starting a server requires its
+explicit name.
 The position-based semantic tools take a root-contained path, a zero-based
 UTF-8 position, and an optional server override. They resolve the path before
 routing, infer the language ID, synchronize the document, verify the
@@ -233,6 +239,68 @@ extension fields when present. Location ranges in readable project files are
 translated to UTF-8; other locations retain the server's negotiated encoding.
 Deixis advertises workspace-symbol kind and tag support, but not lazy resolve
 support, so returned locations must include a range.
+
+### Workspace-edit and rename safety contract
+
+Rename is split across three tools. The mutating third step is available only
+when the process starts with `--allow-mutation`. `prepare_rename` calls
+`textDocument/prepareRename` when the selected server advertises prepare
+support. `preview_rename` calls `textDocument/rename`, normalizes the returned
+`WorkspaceEdit`, and returns structured per-file edits together with a unified
+diff. Neither tool changes the filesystem. `apply_rename` accepts only the
+opaque preview ID produced by `preview_rename`; possession of that ID is the
+explicit authorization to apply that exact set of edits. An ID is valid for ten
+minutes, may be used once, and is consumed by the first apply attempt whether
+that attempt succeeds or fails. The process retains at most 16 previews and 64
+MiB of source and replacement text, evicting the oldest previews as needed.
+
+The accepted `WorkspaceEdit` subset is intentionally narrow. Deixis supports
+the `changes` map and text-document edits in `documentChanges`; when both are
+present, `documentChanges` is authoritative. Every target must be an existing,
+readable UTF-8 file whose canonical path remains inside the immutable project
+root. Each canonical file may appear only once. Change annotations, annotated
+text edits, and resource operations such as create, rename, and delete are
+rejected. LSP ranges are converted from the negotiated server encoding to the
+public UTF-8 coordinate system, checked against the request-time document
+snapshots, sorted, and rejected if they overlap. If an edited document changes
+in the document store while the rename request is in flight, normalization
+returns an `edit_conflict` instead of interpreting the response against a newer
+buffer. A supplied document version must match the request-time synchronized
+document version; a version on an unsynchronized document is invalid.
+
+The preview retains the exact contents read for every target. Application
+compares every canonical path and its complete contents with that snapshot
+before staging and again before commit. Any mismatch produces an
+`edit_conflict` without intentional writes to a project file. Deixis stages
+each replacement as a new sibling file whose permissions are restricted to the
+target's permissions before any replacement content is written, then flushes
+its contents. It removes the current and prior stages after any staging error,
+and reports cleanup failures. Only after every replacement is staged, the
+second validation succeeds, and cancellation is checked again does it move
+each original to a unique sibling backup and install the staged replacement.
+The commit itself is not cancelable. A failure during commit triggers
+reverse-order rollback of every file touched by the transaction. An incomplete
+rollback receives the distinct
+`edit_rollback_failed` code. Semantic tool calls take a shared workspace lock,
+while apply holds it exclusively, so Deixis does not synchronize documents
+against its own partially committed transaction.
+
+After a successful commit, Deixis resynchronizes each affected document already
+open in the responsible language server before releasing the workspace lock.
+If refresh fails, it invalidates that server process so a later operation
+cannot reuse an authoritative stale buffer.
+
+This transaction protects against ordinary failures while the process remains
+alive. It does not provide a durable journal, directory synchronization, or
+recovery after process termination, operating-system failure, or power loss.
+Concurrent programs can also change files outside Deixis's lock; the two exact
+content checks are the correctness backstop before commit, but they cannot
+eliminate filesystem time-of-check/time-of-use races.
+
+Deixis advertises LSP workspace-edit support for text-only transactional
+failure handling and rename prepare support. It still rejects unsolicited
+server-to-client `workspace/applyEdit` requests: those requests bypass the MCP
+preview ID and therefore lack authorization.
 
 MCP hosts already namespace tools by server, so tool names do not repeat an
 `lsp_` prefix. Every handler checks the downstream server capability before
@@ -345,7 +413,8 @@ The client side handles the common requests language servers initiate:
 - dynamic capability registration and unregistration maintain in-memory state;
 - log-message, show-message, and show-message request traffic is represented in
   tracing output; and
-- `workspace/applyEdit` is rejected while the project is read-only.
+- `workspace/applyEdit` is rejected because server-initiated edits lack an
+  authorized MCP rename preview.
 
 Unknown requests receive the correct method-not-found response. Notifications
 that are not relevant may be ignored, but they must not stall the reader loop.
@@ -419,8 +488,10 @@ message, and optional data. The public codes are `invalid_path`,
 `invalid_position`, `unsupported_capability`, `request_timeout`, `server_busy`,
 `server_exited`, `lsp_error`, `server_start_failed`, `lsp_protocol_error`,
 `document_error`, `request_canceled`, `server_error`, `routing_error`,
-`no_server_configured`, and `unknown_server`. Malformed tool arguments remain
-MCP `invalid_params` protocol errors because tool execution has not begun.
+`no_server_configured`, `unknown_server`, `invalid_workspace_edit`,
+`invalid_preview`, `edit_conflict`, `edit_application_failed`, and
+`edit_rollback_failed`. Malformed tool arguments remain MCP `invalid_params`
+protocol errors because tool execution has not begun.
 
 When a language server closes stdout, the reader resolves every pending request
 immediately as a server-exit failure. Those calls do not wait for their
@@ -503,8 +574,8 @@ arguments are fixed when the MCP process starts. It also demonstrates the value
 of snapshotting tool output against several real language servers. Deixis keeps
 those lessons, but differs by supporting several configured servers in one
 project-scoped process, retaining structured LSP results instead of expanding
-definitions into source text, and deferring its rename and file-edit tools until
-a mutation safety contract exists.
+definitions into source text, and requiring an inspectable, one-shot-authorized
+preview before applying rename edits.
 
 The [official Rust MCP SDK] owns MCP framing and version negotiation. Deixis
 will not implement that protocol independently.
@@ -517,8 +588,8 @@ will not implement that protocol independently.
 
 ## Deferred work
 
-Rename, code actions, formatting, and any application of workspace edits require
-a separate design for preview, authorization, conflict detection, and rollback.
-Streamable HTTP, MCP resources and prompts, server installation, a built-in
-language catalog, multiple project roots, and long-running MCP tasks are also
-deferred until demonstrated use requires them.
+Code actions and formatting remain deferred; each would require its own public
+tool workflow even if it reused the rename transaction machinery. Streamable
+HTTP, MCP resources and prompts, server installation, a built-in language
+catalog, multiple project roots, and long-running MCP tasks are also deferred
+until demonstrated use requires them.

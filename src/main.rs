@@ -36,6 +36,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             root = %project.root().display(),
             config = ?config_path,
             configured_servers,
+            allow_mutation = startup.allow_mutation(),
             "starting deixis"
         );
     }

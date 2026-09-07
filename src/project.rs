@@ -127,6 +127,7 @@ impl Error for ProjectPathError {
 pub struct StartupState {
     project: Project,
     config: Option<Config>,
+    allow_mutation: bool,
 }
 
 impl StartupState {
@@ -176,6 +177,7 @@ impl StartupState {
                 config_path,
             },
             config,
+            allow_mutation: options.allow_mutation(),
         })
     }
 
@@ -185,6 +187,10 @@ impl StartupState {
 
     pub fn config(&self) -> Option<&Config> {
         self.config.as_ref()
+    }
+
+    pub fn allow_mutation(&self) -> bool {
+        self.allow_mutation
     }
 }
 

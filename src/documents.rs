@@ -87,6 +87,13 @@ impl DocumentStore {
         self.documents.is_empty()
     }
 
+    pub(crate) fn snapshots(&self) -> BTreeMap<PathBuf, SynchronizedDocument> {
+        self.documents
+            .iter()
+            .map(|(path, tracked)| (path.clone(), tracked.document.clone()))
+            .collect()
+    }
+
     pub(crate) fn synchronize(
         &mut self,
         absolute_path: &Path,

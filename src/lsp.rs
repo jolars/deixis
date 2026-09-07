@@ -33,6 +33,10 @@ use crate::{
         Position, PositionConverter, PositionEncoding, PositionError, Range,
     },
     project::{Project, ProjectFile, ProjectPathError},
+    workspace_edits::{
+        RenameFilePreview, WorkspaceEdit, WorkspaceEditError,
+        normalize_workspace_edit_at_snapshot,
+    },
 };
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -352,6 +356,203 @@ impl LazyLanguageServer {
             &cancellation,
         )
         .await
+    }
+
+    pub async fn prepare_rename(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+    ) -> Result<PrepareRename, LspError> {
+        let cancellation = CancellationToken::new();
+        self.prepare_rename_with_cancellation(
+            path,
+            language_id,
+            position,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_rename_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        cancellation: &CancellationToken,
+    ) -> Result<PrepareRename, LspError> {
+        const METHOD: &str = "textDocument/prepareRename";
+
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_prepare_rename(
+                snapshot.capabilities().get("renameProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: METHOD,
+            });
+        }
+
+        let document = active.synchronize_document(file, language_id).await?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+        let lsp_position = document
+            .to_lsp_position(position, encoding)
+            .map_err(|source| LspError::PositionConversion {
+                server: self.config.name().to_owned(),
+                path: document.absolute_path().to_path_buf(),
+                source,
+            })?;
+        let value = active
+            .request_value(
+                METHOD,
+                json!({
+                    "textDocument": { "uri": document.uri() },
+                    "position": lsp_position,
+                }),
+                self.config.timeouts().request(),
+                cancellation,
+            )
+            .await?;
+        let response: Option<RawPrepareRename> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+
+        let (range, placeholder, default_behavior) = match response {
+            None => (None, None, None),
+            Some(RawPrepareRename::Range(range)) => (
+                Some(document.from_lsp_range(range, encoding).map_err(
+                    |source| LspError::PositionConversion {
+                        server: self.config.name().to_owned(),
+                        path: document.absolute_path().to_path_buf(),
+                        source,
+                    },
+                )?),
+                None,
+                None,
+            ),
+            Some(RawPrepareRename::RangeWithPlaceholder {
+                range,
+                placeholder,
+            }) => (
+                Some(document.from_lsp_range(range, encoding).map_err(
+                    |source| LspError::PositionConversion {
+                        server: self.config.name().to_owned(),
+                        path: document.absolute_path().to_path_buf(),
+                        source,
+                    },
+                )?),
+                Some(placeholder),
+                None,
+            ),
+            Some(RawPrepareRename::DefaultBehavior { default_behavior }) => {
+                (None, None, Some(default_behavior))
+            }
+        };
+        Ok(PrepareRename {
+            server: self.config.name().to_owned(),
+            uri: document.uri().to_owned(),
+            valid: range.is_some() || default_behavior.is_some(),
+            range,
+            placeholder,
+            default_behavior,
+        })
+    }
+
+    pub async fn rename(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<Vec<RenameFilePreview>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.rename_with_cancellation(
+            path,
+            language_id,
+            position,
+            new_name,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn rename_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        new_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RenameFilePreview>, LspError> {
+        const METHOD: &str = "textDocument/rename";
+
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_method(
+                METHOD,
+                snapshot.capabilities().get("renameProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: METHOD,
+            });
+        }
+
+        let (document, request_documents) = active
+            .synchronize_document_with_snapshot(file, language_id)
+            .await?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+        let lsp_position = document
+            .to_lsp_position(position, encoding)
+            .map_err(|source| LspError::PositionConversion {
+                server: self.config.name().to_owned(),
+                path: document.absolute_path().to_path_buf(),
+                source,
+            })?;
+        let value = active
+            .request_value(
+                METHOD,
+                json!({
+                    "textDocument": { "uri": document.uri() },
+                    "position": lsp_position,
+                    "newName": new_name,
+                }),
+                self.config.timeouts().request(),
+                cancellation,
+            )
+            .await?;
+        let response: Option<WorkspaceEdit> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+        let Some(edit) = response else {
+            return Ok(Vec::new());
+        };
+        let current_documents = active.documents.lock().await.snapshots();
+        normalize_workspace_edit_at_snapshot(
+            &self.project,
+            edit,
+            encoding,
+            &request_documents,
+            &current_documents,
+        )
+        .await
+        .map_err(|source| LspError::InvalidWorkspaceEdit {
+            server: self.config.name().to_owned(),
+            source,
+        })
     }
 
     pub(crate) async fn references_with_cancellation(
@@ -821,6 +1022,51 @@ impl LazyLanguageServer {
         }
     }
 
+    pub(crate) async fn resynchronize_after_workspace_edit(
+        &self,
+        paths: &[String],
+    ) -> Result<(), LspError> {
+        let active = {
+            let state = self.state.lock().await;
+            state.running.as_ref().map(|running| running.active.clone())
+        };
+        let Some(active) = active else {
+            return Ok(());
+        };
+        let tracked = active.documents.lock().await.snapshots();
+        for path in paths {
+            let file = self
+                .project
+                .resolve_file(path)
+                .map_err(LspError::DocumentPath)?;
+            let Some(document) = tracked.get(file.absolute()) else {
+                continue;
+            };
+            active
+                .synchronize_document(file, document.language_id())
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_after_workspace_edit(
+        &self,
+    ) -> Result<(), LspError> {
+        let running = {
+            let mut state = self.state.lock().await;
+            state.running.take()
+        };
+        match running {
+            Some(running) => {
+                running
+                    .stop_after_failure(self.config.timeouts().shutdown())
+                    .await?;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
     pub async fn diagnostics(&self) -> Vec<JsonValue> {
         let active = {
             let state = self.state.lock().await;
@@ -1163,6 +1409,57 @@ impl ReferenceLocation {
             self.position_encoding,
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareRename {
+    pub server: String,
+    pub uri: String,
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_behavior: Option<bool>,
+}
+
+impl PrepareRename {
+    pub fn text(&self) -> String {
+        if let Some(range) = self.range {
+            return format!(
+                "{}: rename is valid at {}:{}:{}-{}:{}",
+                self.server,
+                self.uri,
+                range.start.line,
+                range.start.character,
+                range.end.line,
+                range.end.character
+            );
+        }
+        if self.default_behavior.is_some() {
+            return format!(
+                "{}: rename is valid at {} using default identifier behavior",
+                self.server, self.uri
+            );
+        }
+        format!("{}: rename is not valid at {}", self.server, self.uri)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawPrepareRename {
+    RangeWithPlaceholder {
+        range: Range,
+        placeholder: String,
+    },
+    DefaultBehavior {
+        #[serde(rename = "defaultBehavior")]
+        default_behavior: bool,
+    },
+    Range(Range),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1889,6 +2186,10 @@ pub enum LspError {
         server: String,
         message: String,
     },
+    InvalidWorkspaceEdit {
+        server: String,
+        source: WorkspaceEditError,
+    },
     DocumentPath(ProjectPathError),
     ReadDocument {
         path: PathBuf,
@@ -1995,6 +2296,10 @@ impl fmt::Display for LspError {
             Self::InvalidDiagnosticReport { server, message } => write!(
                 formatter,
                 "language server `{server}` returned an invalid diagnostic report: {message}"
+            ),
+            Self::InvalidWorkspaceEdit { server, source } => write!(
+                formatter,
+                "language server `{server}` returned an invalid workspace edit: {source}"
             ),
             Self::DocumentPath(source) => write!(formatter, "{source}"),
             Self::ReadDocument { path, source } => {
@@ -2143,6 +2448,7 @@ impl Error for LspError {
             | Self::ReadDocument { source, .. }
             | Self::Shutdown { source, .. } => Some(source),
             Self::PositionConversion { source, .. } => Some(source),
+            Self::InvalidWorkspaceEdit { source, .. } => Some(source),
             Self::DocumentPath(source) => Some(source),
             Self::EncodeMessage(source) | Self::DecodeResult(source) => {
                 Some(source)
@@ -2584,6 +2890,33 @@ impl ActiveServer {
             })
     }
 
+    async fn supports_prepare_rename(
+        &self,
+        static_capability: Option<&JsonValue>,
+    ) -> bool {
+        if static_capability
+            .and_then(|capability| capability.get("prepareProvider"))
+            .and_then(JsonValue::as_bool)
+            == Some(true)
+        {
+            return true;
+        }
+
+        self.registrations
+            .lock()
+            .await
+            .values()
+            .any(|registration| {
+                registration.get("method").and_then(JsonValue::as_str)
+                    == Some("textDocument/rename")
+                    && registration
+                        .get("registerOptions")
+                        .and_then(|options| options.get("prepareProvider"))
+                        .and_then(JsonValue::as_bool)
+                        == Some(true)
+            })
+    }
+
     async fn diagnostic_provider(
         &self,
         method: &str,
@@ -2620,6 +2953,22 @@ impl ActiveServer {
         file: ProjectFile,
         language_id: &str,
     ) -> Result<SynchronizedDocument, LspError> {
+        self.synchronize_document_with_snapshot(file, language_id)
+            .await
+            .map(|(document, _)| document)
+    }
+
+    async fn synchronize_document_with_snapshot(
+        &self,
+        file: ProjectFile,
+        language_id: &str,
+    ) -> Result<
+        (
+            SynchronizedDocument,
+            BTreeMap<PathBuf, SynchronizedDocument>,
+        ),
+        LspError,
+    > {
         let snapshot = self.status.lock().await.clone();
         let sync = DocumentSync::from_capability(snapshot.text_document_sync())
             .ok_or_else(|| LspError::UnsupportedDocumentSynchronization {
@@ -2709,9 +3058,10 @@ impl ActiveServer {
             DocumentUpdate::Opened { notify: false, .. }
             | DocumentUpdate::Unchanged(_) => {}
         }
+        let snapshots = documents.snapshots();
         drop(documents);
 
-        Ok(document)
+        Ok((document, snapshots))
     }
 
     async fn pull_diagnostics(
@@ -3464,7 +3814,7 @@ async fn handle_server_request(
                     id,
                     json!({
                         "applied": false,
-                        "failureReason": "Deixis is read-only",
+                        "failureReason": "server-initiated workspace edits are not authorized; use the rename preview and apply tools",
                     }),
                 ))
                 .await;
@@ -3712,6 +4062,10 @@ fn initialize_params(
             "workspace": {
                 "configuration": true,
                 "workspaceFolders": true,
+                "workspaceEdit": {
+                    "documentChanges": true,
+                    "failureHandling": "textOnlyTransactional",
+                },
                 "didChangeConfiguration": {
                     "dynamicRegistration": true,
                 },
@@ -3763,6 +4117,11 @@ fn initialize_params(
                 },
                 "references": {
                     "dynamicRegistration": true,
+                },
+                "rename": {
+                    "dynamicRegistration": true,
+                    "prepareSupport": true,
+                    "prepareSupportDefaultBehavior": 1,
                 },
                 "publishDiagnostics": {
                     "relatedInformation": false,

@@ -10,16 +10,18 @@ For a ready-to-copy polyglot configuration, see
 
 ## Loading configuration
 
-The command-line interface has two options:
+The command-line interface has three options:
 
 ```console
-deixis [--root <project>] [--config <config.toml>]
+deixis [--root <project>] [--config <config.toml>] [--allow-mutation]
 ```
 
 - `--root` selects the immutable project root. It defaults to the process's
   current directory.
 - `--config` selects a configuration file and takes precedence over the user
   configuration.
+- `--allow-mutation` advertises and enables mutating MCP tools. Without it,
+  Deixis remains query-only; `apply_rename` is neither advertised nor callable.
 
 Both paths may be relative to the current directory. They must exist and are
 canonicalized before MCP serving begins. If `--config` is absent, Deixis looks

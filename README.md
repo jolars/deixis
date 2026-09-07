@@ -7,12 +7,13 @@ capabilities without adding another filesystem, shell, editor, index, or memory
 layer.
 
 > [!WARNING]
-> Deixis is pre-alpha. The read-only tool set works, but no stability guarantees
-> are available yet.
+> Deixis is pre-alpha. Its semantic tools and guarded rename workflow work, but
+> no stability guarantees are available yet.
 
 ## Capabilities
 
-A configured Deixis session exposes ten read-only MCP tools:
+A configured Deixis session exposes twelve read-only MCP tools by default.
+Starting it with `--allow-mutation` adds `apply_rename` as a thirteenth tool.
 
   | Tool                   | Purpose                                                     |
   | ---------------------- | ----------------------------------------------------------- |
@@ -26,6 +27,9 @@ A configured Deixis session exposes ten read-only MCP tools:
   | `diagnostics`          | Request pull diagnostics or return cached push diagnostics. |
   | `document_symbols`     | Return a normalized hierarchy of symbols in a file.         |
   | `workspace_symbols`    | Search attached servers, or one explicitly named server.    |
+  | `prepare_rename`       | Check whether a symbol can be renamed at a position.         |
+  | `preview_rename`       | Validate edits and return a diff plus a one-shot preview ID. |
+  | `apply_rename`         | Apply one exact preview (requires `--allow-mutation`).        |
 
 Deixis negotiates UTF-8, UTF-16, and UTF-32 positions, synchronizes documents
 from disk before file-scoped requests, gates every operation on the language
@@ -271,6 +275,26 @@ failures return `isError: true` with a stable structured error code. Null or
 empty semantic results may also report `readiness` and `resultStability`; a
 `transient` result means the language server has signaled that it is still
 working.
+
+Symbol rename is deliberately a two-step mutation. By default,
+`prepare_rename` and `preview_rename` are available for read-only inspection,
+but `apply_rename` is neither advertised nor callable. Add
+`--allow-mutation` to the Deixis command when configuring the MCP host to opt
+into application. Then call `preview_rename` with the file, UTF-8 position, and
+`newName`; inspect its structured per-file edits and unified diff; and pass its
+opaque `previewId` to `apply_rename`. Previewing does not modify files. The ID
+authorizes only that exact preview, expires after ten minutes, and is consumed
+by the first apply attempt—including a failed attempt. A second apply requires
+a new preview.
+
+Rename accepts only text edits to existing UTF-8 files contained by the
+immutable project root. It rejects file creation, deletion, rename operations,
+change annotations, external paths, overlapping edits, and stale file contents.
+Application stages every replacement before committing any file and attempts
+to restore all originals if a commit fails. This is an in-process transaction,
+not a power-loss guarantee; Deixis does not promise recovery after a process or
+machine crash. Server-initiated `workspace/applyEdit` requests remain rejected
+because they do not carry explicit preview authorization.
 
 ## Logging
 

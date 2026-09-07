@@ -13,7 +13,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -26,6 +29,9 @@ use crate::{
     },
     positions::Position,
     project::{Project, ProjectPathError, StartupState},
+    workspace_edits::{
+        PreviewIdError, PreviewStore, WorkspaceEditError, apply_rename_preview,
+    },
 };
 
 const SERVER_STATUS_TOOL: &str = "deixis_server_status";
@@ -38,6 +44,9 @@ const REFERENCES_TOOL: &str = "references";
 const DIAGNOSTICS_TOOL: &str = "diagnostics";
 const DOCUMENT_SYMBOLS_TOOL: &str = "document_symbols";
 const WORKSPACE_SYMBOLS_TOOL: &str = "workspace_symbols";
+const PREPARE_RENAME_TOOL: &str = "prepare_rename";
+const PREVIEW_RENAME_TOOL: &str = "preview_rename";
+const APPLY_RENAME_TOOL: &str = "apply_rename";
 
 #[derive(Clone, Copy)]
 enum LocationOperation {
@@ -84,6 +93,8 @@ const IMPLEMENTATION_SPEC: LocationToolSpec = LocationToolSpec {
 pub struct DeixisServer {
     startup: StartupState,
     language_servers: BTreeMap<String, Arc<LazyLanguageServer>>,
+    previews: Arc<Mutex<PreviewStore>>,
+    workspace_gate: Arc<RwLock<()>>,
 }
 
 impl DeixisServer {
@@ -109,6 +120,8 @@ impl DeixisServer {
         Self {
             startup,
             language_servers,
+            previews: Arc::new(Mutex::new(PreviewStore::default())),
+            workspace_gate: Arc::new(RwLock::new(())),
         }
     }
 
@@ -161,7 +174,7 @@ impl ServerHandler for DeixisServer {
         let tools = if self.language_servers.is_empty() {
             Vec::new()
         } else {
-            vec![
+            let mut tools = vec![
                 server_status_tool(),
                 hover_tool(),
                 location_tool(DECLARATION_SPEC),
@@ -172,7 +185,13 @@ impl ServerHandler for DeixisServer {
                 diagnostics_tool(),
                 document_symbols_tool(),
                 workspace_symbols_tool(),
-            ]
+                prepare_rename_tool(),
+                preview_rename_tool(),
+            ];
+            if self.startup.allow_mutation() {
+                tools.push(apply_rename_tool());
+            }
+            tools
         };
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -212,6 +231,15 @@ impl ServerHandler for DeixisServer {
             }
             WORKSPACE_SYMBOLS_TOOL => {
                 self.call_workspace_symbols(request, &context.ct).await
+            }
+            PREPARE_RENAME_TOOL => {
+                self.call_prepare_rename(request, &context.ct).await
+            }
+            PREVIEW_RENAME_TOOL => {
+                self.call_preview_rename(request, &context.ct).await
+            }
+            APPLY_RENAME_TOOL if self.startup.allow_mutation() => {
+                self.call_apply_rename(request, &context.ct).await
             }
             _ => Err(McpError::method_not_found::<CallToolRequestMethod>()),
         }
@@ -312,6 +340,7 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
+        let _workspace = self.workspace_gate.read().await;
         let Some(config) = self.config() else {
             return Ok(error_result(
                 ToolError::new(
@@ -422,6 +451,7 @@ impl DeixisServer {
             )
         })?;
         arguments.validate(spec.tool)?;
+        let _workspace = self.workspace_gate.read().await;
         let Some(config) = self.config() else {
             return Ok(error_result(
                 ToolError::new(
@@ -564,6 +594,7 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
+        let _workspace = self.workspace_gate.read().await;
         let Some(config) = self.config() else {
             return Ok(error_result(
                 ToolError::new(
@@ -675,6 +706,7 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
+        let _workspace = self.workspace_gate.read().await;
         let Some(config) = self.config() else {
             return Ok(error_result(
                 ToolError::new(
@@ -813,6 +845,7 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
+        let _workspace = self.workspace_gate.read().await;
         let Some(config) = self.config() else {
             return Ok(error_result(
                 ToolError::new(
@@ -919,6 +952,7 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
+        let _workspace = self.workspace_gate.read().await;
         if self.language_servers.is_empty() {
             return Ok(error_result(
                 ToolError::new(
@@ -1044,6 +1078,306 @@ impl DeixisServer {
         })?;
         Ok(success_result(json!({ "symbols": symbols }), text))
     }
+
+    async fn call_prepare_rename(
+        &self,
+        request: CallToolRequestParams,
+        cancellation: &CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        const METHOD: &str = "textDocument/prepareRename";
+
+        let arguments = serde_json::from_value::<RenameArguments>(
+            JsonValue::Object(request.arguments.unwrap_or_default()),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid prepare rename arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate(PREPARE_RENAME_TOOL)?;
+        let _workspace = self.workspace_gate.read().await;
+        let Some(config) = self.config() else {
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    PREPARE_RENAME_TOOL,
+                    "no language server is configured",
+                )
+                .with_method(METHOD)
+                .with_path(&arguments.path),
+            ));
+        };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_path(
+                    PREPARE_RENAME_TOOL,
+                    METHOD,
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_route(
+                        PREPARE_RENAME_TOOL,
+                        METHOD,
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
+        let prepared = match language_server
+            .prepare_rename_with_cancellation(
+                file.absolute(),
+                route.language_id(),
+                arguments.position,
+                cancellation,
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: PREPARE_RENAME_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some(METHOD),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
+            }
+        };
+        let text = prepared.text();
+        let mut structured =
+            serde_json::to_value(&prepared).map_err(|error| {
+                McpError::internal_error(
+                    format!(
+                        "failed to encode prepare rename response: {error}"
+                    ),
+                    None,
+                )
+            })?;
+        if !prepared.valid {
+            let readiness = language_server.status().await.readiness().clone();
+            attach_empty_result_context(&mut structured, &readiness);
+        }
+        Ok(success_result(structured, text))
+    }
+
+    async fn call_preview_rename(
+        &self,
+        request: CallToolRequestParams,
+        cancellation: &CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        const METHOD: &str = "textDocument/rename";
+
+        let arguments = serde_json::from_value::<PreviewRenameArguments>(
+            JsonValue::Object(request.arguments.unwrap_or_default()),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid preview rename arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate()?;
+        let _workspace = self.workspace_gate.read().await;
+        let Some(config) = self.config() else {
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    PREVIEW_RENAME_TOOL,
+                    "no language server is configured",
+                )
+                .with_method(METHOD)
+                .with_path(&arguments.path),
+            ));
+        };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_path(
+                    PREVIEW_RENAME_TOOL,
+                    METHOD,
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_route(
+                        PREVIEW_RENAME_TOOL,
+                        METHOD,
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
+        let files = match language_server
+            .rename_with_cancellation(
+                file.absolute(),
+                route.language_id(),
+                arguments.position,
+                &arguments.new_name,
+                cancellation,
+            )
+            .await
+        {
+            Ok(files) => files,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: PREVIEW_RENAME_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some(METHOD),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
+            }
+        };
+        if files.is_empty() {
+            let readiness = language_server.status().await.readiness().clone();
+            let mut structured = json!({
+                "previewId": null,
+                "server": route.server().name(),
+                "newName": arguments.new_name,
+                "fileCount": 0,
+                "editCount": 0,
+                "expiresInSeconds": null,
+                "files": [],
+            });
+            attach_empty_result_context(&mut structured, &readiness);
+            return Ok(success_result(
+                structured,
+                "Rename produced no changes.",
+            ));
+        }
+
+        let preview = match self.previews.lock().await.insert(
+            route.server().name(),
+            &arguments.new_name,
+            files,
+        ) {
+            Ok(preview) => preview,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_workspace_edit(
+                    PREVIEW_RENAME_TOOL,
+                    Some(route.server().name()),
+                    Some(METHOD),
+                    Some(&arguments.path),
+                    &error,
+                )));
+            }
+        };
+        let text = preview.text();
+        let structured = serde_json::to_value(preview).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode rename preview: {error}"),
+                None,
+            )
+        })?;
+        Ok(success_result(structured, text))
+    }
+
+    async fn call_apply_rename(
+        &self,
+        request: CallToolRequestParams,
+        cancellation: &CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        let arguments = serde_json::from_value::<ApplyRenameArguments>(
+            JsonValue::Object(request.arguments.unwrap_or_default()),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid apply rename arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate()?;
+        let _workspace = self.workspace_gate.write().await;
+        let preview =
+            match self.previews.lock().await.take(&arguments.preview_id) {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_preview_id(
+                        &error,
+                    )));
+                }
+            };
+        let cancellation = cancellation.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            apply_rename_preview(preview, &cancellation)
+        })
+        .await
+        .map_err(|error| {
+            McpError::internal_error(
+                format!("rename application task failed: {error}"),
+                None,
+            )
+        })?;
+        let mut outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_workspace_edit(
+                    APPLY_RENAME_TOOL,
+                    None,
+                    None,
+                    None,
+                    &error,
+                )));
+            }
+        };
+        let language_server = self
+            .language_servers
+            .get(&outcome.server)
+            .expect("rename previews retain a configured server name");
+        if let Err(error) = language_server
+            .resynchronize_after_workspace_edit(&outcome.paths)
+            .await
+        {
+            let invalidation = language_server
+                .invalidate_after_workspace_edit()
+                .await
+                .err()
+                .map(|invalidation| {
+                    format!("; invalidation failed: {invalidation}")
+                })
+                .unwrap_or_default();
+            outcome.warnings.push(format!(
+                "failed to refresh language-server documents after applying the rename: {error}; the server was invalidated{invalidation}"
+            ));
+        }
+        let text = outcome.text();
+        let structured = serde_json::to_value(outcome).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode rename application: {error}"),
+                None,
+            )
+        })?;
+        Ok(success_result(structured, text))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1162,6 +1496,7 @@ impl ToolError {
             LspError::Spawn { server, .. }
             | LspError::MissingPipe { server, .. }
             | LspError::InvalidDiagnosticReport { server, .. }
+            | LspError::InvalidWorkspaceEdit { server, .. }
             | LspError::UnsupportedDocumentSynchronization { server, .. }
             | LspError::UnsupportedPositionEncoding { server, .. }
             | LspError::PositionConversion { server, .. }
@@ -1218,6 +1553,43 @@ impl ToolError {
 
         result
     }
+
+    fn from_preview_id(error: &PreviewIdError) -> Self {
+        Self::new("invalid_preview", APPLY_RENAME_TOOL, error.to_string())
+    }
+
+    fn from_workspace_edit(
+        tool: &'static str,
+        server: Option<&str>,
+        method: Option<&str>,
+        path: Option<&str>,
+        error: &WorkspaceEditError,
+    ) -> Self {
+        let code = match error {
+            WorkspaceEditError::InvalidEdit(_)
+            | WorkspaceEditError::Read { .. } => "invalid_workspace_edit",
+            WorkspaceEditError::Conflict { .. } => "edit_conflict",
+            WorkspaceEditError::Stage { .. } => "edit_application_failed",
+            WorkspaceEditError::Application { .. }
+                if error.rollback_failed() =>
+            {
+                "edit_rollback_failed"
+            }
+            WorkspaceEditError::Application { .. } => "edit_application_failed",
+            WorkspaceEditError::Canceled { .. } => "request_canceled",
+        };
+        let mut result = Self::new(code, tool, error.to_string());
+        if let Some(server) = server {
+            result = result.with_server(server);
+        }
+        if let Some(method) = method {
+            result = result.with_method(method);
+        }
+        if let Some(path) = path {
+            result = result.with_path(path);
+        }
+        result
+    }
 }
 
 fn lsp_error_code(error: &LspError) -> &'static str {
@@ -1240,6 +1612,11 @@ fn lsp_error_code(error: &LspError) -> &'static str {
         | LspError::DecodeResult(_)
         | LspError::InvalidDiagnosticReport { .. }
         | LspError::ResponseTooLarge { .. } => "lsp_protocol_error",
+        LspError::InvalidWorkspaceEdit {
+            source: WorkspaceEditError::Conflict { .. },
+            ..
+        } => "edit_conflict",
+        LspError::InvalidWorkspaceEdit { .. } => "invalid_workspace_edit",
         LspError::ReadDocument { .. }
         | LspError::DocumentSynchronizationClosed { .. }
         | LspError::DocumentLanguageChanged { .. }
@@ -1317,6 +1694,83 @@ struct WorkspaceSymbolsArguments {
     query: String,
     #[serde(default)]
     server: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RenameArguments {
+    path: String,
+    #[serde(default)]
+    server: Option<String>,
+    position: Position,
+}
+
+impl RenameArguments {
+    fn validate(&self, tool: &str) -> Result<(), McpError> {
+        if self.path.is_empty() {
+            return Err(McpError::invalid_params(
+                format!("invalid {tool} arguments: `path` must not be empty"),
+                None,
+            ));
+        }
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.trim().is_empty())
+        {
+            return Err(McpError::invalid_params(
+                format!("invalid {tool} arguments: `server` must not be empty"),
+                None,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreviewRenameArguments {
+    path: String,
+    #[serde(default)]
+    server: Option<String>,
+    position: Position,
+    new_name: String,
+}
+
+impl PreviewRenameArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        RenameArguments {
+            path: self.path.clone(),
+            server: self.server.clone(),
+            position: self.position,
+        }
+        .validate(PREVIEW_RENAME_TOOL)?;
+        if self.new_name.is_empty() {
+            return Err(McpError::invalid_params(
+                "invalid preview rename arguments: `newName` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyRenameArguments {
+    preview_id: String,
+}
+
+impl ApplyRenameArguments {
+    fn validate(&self) -> Result<(), McpError> {
+        if self.preview_id.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "invalid apply rename arguments: `previewId` must not be empty",
+                None,
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl WorkspaceSymbolsArguments {
@@ -2026,6 +2480,205 @@ fn workspace_symbols_tool() -> Tool {
     )
 }
 
+fn prepare_rename_tool() -> Tool {
+    Tool::new(
+        PREPARE_RENAME_TOOL,
+        "Test whether a symbol can be renamed at a UTF-8 position.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative or root-contained absolute file path."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
+                },
+                "position": position_schema()
+            },
+            "required": ["path", "position"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(result_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "server": { "type": "string" },
+            "uri": { "type": "string" },
+            "valid": { "type": "boolean" },
+            "range": range_schema(),
+            "placeholder": { "type": "string" },
+            "defaultBehavior": { "type": "boolean" },
+            "readiness": readiness_schema(),
+            "resultStability": result_stability_schema()
+        },
+        "required": ["server", "uri", "valid"],
+        "additionalProperties": false
+    })))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    )
+}
+
+fn preview_rename_tool() -> Tool {
+    Tool::new(
+        PREVIEW_RENAME_TOOL,
+        "Compute and validate a symbol rename without changing files. Inspect the returned edits and diff before calling `apply_rename`, which requires the `--allow-mutation` CLI flag.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative or root-contained absolute file path."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
+                },
+                "position": position_schema(),
+                "newName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "New symbol name validated by the language server."
+                }
+            },
+            "required": ["path", "position", "newName"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(result_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "previewId": { "type": ["string", "null"] },
+            "server": { "type": "string" },
+            "newName": { "type": "string" },
+            "fileCount": { "type": "integer", "minimum": 0 },
+            "editCount": { "type": "integer", "minimum": 0 },
+            "expiresInSeconds": {
+                "type": ["integer", "null"],
+                "minimum": 0
+            },
+            "files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "uri": { "type": "string" },
+                        "documentVersion": {
+                            "type": ["integer", "null"]
+                        },
+                        "positionEncoding": { "const": "utf-8" },
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "range": range_schema(),
+                                    "oldText": { "type": "string" },
+                                    "newText": { "type": "string" }
+                                },
+                                "required": ["range", "oldText", "newText"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": [
+                        "path",
+                        "uri",
+                        "documentVersion",
+                        "positionEncoding",
+                        "edits"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "readiness": readiness_schema(),
+            "resultStability": result_stability_schema()
+        },
+        "required": [
+            "previewId",
+            "server",
+            "newName",
+            "fileCount",
+            "editCount",
+            "expiresInSeconds",
+            "files"
+        ],
+        "additionalProperties": false
+    })))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(false)
+            .open_world(false),
+    )
+}
+
+fn apply_rename_tool() -> Tool {
+    Tool::new(
+        APPLY_RENAME_TOOL,
+        "Apply one exact, previously inspected rename preview. The preview is consumed on this attempt.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "previewId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Opaque identifier returned by `preview_rename`."
+                }
+            },
+            "required": ["previewId"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(result_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "applied": { "const": true },
+            "previewId": { "type": "string" },
+            "server": { "type": "string" },
+            "fileCount": { "type": "integer", "minimum": 1 },
+            "editCount": { "type": "integer", "minimum": 1 },
+            "paths": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "warnings": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        },
+        "required": [
+            "applied",
+            "previewId",
+            "server",
+            "fileCount",
+            "editCount",
+            "paths",
+            "warnings"
+        ],
+        "additionalProperties": false
+    })))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .idempotent(false)
+            .open_world(false),
+    )
+}
+
 fn position_schema() -> JsonValue {
     json!({
         "type": "object",
@@ -2174,7 +2827,12 @@ fn error_output_schema() -> JsonValue {
                             "server_error",
                             "routing_error",
                             "no_server_configured",
-                            "unknown_server"
+                            "unknown_server",
+                            "invalid_workspace_edit",
+                            "invalid_preview",
+                            "edit_conflict",
+                            "edit_application_failed",
+                            "edit_rollback_failed"
                         ]
                     },
                     "message": { "type": "string" },

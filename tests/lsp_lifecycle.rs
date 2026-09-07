@@ -15,6 +15,7 @@ use deixis::{
     },
     positions::{Position, PositionEncoding, Range},
     project::StartupState,
+    workspace_edits::WorkspaceEditError,
 };
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -493,7 +494,10 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(!probe.apply_edit_applied);
     assert_eq!(
         probe.apply_edit_failure_reason,
-        Some("Deixis is read-only".to_owned())
+        Some(
+            "server-initiated workspace edits are not authorized; use the rename preview and apply tools"
+                .to_owned()
+        )
     );
     assert_eq!(probe.show_message_request_result, JsonValue::Null);
     assert_eq!(probe.unknown_error_code, -32601);
@@ -520,6 +524,14 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(!probe.workspace_symbol_resolve_support);
     assert!(probe.diagnostic_dynamic_registration);
     assert!(probe.diagnostic_version_support);
+    assert!(probe.workspace_edit_document_changes);
+    assert_eq!(
+        probe.workspace_edit_failure_handling,
+        "textOnlyTransactional"
+    );
+    assert!(probe.rename_dynamic_registration);
+    assert!(probe.rename_prepare_support);
+    assert_eq!(probe.rename_prepare_support_default_behavior, 1);
     assert!(probe.diagnostic_refresh);
     assert!(probe.work_done_progress);
     assert!(probe.server_status_notification);
@@ -912,6 +924,148 @@ async fn rejects_hover_before_synchronizing_when_capability_is_disabled()
     assert!(probe.events.is_empty());
     assert_eq!(probe.open_documents, 0);
 
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn normalizes_prepare_rename_responses() -> Result<(), Box<dyn Error>> {
+    for (mode, valid, range, placeholder, default_behavior) in [
+        (
+            "normal",
+            true,
+            Some(Range::new(Position::new(0, 4), Position::new(0, 7))),
+            Some("old"),
+            None,
+        ),
+        ("prepare-rename-null", false, None, None, None),
+        ("prepare-rename-default", true, None, None, Some(true)),
+        (
+            "prepare-rename-range",
+            true,
+            Some(Range::new(Position::new(0, 4), Position::new(0, 7))),
+            None,
+            None,
+        ),
+    ] {
+        let (manager, root) = configured_manager_with_root(mode, 1_000, 1_000)?;
+        fs::write(root.join("main.rs"), "let old = 1;\n")?;
+
+        let prepared = manager
+            .prepare_rename("main.rs", "rust", Position::new(0, 4))
+            .await?;
+
+        assert_eq!(prepared.server, "mock-lsp", "{mode}");
+        assert!(prepared.uri.ends_with("/main.rs"), "{mode}");
+        assert_eq!(prepared.valid, valid, "{mode}");
+        assert_eq!(prepared.range, range, "{mode}");
+        assert_eq!(prepared.placeholder.as_deref(), placeholder, "{mode}");
+        assert_eq!(prepared.default_behavior, default_behavior, "{mode}");
+        manager.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn normalizes_rename_edits_without_applying_them()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("rename-multi-file", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+    fs::write(root.join("other.rs"), "old();\n")?;
+
+    let files = manager
+        .rename("main.rs", "rust", Position::new(0, 4), "fresh")
+        .await?;
+
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0].path, "main.rs");
+    assert_eq!(files[0].edits.len(), 1);
+    assert_eq!(files[0].edits[0].old_text, "old");
+    assert_eq!(files[0].edits[0].new_text, "fresh");
+    assert_eq!(files[1].path, "other.rs");
+    assert_eq!(files[1].edits[0].old_text, "old");
+    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "let old = 1;\n");
+    assert_eq!(fs::read_to_string(root.join("other.rs"))?, "old();\n");
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_rename_edits_when_a_target_changes_during_the_request()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("rename-delayed", 1_000, 1_000)?;
+    let manager = Arc::new(manager);
+    let source = root.join("main.rs");
+    let barrier = root.join("rename-barrier");
+    fs::write(&source, "let old = 1;\n")?;
+
+    let rename = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            manager
+                .rename("main.rs", "rust", Position::new(0, 4), "fresh")
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !barrier.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    fs::write(&source, "let prefix_old = 1;\n")?;
+    manager.synchronize_document(&source, "rust").await?;
+
+    let error = rename.await?.unwrap_err();
+    assert!(matches!(
+        error,
+        LspError::InvalidWorkspaceEdit {
+            source: WorkspaceEditError::Conflict { .. },
+            ..
+        }
+    ));
+
+    Arc::try_unwrap(manager)
+        .ok()
+        .expect("rename task should release the manager")
+        .shutdown()
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn gates_rename_capabilities_and_rejects_resource_operations()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) =
+        configured_manager_with_root("rename-no-prepare", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+
+    let error = manager
+        .prepare_rename("main.rs", "rust", Position::new(0, 4))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::UnsupportedCapability { .. }));
+    assert_eq!(
+        manager
+            .rename("main.rs", "rust", Position::new(0, 4), "fresh")
+            .await?
+            .len(),
+        1
+    );
+    manager.shutdown().await?;
+
+    let (manager, root) =
+        configured_manager_with_root("rename-resource", 1_000, 1_000)?;
+    fs::write(root.join("main.rs"), "let old = 1;\n")?;
+    let error = manager
+        .rename("main.rs", "rust", Position::new(0, 4), "fresh")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::InvalidWorkspaceEdit { .. }));
+    assert_eq!(fs::read_to_string(root.join("main.rs"))?, "let old = 1;\n");
     manager.shutdown().await?;
     Ok(())
 }
@@ -1646,6 +1800,7 @@ file_extensions = {{ ".rs" = "rust" }}
 
 [servers.mock-lsp.environment]
 DEIXIS_MOCK_START_COUNT = {}
+DEIXIS_MOCK_RENAME_BARRIER = {}
 
 [servers.mock-lsp.timeouts]
 startup_ms = {}
@@ -1671,6 +1826,7 @@ two = 2
             support::toml_string(&server),
             mode,
             support::toml_string(&root.join("mock-start-count")),
+            support::toml_string(&root.join("rename-barrier")),
             bounds.startup_timeout_ms,
             bounds.request_timeout_ms,
             bounds.shutdown_timeout_ms,
@@ -1773,6 +1929,11 @@ struct ProbeResponse {
     workspace_symbol_resolve_support: bool,
     diagnostic_dynamic_registration: bool,
     diagnostic_version_support: bool,
+    workspace_edit_document_changes: bool,
+    workspace_edit_failure_handling: String,
+    rename_dynamic_registration: bool,
+    rename_prepare_support: bool,
+    rename_prepare_support_default_behavior: i64,
     diagnostic_refresh: bool,
     work_done_progress: bool,
     server_status_notification: bool,
