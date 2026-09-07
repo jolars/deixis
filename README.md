@@ -14,18 +14,18 @@ layer.
 
 A configured Deixis session exposes ten read-only MCP tools:
 
-| Tool | Purpose |
-| --- | --- |
-| `deixis_server_status` | Inspect readiness and optionally start a configured server. |
-| `hover` | Return hover markup at a zero-based UTF-8 position. |
-| `definition` | Find definitions. |
-| `declaration` | Find declarations. |
-| `type_definition` | Find type definitions. |
-| `implementation` | Find implementations. |
-| `references` | Find references, with explicit declaration inclusion. |
-| `diagnostics` | Request pull diagnostics or return cached push diagnostics. |
-| `document_symbols` | Return a normalized hierarchy of symbols in a file. |
-| `workspace_symbols` | Search every capable configured server concurrently. |
+  | Tool                   | Purpose                                                     |
+  | ---------------------- | ----------------------------------------------------------- |
+  | `deixis_server_status` | Inspect readiness and optionally start a configured server. |
+  | `hover`                | Return hover markup at a zero-based UTF-8 position.         |
+  | `definition`           | Find definitions.                                           |
+  | `declaration`          | Find declarations.                                          |
+  | `type_definition`      | Find type definitions.                                      |
+  | `implementation`       | Find implementations.                                       |
+  | `references`           | Find references, with explicit declaration inclusion.       |
+  | `diagnostics`          | Request pull diagnostics or return cached push diagnostics. |
+  | `document_symbols`     | Return a normalized hierarchy of symbols in a file.         |
+  | `workspace_symbols`    | Search every capable configured server concurrently.        |
 
 Deixis negotiates UTF-8, UTF-16, and UTF-32 positions, synchronizes documents
 from disk before file-scoped requests, gates every operation on the language
@@ -87,25 +87,25 @@ file_extensions = { ".rs" = "rust" }
 Pass the file explicitly with `--config`, or install it as the user
 configuration:
 
-| Platform | Default path when `XDG_CONFIG_HOME` is unset |
-| --- | --- |
-| Linux and other Unix | `~/.config/deixis/config.toml` |
-| macOS | `~/Library/Application Support/deixis/config.toml` |
-| Windows | `%APPDATA%\deixis\config.toml` |
+  | Platform             | Default path when `XDG_CONFIG_HOME` is unset       |
+  | -------------------- | -------------------------------------------------- |
+  | Linux and other Unix | `~/.config/deixis/config.toml`                     |
+  | macOS                | `~/Library/Application Support/deixis/config.toml` |
+  | Windows              | `%APPDATA%\deixis\config.toml`                     |
 
 `$XDG_CONFIG_HOME/deixis/config.toml` takes precedence on every platform when
 that variable is set. An explicit `--config` takes precedence over the user
 configuration. Deixis never discovers configuration in the project tree.
 
-The configuration is strict: unknown fields, empty commands, invalid routes,
-and zero-valued bounds stop startup with an error. The
-[configuration reference](docs/configuration.md) documents every field,
-default, routing rule, and process limit.
+The configuration is strict: unknown fields, empty commands, invalid routes, and
+zero-valued bounds stop startup with an error. The [configuration
+reference](docs/configuration.md) documents every field, default, routing rule,
+and process limit.
 
 ## Connect an MCP client
 
-Deixis is a local stdio server. The MCP host must launch the binary directly;
-do not wrap it in a shell command. Set the project either with `--root` or by
+Deixis is a local stdio server. The MCP host must launch the binary directly; do
+not wrap it in a shell command. Set the project either with `--root` or by
 starting Deixis in the project directory. The root defaults to the current
 working directory and is canonicalized once at startup.
 
@@ -273,9 +273,8 @@ Without Nix, install those five servers and run:
 cargo test --test real_language_servers -- --ignored --test-threads=1
 ```
 
-Executable paths may be overridden with
-`DEIXIS_TYPESCRIPT_LANGUAGE_SERVER`, `DEIXIS_PYRIGHT_LANGSERVER`,
-`DEIXIS_GOPLS`, `DEIXIS_CLANGD`, and `DEIXIS_DENO`.
+Executable paths may be overridden with `DEIXIS_TYPESCRIPT_LANGUAGE_SERVER`,
+`DEIXIS_PYRIGHT_LANGSERVER`, `DEIXIS_GOPLS`, `DEIXIS_CLANGD`, and `DEIXIS_DENO`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete development gate.
 
