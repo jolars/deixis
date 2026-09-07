@@ -14,9 +14,11 @@ The four experimental arms separate tool availability from instructions:
 | `instruction_only` | No | Yes |
 | `deixis_instructed` | Yes | Yes |
 
-The task prompt never changes across arms. The instruction says to use typed
-LSP tools when they are available and relevant, and to use ordinary repository
-tools otherwise. This makes the following paired comparisons meaningful:
+The task prompt never changes across arms. The instruction explicitly requires
+the agent to try the corresponding Deixis tool before text search or broad file
+reading for semantic-navigation needs. It allows ordinary repository tools when
+Deixis is absent or a call fails. This makes the following paired comparisons
+meaningful:
 
 - `deixis_available` versus `control`: unprompted availability and discovery;
 - `deixis_instructed` versus `instruction_only`: the configured deployment;

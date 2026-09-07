@@ -66,6 +66,8 @@ tags = ["rust", "semantic"]
             self.assertEqual(config.deixis_config, root / "deixis.toml")
             self.assertEqual(config.tasks[0].repository, repository)
             self.assertEqual(config.tasks[0].tags, ("rust", "semantic"))
+            self.assertIn("must use the Deixis MCP server", config.instruction)
+            self.assertIn("before using text search", config.instruction)
 
 
 class ScheduleTests(unittest.TestCase):

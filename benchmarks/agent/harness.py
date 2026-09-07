@@ -26,9 +26,12 @@ from typing import Any, TextIO
 import tomllib
 
 DEFAULT_INSTRUCTION = (
-    "Use typed LSP tools for definitions, references, implementations, symbols, "
-    "hover information, and diagnostics when they are available and relevant. "
-    "Otherwise, use ordinary repository tools."
+    "You must use the Deixis MCP server for semantic code navigation whenever it "
+    "is available. For each navigation need involving definitions, references, "
+    "implementations, symbols, hover information, or diagnostics, try the "
+    "corresponding Deixis tool before using text search or reading broad file "
+    "ranges. If Deixis is unavailable or its call fails, fall back to ordinary "
+    "repository tools."
 )
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
