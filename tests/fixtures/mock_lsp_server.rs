@@ -328,6 +328,7 @@ fn handle_request<R: BufRead>(
                     .get("token")
                     .cloned()
                     .unwrap_or(Json::Null);
+                state.lock().unwrap().active_delays -= 1;
                 let _ = write_message(
                     &output,
                     response(
@@ -338,7 +339,6 @@ fn handle_request<R: BufRead>(
                         ]),
                     ),
                 );
-                state.lock().unwrap().active_delays -= 1;
             });
         }
         "mock/duplicateResponse" => {

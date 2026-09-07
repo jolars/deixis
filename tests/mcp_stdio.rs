@@ -303,7 +303,7 @@ async fn every_tool_has_a_stable_text_fallback_and_structured_output()
     let transport = TokioChildProcess::new(command)?;
     let client =
         timeout(Duration::from_secs(10), ().serve(transport)).await??;
-    let uri = url::Url::from_file_path(root.join("main.rs"))
+    let uri = url::Url::from_file_path(fs::canonicalize(root.join("main.rs"))?)
         .unwrap()
         .to_string();
 
@@ -1127,7 +1127,7 @@ async fn diagnostics_prefers_pull_reports_and_exposes_freshness()
         result.structured_content,
         Some(json!({
             "server": "mock-lsp",
-            "uri": url::Url::from_file_path(root.join("main.rs"))
+            "uri": url::Url::from_file_path(fs::canonicalize(root.join("main.rs"))?)
                 .unwrap()
                 .to_string(),
             "source": "pull",
