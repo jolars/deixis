@@ -3,7 +3,7 @@
   "name": "io.github.jolars/deixis",
   "title": "Deixis",
   "description": "Typed LSP operations for MCP clients.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "websiteUrl": "https://github.com/jolars/deixis",
   "repository": {
     "url": "https://github.com/jolars/deixis",
@@ -14,7 +14,7 @@
     {
       "registryType": "cargo",
       "identifier": "deixis",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       },

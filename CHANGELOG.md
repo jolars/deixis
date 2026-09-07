@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1](https://github.com/jolars/deixis/compare/v0.2.0...v0.2.1) (2026-09-07)
+
+### Bug Fixes
+- publish releases to MCP registry ([`3867f0f`](https://github.com/jolars/deixis/commit/3867f0f09f47052ceb539f4b83a8026b94ed293f))
+
 ## [0.2.0](https://github.com/jolars/deixis/compare/v0.1.0...v0.2.0) (2026-09-07)
 
 ### Features
