@@ -802,6 +802,22 @@ window_ms = 45000
     }
 
     #[test]
+    fn parses_the_documented_example_config() {
+        let config =
+            Config::from_toml_str(include_str!("../examples/config.toml"))
+                .unwrap();
+
+        assert_eq!(
+            config
+                .servers()
+                .iter()
+                .map(|server| server.name())
+                .collect::<Vec<_>>(),
+            ["clangd", "gopls", "pyright", "rust", "typescript"]
+        );
+    }
+
+    #[test]
     fn builds_a_direct_tokio_command() {
         let config = Config::from_toml_str(VALID_CONFIG).unwrap();
         let command = config.server("rust").unwrap().to_command();

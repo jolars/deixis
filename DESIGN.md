@@ -1,7 +1,7 @@
 # Deixis Design
 
-This document records the intended architecture and the reasons behind it.
-`TODO.md` turns that architecture into an implementation sequence.
+This document records the architecture and the reasons behind it. `TODO.md`
+contains the remaining implementation sequence.
 
 ## Status
 
@@ -25,8 +25,9 @@ servers, then merges results in stable lexical server-name order with explicit
 provenance. Document symbols preserve server-provided hierarchies and normalize
 legacy flat responses to a common node shape. Every tool includes a concise
 text fallback.
-Nothing in this document should be read as already implemented unless it is
-also marked complete in `TODO.md`.
+The status above and the user-facing capability list in `README.md` distinguish
+shipped behavior from future design. `TODO.md` contains only open work; Git
+history and `CHANGELOG.md` record completed development.
 
 ## Purpose
 

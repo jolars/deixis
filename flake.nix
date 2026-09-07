@@ -48,6 +48,7 @@
               ./LICENSE-APACHE
               ./LICENSE-MIT
               ./README.md
+              ./examples
               ./src
               ./tests
             ];

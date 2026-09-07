@@ -2,10 +2,9 @@
 
 ## Project state
 
-Deixis is pre-alpha. Its intended architecture is recorded in
-[DESIGN.md](DESIGN.md), and its implementation order is recorded in
-[TODO.md](TODO.md). Discuss changes that alter those boundaries before building
-on them.
+Deixis is pre-alpha. Its architecture is recorded in [DESIGN.md](DESIGN.md),
+and its remaining implementation order is recorded in [TODO.md](TODO.md).
+Discuss changes that alter those boundaries before building on them.
 
 ## Development environment
 

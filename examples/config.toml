@@ -1,0 +1,50 @@
+[servers.rust]
+command = "rust-analyzer"
+file_extensions = { ".rs" = "rust" }
+
+[servers.rust.initialization_options]
+checkOnSave = true
+
+[servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+file_extensions = {
+  ".js" = "javascript",
+  ".jsx" = "javascriptreact",
+  ".ts" = "typescript",
+  ".tsx" = "typescriptreact",
+}
+
+[servers.pyright]
+command = "pyright-langserver"
+args = ["--stdio"]
+file_extensions = { ".py" = "python" }
+
+[servers.gopls]
+command = "gopls"
+file_extensions = { ".go" = "go" }
+
+[servers.clangd]
+command = "clangd"
+file_extensions = {
+  ".c" = "c",
+  ".cc" = "cpp",
+  ".cpp" = "cpp",
+  ".h" = "c",
+  ".hpp" = "cpp",
+}
+
+# Every table below is optional; these are the per-server defaults.
+[servers.clangd.timeouts]
+startup_ms = 30000
+request_ms = 30000
+shutdown_ms = 5000
+
+[servers.clangd.limits]
+outbound_queue_capacity = 64
+max_concurrent_requests = 16
+max_response_bytes = 16777216
+
+[servers.clangd.restart]
+max_restarts = 3
+window_ms = 60000
