@@ -16,7 +16,7 @@ A configured Deixis session exposes ten read-only MCP tools:
 
   | Tool                   | Purpose                                                     |
   | ---------------------- | ----------------------------------------------------------- |
-  | `deixis_server_status` | Inspect readiness and optionally start a configured server. |
+  | `deixis_server_status` | Summarize configured servers or inspect one in detail.      |
   | `hover`                | Return hover markup at a zero-based UTF-8 position.         |
   | `definition`           | Find definitions.                                           |
   | `declaration`          | Find declarations.                                          |
@@ -31,6 +31,12 @@ Deixis negotiates UTF-8, UTF-16, and UTF-32 positions, synchronizes documents
 from disk before file-scoped requests, gates every operation on the language
 server's advertised capabilities, and preserves source-server provenance in
 results. Several language servers may serve one immutable project root.
+
+Calling `deixis_server_status` without arguments lists every configured server
+as `not started`, `running`, or `attached`. A server is attached after Deixis
+has synchronized at least one document with its current process. Pass `server`
+for its detailed lifecycle and capability snapshot; `start: true` also requires
+an explicit server name.
 
 See [DESIGN.md](DESIGN.md) for the protocol and architecture and
 [TODO.md](TODO.md) for planned work.

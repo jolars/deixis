@@ -113,8 +113,8 @@ slot. `server_busy` means the bounded outbound queue was already full. Either
 condition can reflect a language server that is overloaded, still indexing, or
 stuck.
 
-1. Inspect `deixis_server_status` and any readiness information on an empty
-   result.
+1. Inspect the named server with `deixis_server_status` and check any readiness
+   information on an empty result.
 2. Reduce concurrent calls before increasing bounds.
 3. Increase `request_ms` only when normal server work genuinely takes longer.
 4. Keep the MCP host's tool timeout above `startup_ms + request_ms`, because the

@@ -175,8 +175,12 @@ Without selected configuration, the current server advertises no tools. With
 configuration, it advertises ten read-only tools: `deixis_server_status`,
 `hover`, `definition`, `declaration`, `type_definition`, `implementation`,
 `references`, `diagnostics`, `document_symbols`, and `workspace_symbols`. The
-probe accepts an optional server name and `start` flag; without a name, it uses
-the first name in stable lexical order.
+probe accepts an optional server name and `start` flag. Without a name, it
+returns every configured server in stable lexical order with a compact `not
+started`, `running`, or `attached` state. `Attached` means that Deixis has
+synchronized at least one document with the current server process. With a
+name, the probe returns the detailed lifecycle, readiness, negotiated encoding,
+and capabilities for that server. Starting a server requires its explicit name.
 The position-based semantic tools take a root-contained path, a zero-based
 UTF-8 position, and an optional server override. They resolve the path before
 routing, infer the language ID, synchronize the document, verify the

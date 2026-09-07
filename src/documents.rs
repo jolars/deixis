@@ -83,6 +83,10 @@ pub(crate) struct DocumentStore {
 }
 
 impl DocumentStore {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
+
     pub(crate) fn synchronize(
         &mut self,
         absolute_path: &Path,

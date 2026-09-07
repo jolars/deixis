@@ -178,6 +178,7 @@ async fn configured_child_diagnostics_stay_on_stderr_with_server_name()
             "params": {
                 "name": "deixis_server_status",
                 "arguments": {
+                    "server": "mock-lsp",
                     "start": true
                 }
             }
@@ -307,9 +308,14 @@ async fn every_tool_has_a_stable_text_fallback_and_structured_output()
         .unwrap()
         .to_string();
 
+    let stopped_status_arguments =
+        json!({ "server": "mock-lsp" }).as_object().unwrap().clone();
     let stopped_status = timeout(
         Duration::from_secs(10),
-        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+        client.call_tool(
+            CallToolRequestParams::new("deixis_server_status")
+                .with_arguments(stopped_status_arguments),
+        ),
     )
     .await??;
     assert_eq!(
@@ -321,8 +327,13 @@ async fn every_tool_has_a_stable_text_fallback_and_structured_output()
         JsonValue::Null
     );
 
-    let status_arguments =
-        json!({ "start": true }).as_object().unwrap().clone();
+    let status_arguments = json!({
+        "server": "mock-lsp",
+        "start": true,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
     let status = timeout(
         Duration::from_secs(10),
         client.call_tool(
@@ -447,6 +458,116 @@ async fn every_tool_has_a_stable_text_fallback_and_structured_output()
             _ => assert_eq!(structured["locations"][0]["server"], "mock-lsp"),
         }
     }
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unqualified_server_status_summarizes_every_configured_server()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("server-status-overview")?;
+    fs::write(root.join("main.py"), "let answer = 42;\n")?;
+    let config_path = write_mixed_workspace_symbol_config(&root)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let ambiguous_start_arguments =
+        json!({ "start": true }).as_object().unwrap().clone();
+    let ambiguous_start = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("deixis_server_status")
+                .with_arguments(ambiguous_start_arguments),
+        ),
+    )
+    .await?
+    .expect_err("starting a server should require an explicit name");
+    assert!(
+        ambiguous_start
+            .to_string()
+            .contains("`server` is required when `start` is true"),
+        "{ambiguous_start}"
+    );
+
+    let start_arguments = json!({
+        "server": "zeta",
+        "start": true,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("deixis_server_status")
+                .with_arguments(start_arguments),
+        ),
+    )
+    .await??;
+
+    let status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+    )
+    .await??;
+
+    assert_eq!(
+        status.content[0].as_text().unwrap().text,
+        "alpha: not started\nzeta: running"
+    );
+    assert_eq!(
+        status.structured_content,
+        Some(json!({
+            "servers": [
+                {
+                    "configuredName": "alpha",
+                    "state": "notStarted",
+                },
+                {
+                    "configuredName": "zeta",
+                    "state": "running",
+                },
+            ],
+        }))
+    );
+    assert_eq!(status.is_error, Some(false));
+
+    let hover_arguments = json!({
+        "path": "main.py",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("hover").with_arguments(hover_arguments),
+        ),
+    )
+    .await??;
+
+    let attached_status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+    )
+    .await??;
+    assert_eq!(
+        attached_status.content[0].as_text().unwrap().text,
+        "alpha: not started\nzeta: attached"
+    );
+    assert_eq!(
+        attached_status.structured_content.unwrap()["servers"][1]["state"],
+        "attached"
+    );
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())
@@ -997,7 +1118,13 @@ async fn forwards_mcp_cancellation_during_an_lsp_response_race()
     let client =
         timeout(Duration::from_secs(10), ().serve(transport)).await??;
 
-    let start_arguments = json!({ "start": true }).as_object().unwrap().clone();
+    let start_arguments = json!({
+        "server": "mock-lsp",
+        "start": true,
+    })
+    .as_object()
+    .unwrap()
+    .clone();
     timeout(
         Duration::from_secs(10),
         client.call_tool(
@@ -1027,8 +1154,13 @@ async fn forwards_mcp_cancellation_during_an_lsp_response_race()
 
     timeout(Duration::from_secs(10), async {
         loop {
+            let arguments =
+                json!({ "server": "mock-lsp" }).as_object().unwrap().clone();
             let status = client
-                .call_tool(CallToolRequestParams::new("deixis_server_status"))
+                .call_tool(
+                    CallToolRequestParams::new("deixis_server_status")
+                        .with_arguments(arguments),
+                )
                 .await?;
             if status
                 .structured_content
@@ -1047,8 +1179,13 @@ async fn forwards_mcp_cancellation_during_an_lsp_response_race()
 
     timeout(Duration::from_secs(10), async {
         loop {
+            let arguments =
+                json!({ "server": "mock-lsp" }).as_object().unwrap().clone();
             let status = client
-                .call_tool(CallToolRequestParams::new("deixis_server_status"))
+                .call_tool(
+                    CallToolRequestParams::new("deixis_server_status")
+                        .with_arguments(arguments),
+                )
                 .await?;
             if status
                 .structured_content

@@ -234,30 +234,41 @@ impl DeixisServer {
             )
         })?;
         arguments.validate()?;
-        let language_server_name = arguments.server.as_deref().or_else(|| {
-            self.language_servers.keys().next().map(String::as_str)
-        });
+        if arguments.server.is_none() {
+            if self.language_servers.is_empty() {
+                return Ok(error_result(ToolError::new(
+                    "no_server_configured",
+                    SERVER_STATUS_TOOL,
+                    "no language server is configured",
+                )));
+            }
+
+            let mut statuses = Vec::with_capacity(self.language_servers.len());
+            for language_server in self.language_servers.values() {
+                statuses.push(language_server.status().await);
+            }
+            return Ok(success_result(
+                status_overview_json(&statuses),
+                status_overview_text(&statuses),
+            ));
+        }
+
+        let language_server_name = arguments.server.as_deref();
         let language_server = language_server_name
             .and_then(|name| self.language_servers.get(name));
         let Some(language_server) = language_server else {
-            let error = arguments.server.as_deref().map_or_else(
-                || {
-                    ToolError::new(
-                        "no_server_configured",
-                        SERVER_STATUS_TOOL,
-                        "no language server is configured",
-                    )
-                },
-                |name| {
-                    ToolError::new(
-                        "unknown_server",
-                        SERVER_STATUS_TOOL,
-                        format!("server `{name}` is not configured"),
-                    )
-                    .with_server(name)
-                },
-            );
-            return Ok(error_result(error));
+            let name = arguments
+                .server
+                .as_deref()
+                .expect("the overview case returned above");
+            return Ok(error_result(
+                ToolError::new(
+                    "unknown_server",
+                    SERVER_STATUS_TOOL,
+                    format!("server `{name}` is not configured"),
+                )
+                .with_server(name),
+            ));
         };
 
         let status = if arguments.start {
@@ -1398,6 +1409,24 @@ struct ServerStatusArguments {
     start: bool,
 }
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ServerStatusOverviewState {
+    NotStarted,
+    Running,
+    Attached,
+}
+
+impl ServerStatusOverviewState {
+    fn text(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not started",
+            Self::Running => "running",
+            Self::Attached => "attached",
+        }
+    }
+}
+
 impl ServerStatusArguments {
     fn validate(&self) -> Result<(), McpError> {
         if self
@@ -1407,6 +1436,12 @@ impl ServerStatusArguments {
         {
             return Err(McpError::invalid_params(
                 "invalid server status arguments: `server` must not be empty",
+                None,
+            ));
+        }
+        if self.start && self.server.is_none() {
+            return Err(McpError::invalid_params(
+                "invalid server status arguments: `server` is required when `start` is true",
                 None,
             ));
         }
@@ -1428,24 +1463,26 @@ pub async fn serve_stdio(startup: StartupState) -> Result<(), Box<dyn Error>> {
 fn server_status_tool() -> Tool {
     Tool::new(
         SERVER_STATUS_TOOL,
-        "Return status for a configured language server, optionally starting it.",
+        "Summarize all configured language servers, or return detailed status for one.",
         object_schema(json!({
             "type": "object",
             "properties": {
                 "server": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Configured server name. Defaults to the first name in stable lexical order."
+                    "description": "Configured server name. Omit it for a compact overview of every configured server."
                 },
                 "start": {
                     "type": "boolean",
-                    "description": "Start the configured language server before returning status."
+                    "description": "Start the named language server before returning status. Requires `server`."
                 }
             },
             "additionalProperties": false
         })),
     )
-    .with_raw_output_schema(result_output_schema(status_output_schema()))
+    .with_raw_output_schema(result_output_schema(json!({
+        "oneOf": [status_overview_output_schema(), status_output_schema()]
+    })))
     .with_annotations(
         ToolAnnotations::new()
             .read_only(true)
@@ -2000,6 +2037,34 @@ fn status_output_schema() -> JsonValue {
     })
 }
 
+fn status_overview_output_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "servers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "configuredName": { "type": "string" },
+                        "state": {
+                            "enum": [
+                                "notStarted",
+                                "running",
+                                "attached"
+                            ]
+                        }
+                    },
+                    "required": ["configuredName", "state"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["servers"],
+        "additionalProperties": false
+    })
+}
+
 fn result_output_schema(success: JsonValue) -> Arc<JsonObject> {
     Arc::new(object_schema(json!({
         "oneOf": [success, error_output_schema()]
@@ -2104,6 +2169,44 @@ fn status_json(status: &ServerSnapshot) -> JsonValue {
         "capabilities": status.capabilities(),
         "readiness": status.readiness(),
     })
+}
+
+fn status_overview_json(statuses: &[ServerSnapshot]) -> JsonValue {
+    json!({
+        "servers": statuses
+            .iter()
+            .map(|status| {
+                json!({
+                    "configuredName": status.configured_name(),
+                    "state": status_overview_state(status),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn status_overview_text(statuses: &[ServerSnapshot]) -> String {
+    statuses
+        .iter()
+        .map(|status| {
+            format!(
+                "{}: {}",
+                status.configured_name(),
+                status_overview_state(status).text()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn status_overview_state(status: &ServerSnapshot) -> ServerStatusOverviewState {
+    if !status.started() {
+        return ServerStatusOverviewState::NotStarted;
+    }
+    if status.attached() {
+        return ServerStatusOverviewState::Attached;
+    }
+    ServerStatusOverviewState::Running
 }
 
 fn status_text(status: &ServerSnapshot) -> String {

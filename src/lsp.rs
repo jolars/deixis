@@ -1522,6 +1522,7 @@ impl DiagnosticCache {
 pub struct ServerSnapshot {
     configured_name: String,
     started: bool,
+    attached: bool,
     server_name: Option<String>,
     server_version: Option<String>,
     capabilities: JsonValue,
@@ -1535,6 +1536,7 @@ impl ServerSnapshot {
         Self {
             configured_name: configured_name.to_owned(),
             started: false,
+            attached: false,
             server_name: None,
             server_version: None,
             capabilities: JsonValue::Null,
@@ -1581,6 +1583,7 @@ impl ServerSnapshot {
         Ok(Self {
             configured_name: configured_name.to_owned(),
             started: true,
+            attached: false,
             server_name,
             server_version,
             capabilities,
@@ -1596,6 +1599,10 @@ impl ServerSnapshot {
 
     pub fn started(&self) -> bool {
         self.started
+    }
+
+    pub fn attached(&self) -> bool {
+        self.attached
     }
 
     pub fn server_name(&self) -> Option<&str> {
@@ -2554,6 +2561,7 @@ impl ActiveServer {
     async fn snapshot(&self) -> ServerSnapshot {
         let mut snapshot = self.status.lock().await.clone();
         snapshot.readiness = self.readiness.lock().await.snapshot();
+        snapshot.attached = !self.documents.lock().await.is_empty();
         snapshot
     }
 
