@@ -235,6 +235,78 @@ impl LazyLanguageServer {
         Ok(hover)
     }
 
+    pub async fn signature_help(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+    ) -> Result<Option<SignatureHelp>, LspError> {
+        let cancellation = CancellationToken::new();
+        self.signature_help_with_cancellation(
+            path,
+            language_id,
+            position,
+            &cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn signature_help_with_cancellation(
+        &self,
+        path: impl AsRef<Path>,
+        language_id: &str,
+        position: Position,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<SignatureHelp>, LspError> {
+        const METHOD: &str = "textDocument/signatureHelp";
+
+        let file = self
+            .project
+            .resolve_file(path)
+            .map_err(LspError::DocumentPath)?;
+        let active = self.active_server_with_cancellation(cancellation).await?;
+        let snapshot = active.status.lock().await.clone();
+        if !active
+            .supports_method(
+                METHOD,
+                snapshot.capabilities().get("signatureHelpProvider"),
+            )
+            .await
+        {
+            return Err(LspError::UnsupportedCapability {
+                server: self.config.name().to_owned(),
+                method: METHOD,
+            });
+        }
+
+        let document = active.synchronize_document(file, language_id).await?;
+        let encoding = snapshot.position_encoding().unwrap_or_default();
+        let lsp_position = document
+            .to_lsp_position(position, encoding)
+            .map_err(|source| LspError::PositionConversion {
+                server: self.config.name().to_owned(),
+                path: document.absolute_path().to_path_buf(),
+                source,
+            })?;
+        let value = active
+            .request_value(
+                METHOD,
+                json!({
+                    "textDocument": { "uri": document.uri() },
+                    "position": lsp_position,
+                }),
+                self.config.timeouts().request(),
+                cancellation,
+            )
+            .await?;
+        let response: Option<RawSignatureHelp> =
+            serde_json::from_value(value).map_err(LspError::DecodeResult)?;
+
+        Ok(response.map(|response| {
+            SignatureHelp::from_raw(self.config.name(), response)
+        }))
+    }
+
     pub async fn definition(
         &self,
         path: impl AsRef<Path>,
@@ -1234,6 +1306,98 @@ pub struct Hover {
     pub contents: HoverContents,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<Range>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureHelp {
+    pub server: String,
+    pub signatures: Vec<SignatureInformation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_signature: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+impl SignatureHelp {
+    fn from_raw(server: &str, raw: RawSignatureHelp) -> Self {
+        let RawSignatureHelp {
+            signatures,
+            active_signature,
+            active_parameter,
+            mut fields,
+        } = raw;
+        for reserved in ["server", "readiness", "resultStability"] {
+            fields.remove(reserved);
+        }
+        Self {
+            server: server.to_owned(),
+            signatures,
+            active_signature,
+            active_parameter,
+            fields,
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.active_signature
+            .and_then(|index| self.signatures.get(index as usize))
+            .or_else(|| self.signatures.first())
+            .map(|signature| signature.label.trim().to_owned())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSignatureHelp {
+    signatures: Vec<SignatureInformation>,
+    #[serde(default)]
+    active_signature: Option<u32>,
+    #[serde(default)]
+    active_parameter: Option<u32>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureInformation {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<SignatureDocumentation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Vec<ParameterInformation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterInformation {
+    pub label: ParameterLabel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<SignatureDocumentation>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, JsonValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ParameterLabel {
+    Simple(String),
+    Offsets([u32; 2]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SignatureDocumentation {
+    String(String),
+    Markup(MarkupContent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4146,6 +4310,16 @@ fn initialize_params(
                 },
                 "references": {
                     "dynamicRegistration": true,
+                },
+                "signatureHelp": {
+                    "dynamicRegistration": true,
+                    "signatureInformation": {
+                        "documentationFormat": ["markdown", "plaintext"],
+                        "parameterInformation": {
+                            "labelOffsetSupport": true,
+                        },
+                        "activeParameterSupport": true,
+                    },
                 },
                 "rename": {
                     "dynamicRegistration": true,

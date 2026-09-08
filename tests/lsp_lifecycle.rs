@@ -481,6 +481,13 @@ async fn handles_common_server_to_client_messages() -> Result<(), Box<dyn Error>
     assert!(probe.implementation_dynamic_registration);
     assert!(probe.implementation_link_support);
     assert!(probe.references_dynamic_registration);
+    assert!(probe.signature_help_dynamic_registration);
+    assert_eq!(
+        probe.signature_help_documentation_formats,
+        ["markdown", "plaintext"]
+    );
+    assert!(probe.signature_help_label_offset_support);
+    assert!(probe.signature_help_active_parameter_support);
     assert!(probe.document_symbol_dynamic_registration);
     assert_eq!(probe.document_symbol_kind_count, 26);
     assert!(probe.hierarchical_document_symbol_support);
@@ -1202,6 +1209,21 @@ async fn normalizes_null_and_empty_semantic_responses()
             );
         }
 
+        let signature_help =
+            manager.signature_help("main.rs", "rust", position).await?;
+        if mode.ends_with("null") {
+            assert!(signature_help.is_none(), "{mode}");
+        } else {
+            let signature_help = signature_help
+                .expect("the empty signature help object should be retained");
+            assert_eq!(signature_help.text(), "", "{mode}");
+            assert_eq!(
+                serde_json::to_value(signature_help)?,
+                json!({ "server": "mock-lsp", "signatures": [] }),
+                "{mode}"
+            );
+        }
+
         assert!(
             manager
                 .declaration("main.rs", "rust", position)
@@ -1269,6 +1291,19 @@ async fn accepts_partial_lsp_objects_with_optional_fields_omitted()
     assert_eq!(
         serde_json::to_value(hover)?,
         json!({ "contents": "minimal hover" })
+    );
+
+    let signature_help = manager
+        .signature_help("main.rs", "rust", position)
+        .await?
+        .expect("the partial signature help should be present");
+    assert_eq!(signature_help.text(), "answer()");
+    assert_eq!(
+        serde_json::to_value(signature_help)?,
+        json!({
+            "server": "mock-lsp",
+            "signatures": [{ "label": "answer()" }]
+        })
     );
 
     let definitions = manager.definition("main.rs", "rust", position).await?;
@@ -1501,6 +1536,88 @@ async fn normalizes_references_and_forwards_declaration_inclusion()
 
         manager.shutdown().await?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn requests_structured_signature_help_at_a_utf_8_position()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root(
+        "signature-help-full-utf-16",
+        1_000,
+        1_000,
+    )?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+
+    let signature_help = manager
+        .signature_help("main.rs", "rust", Position::new(0, 8))
+        .await?
+        .expect("the mock server should return signature help");
+
+    assert_eq!(signature_help.text(), "add(left: i32, right: i32) -> i32");
+    assert_eq!(
+        serde_json::to_value(signature_help)?,
+        json!({
+            "server": "mock-lsp",
+            "signatures": [
+                {
+                    "label": "add(left: i32, right: i32) -> i32",
+                    "documentation": {
+                        "kind": "markdown",
+                        "value": "Adds two integers."
+                    },
+                    "parameters": [
+                        {
+                            "label": "left: i32",
+                            "documentation": "Left operand."
+                        },
+                        {
+                            "label": [15, 25],
+                            "documentation": {
+                                "kind": "plaintext",
+                                "value": "Right operand."
+                            },
+                            "x-mock-extension": true
+                        }
+                    ],
+                    "activeParameter": 1,
+                    "x-mock-extension": "signature"
+                },
+                { "label": "add(values: &[i32]) -> i32" }
+            ],
+            "activeSignature": 0,
+            "activeParameter": 0,
+            "x-mock-extension": true
+        })
+    );
+
+    manager.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_signature_help_before_synchronizing_when_unsupported()
+-> Result<(), Box<dyn Error>> {
+    let (manager, root) = configured_manager_with_root(
+        "signature-help-unsupported",
+        1_000,
+        1_000,
+    )?;
+    fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+
+    let error = manager
+        .signature_help("main.rs", "rust", Position::new(0, 4))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LspError::UnsupportedCapability { .. }));
+
+    let probe: DocumentEventsResponse = manager
+        .request("mock/documentEvents", JsonValue::Null)
+        .await?;
+    assert!(probe.events.is_empty());
+    assert_eq!(probe.open_documents, 0);
+
+    manager.shutdown().await?;
     Ok(())
 }
 
@@ -1886,6 +2003,10 @@ struct ProbeResponse {
     implementation_dynamic_registration: bool,
     implementation_link_support: bool,
     references_dynamic_registration: bool,
+    signature_help_dynamic_registration: bool,
+    signature_help_documentation_formats: Vec<String>,
+    signature_help_label_offset_support: bool,
+    signature_help_active_parameter_support: bool,
     document_symbol_dynamic_registration: bool,
     document_symbol_kind_count: usize,
     hierarchical_document_symbol_support: bool,

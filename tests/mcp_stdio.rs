@@ -252,6 +252,7 @@ async fn discovers_the_user_config_without_fixing_the_project_root()
         timeout(Duration::from_secs(10), client.list_tools(None)).await??;
 
     assert!(tools.tools.iter().any(|tool| tool.name == "hover"));
+    assert!(tools.tools.iter().any(|tool| tool.name == "signature_help"));
     for tool in &tools.tools {
         let output_schema = tool.output_schema.as_ref().unwrap_or_else(|| {
             panic!("{} should declare an output schema", tool.name)
@@ -378,6 +379,11 @@ async fn semantic_tools_have_stable_text_fallbacks_and_structured_output()
             "`answer`: the ultimate value".to_owned(),
         ),
         (
+            "signature_help",
+            position_arguments.clone(),
+            "add(left: i32, right: i32) -> i32".to_owned(),
+        ),
+        (
             "declaration",
             position_arguments.clone(),
             location_text.clone(),
@@ -440,6 +446,17 @@ async fn semantic_tools_have_stable_text_fallbacks_and_structured_output()
 
         match tool {
             "hover" => assert_eq!(structured["contents"]["kind"], "markdown"),
+            "signature_help" => {
+                assert_eq!(structured["server"], "mock-lsp");
+                assert_eq!(
+                    structured["signatures"][0]["parameters"][1]["label"],
+                    json!([15, 25])
+                );
+                assert_eq!(
+                    structured["signatures"][0]["parameters"][1]["x-mock-extension"],
+                    true
+                );
+            }
             "diagnostics" => {
                 assert_eq!(structured["diagnostics"][0]["severity"], 1);
                 assert_eq!(
@@ -1145,6 +1162,7 @@ async fn read_only_tools_accept_null_and_empty_lsp_results()
         });
         let cases = [
             ("hover", position_arguments.clone(), "contents"),
+            ("signature_help", position_arguments.clone(), "signatures"),
             ("declaration", position_arguments.clone(), "locations"),
             ("definition", position_arguments.clone(), "locations"),
             ("type_definition", position_arguments.clone(), "locations"),
@@ -1193,6 +1211,7 @@ async fn read_only_tools_accept_null_and_empty_lsp_results()
 
             if tool == "workspace_symbols"
                 || (tool == "hover" && mode.ends_with("empty"))
+                || (tool == "signature_help" && mode.ends_with("empty"))
             {
                 assert!(
                     structured.get("readiness").is_none(),
@@ -2679,6 +2698,131 @@ async fn references_reports_an_unsupported_capability()
             .and_then(|value| value.pointer("/error/tool")),
         Some(&json!("references"))
     );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn exposes_signature_help_with_structured_parameters()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("signature-help-full-utf-16")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "signature-help-full-utf-16")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+    let signature_help_tool = tools
+        .tools
+        .iter()
+        .find(|candidate| candidate.name == "signature_help")
+        .expect("configured servers should expose signature help");
+    assert_eq!(
+        signature_help_tool.input_schema.get("required"),
+        Some(&json!(["path", "position"]))
+    );
+    assert!(signature_help_tool.output_schema.is_some());
+    assert_eq!(
+        signature_help_tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+
+    let arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .expect("signature help arguments should be an object")
+    .clone();
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("signature_help")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(
+        result.content[0].as_text().expect("text fallback").text,
+        "add(left: i32, right: i32) -> i32"
+    );
+    let structured = result
+        .structured_content
+        .as_ref()
+        .expect("signature help should retain structured output");
+    assert_eq!(structured["server"], "mock-lsp");
+    assert_eq!(structured["activeSignature"], 0);
+    assert_eq!(structured["signatures"][0]["activeParameter"], 1);
+    assert_eq!(
+        structured["signatures"][0]["parameters"][0]["label"],
+        "left: i32"
+    );
+    assert_eq!(
+        structured["signatures"][0]["parameters"][1]["label"],
+        json!([15, 25])
+    );
+    assert_eq!(
+        structured["signatures"][0]["parameters"][1]["documentation"]["kind"],
+        "plaintext"
+    );
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn signature_help_reports_an_unsupported_capability()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("signature-help-unsupported")?;
+    fs::write(root.join("main.rs"), "let answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode(&root, "signature-help-unsupported")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let transport = TokioChildProcess::new(command)?;
+    let client =
+        timeout(Duration::from_secs(10), ().serve(transport)).await??;
+    let arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 4 },
+    })
+    .as_object()
+    .expect("signature help arguments should be an object")
+    .clone();
+
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("signature_help")
+                .with_arguments(arguments),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(true));
+    let error = &result.structured_content.as_ref().unwrap()["error"];
+    assert_eq!(error["code"], "unsupported_capability");
+    assert_eq!(error["method"], "textDocument/signatureHelp");
+    assert_eq!(error["tool"], "signature_help");
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())

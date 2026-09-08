@@ -177,6 +177,19 @@ fn handle_request<R: BufRead>(
                 )]),
                 _ => Json::Bool(true),
             };
+            let signature_help_provider = match mode {
+                "signature-help-unsupported" => Json::Bool(false),
+                _ => json_object([
+                    (
+                        "triggerCharacters",
+                        Json::Array(vec![Json::String("(".to_owned())]),
+                    ),
+                    (
+                        "retriggerCharacters",
+                        Json::Array(vec![Json::String(",".to_owned())]),
+                    ),
+                ]),
+            };
             let rename_provider = match mode {
                 "rename-unsupported" => Json::Bool(false),
                 "rename-no-prepare" => Json::Bool(true),
@@ -212,6 +225,10 @@ fn handle_request<R: BufRead>(
                 ),
                 ("referencesProvider".to_owned(), references_provider),
                 ("renameProvider".to_owned(), rename_provider),
+                (
+                    "signatureHelpProvider".to_owned(),
+                    signature_help_provider,
+                ),
                 ("textDocumentSync".to_owned(), text_document_sync),
                 (
                     "typeDefinitionProvider".to_owned(),
@@ -799,6 +816,65 @@ fn handle_request<R: BufRead>(
                 "semantic-responses-null" => Json::Null,
                 "semantic-responses-empty" => Json::Array(Vec::new()),
                 _ => Json::Array(locations),
+            };
+            write_message(output, response(id, result))?;
+        }
+        "textDocument/signatureHelp" => {
+            if mode == "signature-help-unsupported" {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32601,
+                        "signature help request bypassed capability gate"
+                            .to_owned(),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let expected_character = if mode.ends_with("utf-16") {
+                6
+            } else if mode.ends_with("utf-32") {
+                5
+            } else {
+                8
+            };
+            let position = params.get("position");
+            let line = position
+                .and_then(|position| position.get("line"))
+                .and_then(Json::as_i64);
+            let character = position
+                .and_then(|position| position.get("character"))
+                .and_then(Json::as_i64);
+            if line != Some(0) || character != Some(expected_character) {
+                write_message(
+                    output,
+                    error_response(
+                        id,
+                        -32602,
+                        format!(
+                            "expected signature help position 0:{expected_character}, got {line:?}:{character:?}"
+                        ),
+                    ),
+                )?;
+                return Ok(());
+            }
+
+            let result = match mode {
+                "semantic-responses-null" => Json::Null,
+                "semantic-responses-empty" => json_object([(
+                    "signatures",
+                    Json::Array(Vec::new()),
+                )]),
+                mode if mode.contains("-partial-") => json_object([(
+                    "signatures",
+                    Json::Array(vec![json_object([(
+                        "label",
+                        Json::String("answer()".to_owned()),
+                    )])]),
+                )]),
+                _ => mock_signature_help(),
             };
             write_message(output, response(id, result))?;
         }
@@ -1730,6 +1806,10 @@ fn probe_client<R: BufRead>(
         implementation_dynamic_registration,
         implementation_link_support,
         references_dynamic_registration,
+        signature_help_dynamic_registration,
+        signature_help_documentation_formats,
+        signature_help_label_offset_support,
+        signature_help_active_parameter_support,
         document_symbol_dynamic_registration,
         document_symbol_kind_count,
         hierarchical_document_symbol_support,
@@ -1825,6 +1905,32 @@ fn probe_client<R: BufRead>(
             .get("textDocument")
             .and_then(|text_document| text_document.get("references"))
             .and_then(|references| references.get("dynamicRegistration"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let signature_help = capabilities
+            .get("textDocument")
+            .and_then(|text_document| text_document.get("signatureHelp"));
+        let signature_help_dynamic_registration = signature_help
+            .and_then(|signature_help| {
+                signature_help.get("dynamicRegistration")
+            })
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let signature_information = signature_help
+            .and_then(|signature_help| {
+                signature_help.get("signatureInformation")
+            });
+        let signature_help_documentation_formats = signature_information
+            .and_then(|information| information.get("documentationFormat"))
+            .cloned()
+            .unwrap_or(Json::Null);
+        let signature_help_label_offset_support = signature_information
+            .and_then(|information| information.get("parameterInformation"))
+            .and_then(|information| information.get("labelOffsetSupport"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let signature_help_active_parameter_support = signature_information
+            .and_then(|information| information.get("activeParameterSupport"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
         let document_symbol = capabilities
@@ -1939,6 +2045,10 @@ fn probe_client<R: BufRead>(
             implementation_dynamic_registration,
             implementation_link_support,
             references_dynamic_registration,
+            signature_help_dynamic_registration,
+            signature_help_documentation_formats,
+            signature_help_label_offset_support,
+            signature_help_active_parameter_support,
             document_symbol_dynamic_registration,
             document_symbol_kind_count,
             hierarchical_document_symbol_support,
@@ -2080,6 +2190,22 @@ fn probe_client<R: BufRead>(
             Json::Bool(references_dynamic_registration),
         ),
         (
+            "signature_help_dynamic_registration",
+            Json::Bool(signature_help_dynamic_registration),
+        ),
+        (
+            "signature_help_documentation_formats",
+            signature_help_documentation_formats,
+        ),
+        (
+            "signature_help_label_offset_support",
+            Json::Bool(signature_help_label_offset_support),
+        ),
+        (
+            "signature_help_active_parameter_support",
+            Json::Bool(signature_help_active_parameter_support),
+        ),
+        (
             "document_symbol_dynamic_registration",
             Json::Bool(document_symbol_dynamic_registration),
         ),
@@ -2182,6 +2308,86 @@ fn mock_diagnostic(start: i64, end: i64) -> Json {
             "data",
             json_object([("extension", Json::Bool(true))]),
         ),
+    ])
+}
+
+fn mock_signature_help() -> Json {
+    json_object([
+        (
+            "signatures",
+            Json::Array(vec![
+                json_object([
+                    (
+                        "label",
+                        Json::String(
+                            "add(left: i32, right: i32) -> i32".to_owned(),
+                        ),
+                    ),
+                    (
+                        "documentation",
+                        json_object([
+                            ("kind", Json::String("markdown".to_owned())),
+                            (
+                                "value",
+                                Json::String("Adds two integers.".to_owned()),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "parameters",
+                        Json::Array(vec![
+                            json_object([
+                                (
+                                    "label",
+                                    Json::String("left: i32".to_owned()),
+                                ),
+                                (
+                                    "documentation",
+                                    Json::String("Left operand.".to_owned()),
+                                ),
+                            ]),
+                            json_object([
+                                (
+                                    "label",
+                                    Json::Array(vec![
+                                        Json::Number(15),
+                                        Json::Number(25),
+                                    ]),
+                                ),
+                                (
+                                    "documentation",
+                                    json_object([
+                                        (
+                                            "kind",
+                                            Json::String("plaintext".to_owned()),
+                                        ),
+                                        (
+                                            "value",
+                                            Json::String(
+                                                "Right operand.".to_owned(),
+                                            ),
+                                        ),
+                                    ]),
+                                ),
+                                ("x-mock-extension", Json::Bool(true)),
+                            ]),
+                        ]),
+                    ),
+                    ("activeParameter", Json::Number(1)),
+                    (
+                        "x-mock-extension",
+                        Json::String("signature".to_owned()),
+                    ),
+                ]),
+                json_object([(
+                    "label",
+                    Json::String("add(values: &[i32]) -> i32".to_owned()),
+                )]),
+            ]),
+        ),
+        ("activeSignature", Json::Number(0)),
+        ("activeParameter", Json::Number(0)),
+        ("x-mock-extension", Json::Bool(true)),
     ])
 }
 

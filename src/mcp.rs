@@ -36,6 +36,7 @@ use crate::{
 
 const SERVER_STATUS_TOOL: &str = "deixis_server_status";
 const HOVER_TOOL: &str = "hover";
+const SIGNATURE_HELP_TOOL: &str = "signature_help";
 const DECLARATION_TOOL: &str = "declaration";
 const DEFINITION_TOOL: &str = "definition";
 const TYPE_DEFINITION_TOOL: &str = "type_definition";
@@ -177,6 +178,7 @@ impl ServerHandler for DeixisServer {
             let mut tools = vec![
                 server_status_tool(),
                 hover_tool(),
+                signature_help_tool(),
                 location_tool(DECLARATION_SPEC),
                 location_tool(DEFINITION_SPEC),
                 location_tool(TYPE_DEFINITION_SPEC),
@@ -206,6 +208,9 @@ impl ServerHandler for DeixisServer {
                 self.call_server_status(&request, &context.ct).await
             }
             HOVER_TOOL => self.call_hover(request, &context.ct).await,
+            SIGNATURE_HELP_TOOL => {
+                self.call_signature_help(request, &context.ct).await
+            }
             DECLARATION_TOOL => {
                 self.call_location(request, DECLARATION_SPEC, &context.ct)
                     .await
@@ -427,6 +432,123 @@ impl DeixisServer {
                     language_server.status().await.readiness().clone();
                 let text = empty_result_text("hover information", &readiness);
                 let mut structured = json!({ "contents": null });
+                attach_empty_result_context(&mut structured, &readiness);
+                (structured, text)
+            }
+        };
+        Ok(success_result(structured, text))
+    }
+
+    async fn call_signature_help(
+        &self,
+        request: CallToolRequestParams,
+        cancellation: &CancellationToken,
+    ) -> Result<CallToolResponse, McpError> {
+        const METHOD: &str = "textDocument/signatureHelp";
+
+        let arguments = request.arguments.unwrap_or_default();
+        let arguments = serde_json::from_value::<LocationArguments>(
+            JsonValue::Object(arguments),
+        )
+        .map_err(|error| {
+            McpError::invalid_params(
+                format!("invalid signature help arguments: {error}"),
+                None,
+            )
+        })?;
+        arguments.validate(SIGNATURE_HELP_TOOL)?;
+        let _workspace = self.workspace_gate.read().await;
+        let Some(config) = self.config() else {
+            return Ok(error_result(
+                ToolError::new(
+                    "no_server_configured",
+                    SIGNATURE_HELP_TOOL,
+                    "no language server is configured",
+                )
+                .with_method(METHOD)
+                .with_path(&arguments.path),
+            ));
+        };
+        let file = match self.project().resolve_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_path(
+                    SIGNATURE_HELP_TOOL,
+                    METHOD,
+                    &arguments.path,
+                    arguments.server.as_deref(),
+                    &error,
+                )));
+            }
+        };
+        let route =
+            match config.route(file.relative(), arguments.server.as_deref()) {
+                Ok(route) => route,
+                Err(error) => {
+                    return Ok(error_result(ToolError::from_route(
+                        SIGNATURE_HELP_TOOL,
+                        METHOD,
+                        &arguments.path,
+                        arguments.server.as_deref(),
+                        &error,
+                    )));
+                }
+            };
+        let language_server = self
+            .language_servers
+            .get(route.server().name())
+            .expect("every validated server should have a lifecycle manager");
+
+        let signature_help = match language_server
+            .signature_help_with_cancellation(
+                file.absolute(),
+                route.language_id(),
+                arguments.position,
+                cancellation,
+            )
+            .await
+        {
+            Ok(signature_help) => signature_help,
+            Err(error) => {
+                return Ok(error_result(ToolError::from_lsp(
+                    ToolContext {
+                        tool: SIGNATURE_HELP_TOOL,
+                        server: Some(route.server().name()),
+                        method: Some(METHOD),
+                        path: Some(&arguments.path),
+                    },
+                    &error,
+                )));
+            }
+        };
+
+        let (structured, text) = match signature_help {
+            Some(signature_help) => {
+                let text = signature_help.text();
+                let text = if text.is_empty() {
+                    "Signature help is empty.".to_owned()
+                } else {
+                    text
+                };
+                let structured = serde_json::to_value(signature_help)
+                    .map_err(|error| {
+                        McpError::internal_error(
+                            format!(
+                                "failed to encode signature help response: {error}"
+                            ),
+                            None,
+                        )
+                    })?;
+                (structured, text)
+            }
+            None => {
+                let readiness =
+                    language_server.status().await.readiness().clone();
+                let text = empty_result_text("signature help", &readiness);
+                let mut structured = json!({
+                    "server": route.server().name(),
+                    "signatures": [],
+                });
                 attach_empty_result_context(&mut structured, &readiness);
                 (structured, text)
             }
@@ -2083,6 +2205,104 @@ fn hover_tool() -> Tool {
     )
 }
 
+fn signature_help_tool() -> Tool {
+    Tool::new(
+        SIGNATURE_HELP_TOOL,
+        "Return call signatures and structured parameter information for a UTF-8 position in a project file.",
+        object_schema(json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Project-relative or root-contained absolute file path."
+                },
+                "server": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Configured server name used to resolve an otherwise ambiguous route."
+                },
+                "position": position_schema(),
+            },
+            "required": ["path", "position"],
+            "additionalProperties": false
+        })),
+    )
+    .with_raw_output_schema(result_output_schema(json!({
+        "type": "object",
+        "properties": {
+            "server": {
+                "type": "string",
+                "description": "Configured name of the language server that returned this signature help."
+            },
+            "signatures": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string" },
+                        "documentation": signature_documentation_schema(),
+                        "parameters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {
+                                        "oneOf": [
+                                            { "type": "string" },
+                                            {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "integer",
+                                                    "minimum": 0,
+                                                    "maximum": u32::MAX
+                                                },
+                                                "minItems": 2,
+                                                "maxItems": 2
+                                            }
+                                        ]
+                                    },
+                                    "documentation": signature_documentation_schema()
+                                },
+                                "required": ["label"],
+                                "additionalProperties": true
+                            }
+                        },
+                        "activeParameter": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": u32::MAX
+                        }
+                    },
+                    "required": ["label"],
+                    "additionalProperties": true
+                }
+            },
+            "activeSignature": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": u32::MAX
+            },
+            "activeParameter": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": u32::MAX
+            },
+            "readiness": readiness_schema(),
+            "resultStability": result_stability_schema()
+        },
+        "required": ["server", "signatures"],
+        "additionalProperties": true
+    })))
+    .with_annotations(
+        ToolAnnotations::new()
+            .read_only(true)
+            .destructive(false)
+            .idempotent(true)
+            .open_world(false),
+    )
+}
+
 fn location_tool(spec: LocationToolSpec) -> Tool {
     Tool::new(
         spec.tool,
@@ -2708,6 +2928,23 @@ fn range_schema() -> JsonValue {
         },
         "required": ["start", "end"],
         "additionalProperties": false
+    })
+}
+
+fn signature_documentation_schema() -> JsonValue {
+    json!({
+        "oneOf": [
+            { "type": "string" },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "enum": ["plaintext", "markdown"] },
+                    "value": { "type": "string" }
+                },
+                "required": ["kind", "value"],
+                "additionalProperties": false
+            }
+        ]
     })
 }
 

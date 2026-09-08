@@ -35,7 +35,7 @@ shipped stdio surface.
   deadline and cancellation, and report the terminal failure clearly.
 - [ ] Add incoming and outgoing call hierarchy behind negotiated server
   capabilities, with the same result limits as references.
-- [ ] Add signature help behind negotiated server capabilities, with concise
+- [x] Add signature help behind negotiated server capabilities, with concise
   text and structured parameter information.
 - [ ] Present `document_symbols` as an explicit file-outline operation rather
   than a default navigation step in agent guidance and tool documentation.

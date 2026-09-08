@@ -12,13 +12,14 @@ layer.
 
 ## Capabilities
 
-A configured Deixis session exposes twelve read-only MCP tools by default.
-Starting it with `--allow-mutation` adds `apply_rename` as a thirteenth tool.
+A configured Deixis session exposes thirteen read-only MCP tools by default.
+Starting it with `--allow-mutation` adds `apply_rename` as a fourteenth tool.
 
   | Tool                   | Purpose                                                     |
   | ---------------------- | ----------------------------------------------------------- |
   | `deixis_server_status` | Summarize configured servers or inspect one in detail.      |
   | `hover`                | Return hover markup at a zero-based UTF-8 position.         |
+  | `signature_help`       | Return call signatures and structured parameter details.   |
   | `definition`           | Find definitions.                                           |
   | `declaration`          | Find declarations.                                          |
   | `type_definition`      | Find type definitions.                                      |
@@ -266,6 +267,11 @@ configured `server` name. Position-based tools also accept:
 
 Both values are zero-based; `character` is a UTF-8 byte offset. If several
 servers match a file, supply `server` or make the configuration routes unique.
+`signature_help` returns every server-provided signature and its structured
+parameter labels and documentation. Its text fallback contains only the active
+signature—or the first signature when the server does not select one—to keep
+agent context compact.
+
 Without a `server`, `workspace_symbols` fans out to capable attached servers
 without starting others and merges results in stable server-name order. Supply
 `server` to query that server alone, starting it if necessary.

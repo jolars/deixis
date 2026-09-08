@@ -15,9 +15,9 @@ that server on demand, handle common server-to-client messages, continue after
 malformed server output, and shut down all started servers with a bounded
 forced-kill fallback. A configured session exposes the read-only
 `deixis_server_status` lifecycle probe, capability-gated navigation tools, a
-`diagnostics` tool, and a guarded symbol-rename workflow. The semantic tools
-synchronize project-contained documents and translate negotiated position
-encodings. Hover returns structured markup; navigation normalizes LSP location
+`diagnostics` tool, `signature_help`, and a guarded symbol-rename workflow. The
+semantic tools synchronize project-contained documents and translate
+negotiated position encodings. Hover returns structured markup; navigation
 variants and retains configured-server provenance. Diagnostics prefers pull
 reports when advertised and otherwise exposes cached push reports with explicit
 freshness. Workspace-symbol search fans out concurrently across capable
@@ -177,11 +177,12 @@ access, or command interpolation.
 ## MCP surface
 
 Without selected configuration, the current server advertises no tools. With
-configuration, it advertises twelve read-only tools: `deixis_server_status`,
-`hover`, `definition`, `declaration`, `type_definition`, `implementation`,
-`references`, `diagnostics`, `document_symbols`, `workspace_symbols`,
-`prepare_rename`, and `preview_rename`. Starting Deixis with
-`--allow-mutation` advertises and enables `apply_rename` as a thirteenth tool.
+configuration, it advertises thirteen read-only tools: `deixis_server_status`,
+`hover`, `signature_help`, `definition`, `declaration`, `type_definition`,
+`implementation`, `references`, `diagnostics`, `document_symbols`,
+`workspace_symbols`, `prepare_rename`, and `preview_rename`. Starting Deixis
+with `--allow-mutation` advertises and enables `apply_rename` as a fourteenth
+tool.
 The probe accepts an optional server name and `start` flag.
 Without a name, it returns every configured server in stable lexical order with
 a compact `not started`, `running`, or `attached` state. `Attached` means that
@@ -203,6 +204,16 @@ additionally requires an explicit `includeDeclaration` boolean, sends it in the
 LSP reference context, and normalizes `Location[]` or `null` to the configured
 server name, URI, range, and range position encoding. Each semantic tool also
 returns readable text content. No tool forwards arbitrary JSON-RPC.
+
+The `signature_help` tool takes a root-contained path, zero-based UTF-8
+position, and optional server override. It checks `signatureHelpProvider`,
+synchronizes the document, translates the request position to the negotiated
+server encoding, and returns the configured server name with the complete LSP
+signature list. Documentation for signatures and parameters remains structured
+as plain text or markup. Parameter labels remain either strings or two-offset
+tuples, and active signature and parameter indexes remain machine-readable. The
+text fallback contains only the active signature label, falling back to the
+first label when no valid active signature is selected.
 
 The `diagnostics` tool takes a root-contained path and optional server override.
 After synchronizing the document, it requests `textDocument/diagnostic` when
@@ -313,21 +324,24 @@ information remain structured JSON. Each successful result also supplies a small
 textual representation for MCP clients that do not consume structured content.
 These fallbacks have deterministic, tool-specific formats rather than serialized
 JSON. Status is one sentence; hover uses the rendered markup body; navigation
-and references use one location per line; diagnostics summarize availability and
-count; and symbols use one line per symbol, with indentation for document-symbol
-children. Extension fields and other details that do not belong in the concise
-text remain available in the structured result and do not perturb its rendering.
+and references use one location per line; signature help uses one selected
+signature label; diagnostics summarize availability and count; and symbols use
+one line per symbol, with indentation for document-symbol children. Extension
+fields and other details that do not belong in the concise text remain
+available in the structured result and do not perturb its rendering.
 
-Deixis advertises `window.workDoneProgress` and the rust-analyzer
+Deixis advertises signature-help support for markdown and plaintext
+documentation, parameter-label offsets, and per-signature active parameters.
+It also advertises `window.workDoneProgress` and the rust-analyzer
 `experimental.serverStatusNotification` extension. It tracks active work-done
 tokens and rust-analyzer's health and quiescence values. The lifecycle probe
-exposes the resulting `readiness` state and its source. When hover, navigation,
-references, document symbols, or current diagnostics return no semantic result,
-their structured output also includes `readiness` and a derived
-`resultStability`: `transient` while observed work is active, `stable` after
-observed work has completed, and `indeterminate` when the server has emitted no
-usable readiness signal or reports degraded health. Initialization by itself
-leaves readiness `unknown`.
+exposes the resulting `readiness` state and its source. When hover, signature
+help, navigation, references, document symbols, or current diagnostics return
+no semantic result, their structured output also includes `readiness` and a
+derived `resultStability`: `transient` while observed work is active, `stable`
+after observed work has completed, and `indeterminate` when the server has
+emitted no usable readiness signal or reports degraded health. Initialization
+by itself leaves readiness `unknown`.
 
 Deixis acknowledges `workspace/diagnostic/refresh` when a server sends it, but
 does not advertise proactive refresh support. Diagnostics remain
