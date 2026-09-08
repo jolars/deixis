@@ -49,6 +49,7 @@
               ./LICENSE-MIT
               ./README.md
               ./examples
+              ./server.json
               ./src
               ./tests
             ];
