@@ -20,6 +20,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+mod output;
+
 use crate::{
     config::{Config, ConfigRouteError},
     lsp::{
@@ -786,28 +788,15 @@ impl DeixisServer {
         } else {
             None
         };
-        let text = if let Some(readiness) = &readiness {
-            empty_result_text("references", readiness)
-        } else {
-            references
-                .iter()
-                .map(|reference| reference.text())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let locations = serde_json::to_value(references).map_err(|error| {
-            McpError::internal_error(
-                format!("failed to encode references response: {error}"),
-                None,
-            )
-        })?;
-        let mut structured = json!({
-            "locations": locations,
-        });
-        if let Some(readiness) = &readiness {
-            attach_empty_result_context(&mut structured, readiness);
-        }
-        Ok(success_result(structured, text))
+        paged_result(
+            references,
+            "references",
+            "locations",
+            arguments.limit,
+            arguments.offset,
+            false,
+            readiness.as_ref(),
+        )
     }
 
     async fn call_diagnostics(
@@ -1035,26 +1024,15 @@ impl DeixisServer {
         } else {
             None
         };
-        let text = if let Some(readiness) = &readiness {
-            empty_result_text("document symbols", readiness)
-        } else {
-            symbols
-                .iter()
-                .map(|symbol| symbol.text())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let symbols = serde_json::to_value(symbols).map_err(|error| {
-            McpError::internal_error(
-                format!("failed to encode document symbols: {error}"),
-                None,
-            )
-        })?;
-        let mut structured = json!({ "symbols": symbols });
-        if let Some(readiness) = &readiness {
-            attach_empty_result_context(&mut structured, readiness);
-        }
-        Ok(success_result(structured, text))
+        paged_result(
+            symbols,
+            "document symbols",
+            "symbols",
+            arguments.limit,
+            arguments.offset,
+            true,
+            readiness.as_ref(),
+        )
     }
 
     async fn call_workspace_symbols(
@@ -1112,7 +1090,10 @@ impl DeixisServer {
 
         if selected_servers.is_empty() {
             return Ok(success_result(
-                json!({ "symbols": [] }),
+                json!({
+                    "symbols": [],
+                    "pagination": output::paginate(Vec::new(), arguments.limit, arguments.offset, false).metadata,
+                }),
                 "No attached language servers.",
             ));
         }
@@ -1183,22 +1164,15 @@ impl DeixisServer {
             )));
         }
 
-        let text = if symbols.is_empty() {
-            "No workspace symbols.".to_owned()
-        } else {
-            symbols
-                .iter()
-                .map(|symbol| symbol.text())
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let symbols = serde_json::to_value(symbols).map_err(|error| {
-            McpError::internal_error(
-                format!("failed to encode workspace symbols: {error}"),
-                None,
-            )
-        })?;
-        Ok(success_result(json!({ "symbols": symbols }), text))
+        paged_result(
+            symbols,
+            "workspace symbols",
+            "symbols",
+            arguments.limit,
+            arguments.offset,
+            false,
+            None,
+        )
     }
 
     async fn call_prepare_rename(
@@ -1748,6 +1722,42 @@ fn lsp_error_code(error: &LspError) -> &'static str {
     }
 }
 
+fn paged_result(
+    items: impl Serialize,
+    subject: &str,
+    field: &str,
+    limit: u32,
+    offset: u64,
+    hierarchical: bool,
+    readiness: Option<&ReadinessSnapshot>,
+) -> Result<CallToolResponse, McpError> {
+    let JsonValue::Array(items) =
+        serde_json::to_value(items).map_err(|error| {
+            McpError::internal_error(
+                format!("failed to encode {subject}: {error}"),
+                None,
+            )
+        })?
+    else {
+        unreachable!("paginated tools return arrays");
+    };
+    let page = output::paginate(items, limit, offset, hierarchical);
+    let text = if page.metadata["total"] == 0 {
+        readiness.map_or_else(
+            || format!("No {subject}."),
+            |readiness| empty_result_text(subject, readiness),
+        )
+    } else {
+        page.text(subject)
+    };
+    let mut structured =
+        json!({ field: page.items, "pagination": page.metadata });
+    if let Some(readiness) = readiness {
+        attach_empty_result_context(&mut structured, readiness);
+    }
+    Ok(success_result(structured, text))
+}
+
 fn success_result(
     structured: JsonValue,
     text: impl Into<String>,
@@ -1792,6 +1802,10 @@ struct ReferencesArguments {
     server: Option<String>,
     position: Position,
     include_declaration: bool,
+    #[serde(default = "output::default_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1808,6 +1822,10 @@ struct DocumentSymbolsArguments {
     path: String,
     #[serde(default)]
     server: Option<String>,
+    #[serde(default = "output::default_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1816,6 +1834,10 @@ struct WorkspaceSymbolsArguments {
     query: String,
     #[serde(default)]
     server: Option<String>,
+    #[serde(default = "output::default_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1907,7 +1929,7 @@ impl WorkspaceSymbolsArguments {
                 None,
             ));
         }
-        Ok(())
+        output::validate_limit(self.limit)
     }
 }
 
@@ -1929,7 +1951,7 @@ impl DocumentSymbolsArguments {
                 None,
             ));
         }
-        Ok(())
+        output::validate_limit(self.limit)
     }
 }
 
@@ -1973,7 +1995,7 @@ impl ReferencesArguments {
                 None,
             ));
         }
-        Ok(())
+        output::validate_limit(self.limit)
     }
 }
 
@@ -2378,10 +2400,12 @@ fn location_tool(spec: LocationToolSpec) -> Tool {
 fn references_tool() -> Tool {
     Tool::new(
         REFERENCES_TOOL,
-        "Return references for a UTF-8 position in a project file.",
+        "Return a bounded page of references for a UTF-8 position in a project file. Use pagination.nextOffset to continue; text summarizes the structured locations.",
         object_schema(json!({
             "type": "object",
             "properties": {
+                "limit": output::limit_schema(),
+                "offset": output::offset_schema(),
                 "path": {
                     "type": "string",
                     "minLength": 1,
@@ -2405,8 +2429,10 @@ fn references_tool() -> Tool {
     .with_raw_output_schema(result_output_schema(json!({
         "type": "object",
         "properties": {
+            "pagination": output::pagination_schema(),
             "locations": {
                 "type": "array",
+                "maxItems": output::MAX_LIMIT,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -2428,7 +2454,7 @@ fn references_tool() -> Tool {
             "readiness": readiness_schema(),
             "resultStability": result_stability_schema()
         },
-        "required": ["locations"],
+        "required": ["locations", "pagination"],
         "additionalProperties": false
     })))
     .with_annotations(
@@ -2520,10 +2546,12 @@ fn diagnostics_tool() -> Tool {
 fn document_symbols_tool() -> Tool {
     Tool::new(
         DOCUMENT_SYMBOLS_TOOL,
-        "Return hierarchical symbols for a project file, normalizing legacy flat symbol responses to the same node shape.",
+        "Return a bounded page of file symbols in preorder, retaining hierarchy within the page. Every nested symbol counts toward the limit. Use pagination.nextOffset to continue and index/parentIndex to join pages.",
         object_schema(json!({
             "type": "object",
             "properties": {
+                "limit": output::limit_schema(),
+                "offset": output::offset_schema(),
                 "path": {
                     "type": "string",
                     "minLength": 1,
@@ -2560,6 +2588,9 @@ fn document_symbols_output_schema() -> Arc<JsonObject> {
                         "description": "Configured name of the language server that returned this symbol."
                     },
                     "uri": { "type": "string" },
+                    "index": { "type": "integer", "minimum": 0, "description": "Preorder index in this query response." },
+                    "parentIndex": { "type": ["integer", "null"], "minimum": 0, "description": "Parent's preorder index, or null for a document root. A parent outside this page is not repeated." },
+                    "childCount": { "type": "integer", "minimum": 0, "description": "Full number of direct children, including those outside this page." },
                     "name": { "type": "string" },
                     "detail": { "type": "string" },
                     "kind": {
@@ -2581,6 +2612,7 @@ fn document_symbols_output_schema() -> Arc<JsonObject> {
                     },
                     "children": {
                         "type": "array",
+                        "maxItems": output::MAX_LIMIT,
                         "items": { "$ref": "#/$defs/documentSymbol" }
                     },
                     "data": {}
@@ -2593,7 +2625,10 @@ fn document_symbols_output_schema() -> Arc<JsonObject> {
                     "range",
                     "selectionRange",
                     "positionEncoding",
-                    "children"
+                    "children",
+                    "index",
+                    "parentIndex",
+                    "childCount"
                 ],
                 "additionalProperties": true
             }
@@ -2602,14 +2637,16 @@ fn document_symbols_output_schema() -> Arc<JsonObject> {
             {
                 "type": "object",
                 "properties": {
+                    "pagination": output::pagination_schema(),
                     "symbols": {
                         "type": "array",
+                        "maxItems": output::MAX_LIMIT,
                         "items": { "$ref": "#/$defs/documentSymbol" }
                     },
                     "readiness": readiness_schema(),
                     "resultStability": result_stability_schema()
                 },
-                "required": ["symbols"],
+                "required": ["symbols", "pagination"],
                 "additionalProperties": false
             },
             error_output_schema()
@@ -2620,10 +2657,12 @@ fn document_symbols_output_schema() -> Arc<JsonObject> {
 fn workspace_symbols_tool() -> Tool {
     Tool::new(
         WORKSPACE_SYMBOLS_TOOL,
-        "Return project-wide symbols from attached language servers, or from one named server.",
+        "Return a bounded page of project-wide symbols from attached language servers, or from one named server. Use pagination.nextOffset to continue; text summarizes the structured symbols.",
         object_schema(json!({
             "type": "object",
             "properties": {
+                "limit": output::limit_schema(),
+                "offset": output::offset_schema(),
                 "query": {
                     "type": "string",
                     "description": "Query passed to each selected language server. An empty string requests all symbols."
@@ -2641,8 +2680,10 @@ fn workspace_symbols_tool() -> Tool {
     .with_raw_output_schema(result_output_schema(json!({
         "type": "object",
         "properties": {
+            "pagination": output::pagination_schema(),
             "symbols": {
                 "type": "array",
+                "maxItems": output::MAX_LIMIT,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -2688,7 +2729,7 @@ fn workspace_symbols_tool() -> Tool {
                 }
             }
         },
-        "required": ["symbols"],
+        "required": ["symbols", "pagination"],
         "additionalProperties": false
     })))
     .with_annotations(

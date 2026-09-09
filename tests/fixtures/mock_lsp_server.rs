@@ -813,6 +813,21 @@ fn handle_request<R: BufRead>(
                 ),
             ]));
             let result = match mode {
+                "query-budgets-utf-16" => Json::Array(
+                    (0..205)
+                        .map(|index| {
+                            json_object([
+                                (
+                                    "uri",
+                                    Json::String(format!(
+                                        "mock:///reference/{index}"
+                                    )),
+                                ),
+                                ("range", mock_range(6, 12)),
+                            ])
+                        })
+                        .collect(),
+                ),
                 "semantic-responses-null" => Json::Null,
                 "semantic-responses-empty" => Json::Array(Vec::new()),
                 _ => Json::Array(locations),
@@ -1087,6 +1102,35 @@ fn handle_request<R: BufRead>(
                 .unwrap_or_default();
             let answer_range = mock_range(6, 12);
             let result = match mode {
+                "query-budgets-utf-16" => Json::Array(vec![json_object([
+                    ("name", Json::String("parent".to_owned())),
+                    ("kind", Json::Number(13)),
+                    ("range", mock_range(0, 18)),
+                    ("selectionRange", answer_range.clone()),
+                    (
+                        "children",
+                        Json::Array(
+                            (0..204)
+                                .map(|index| {
+                                    json_object([
+                                        (
+                                            "name",
+                                            Json::String(format!(
+                                                "child{index}"
+                                            )),
+                                        ),
+                                        ("kind", Json::Number(13)),
+                                        ("range", answer_range.clone()),
+                                        (
+                                            "selectionRange",
+                                            answer_range.clone(),
+                                        ),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ])]),
                 "document-symbols-flat-utf-16" => {
                     Json::Array(vec![json_object([
                         ("name", Json::String("answer".to_owned())),
@@ -1359,6 +1403,27 @@ fn handle_request<R: BufRead>(
                 root_uri.trim_end_matches('/')
             ));
             let result = match mode {
+                "query-budgets-utf-16" => Json::Array(
+                    (0..205)
+                        .map(|index| {
+                            json_object([
+                                (
+                                    "name",
+                                    Json::String(format!("symbol{index}")),
+                                ),
+                                ("kind", Json::Number(12)),
+                                (
+                                    "location",
+                                    json_object([
+                                        ("uri", uri.clone()),
+                                        ("range", mock_range(start, end)),
+                                    ]),
+                                ),
+                                ("data", Json::String(query.to_owned())),
+                            ])
+                        })
+                        .collect(),
+                ),
                 "semantic-responses-null" => Json::Null,
                 "semantic-responses-empty" => Json::Array(Vec::new()),
                 mode if mode.contains("-partial-") => {

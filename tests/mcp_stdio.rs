@@ -402,7 +402,7 @@ async fn semantic_tools_have_stable_text_fallbacks_and_structured_output()
         (
             "references",
             references_arguments,
-            format!("mock-lsp: {uri}:0:0-0:3 (utf-8)\n{location_text}"),
+            "Returned 2 of 2 references at offset 0.".to_owned(),
         ),
         (
             "diagnostics",
@@ -412,14 +412,12 @@ async fn semantic_tools_have_stable_text_fallbacks_and_structured_output()
         (
             "document_symbols",
             file_arguments,
-            format!(
-                "mock-lsp: binding (kind 13) at {uri}:0:6-0:12 (utf-8)\n  mock-lsp: answer (kind 13) at {uri}:0:6-0:12 (utf-8)"
-            ),
+            "Returned 2 of 2 document symbols at offset 0.".to_owned(),
         ),
         (
             "workspace_symbols",
             workspace_arguments,
-            format!("mock-lsp: mockSymbol (kind 12) at {uri}:0:0-0:3 (utf-8)"),
+            "Returned 1 of 1 workspace symbols at offset 0.".to_owned(),
         ),
     ];
 
@@ -1071,7 +1069,11 @@ async fn workspace_symbols_do_not_start_unattached_servers_by_default()
     );
     assert_eq!(
         default_result.structured_content,
-        Some(json!({ "symbols": [] }))
+        Some(json!({
+            "symbols": [],
+            "pagination": { "offset": 0, "limit": 100, "maxBytes": 65536,
+                "returned": 0, "total": 0, "truncated": false }
+        }))
     );
 
     let status = timeout(
@@ -1233,6 +1235,190 @@ async fn read_only_tools_accept_null_and_empty_lsp_results()
 }
 
 #[tokio::test]
+async fn query_output_budgets_cover_all_items_and_validate_arguments()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("query-output-budgets")?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config = write_mock_config_for_mode(&root, "query-budgets-utf-16")?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command.arg("--root").arg(&root).arg("--config").arg(config);
+    let client = timeout(
+        Duration::from_secs(10),
+        ().serve(TokioChildProcess::new(command)?),
+    )
+    .await??;
+    let tools = client.list_tools(None).await?;
+    for (tool, arguments, field) in [
+        (
+            "references",
+            json!({ "path": "main.rs", "position": { "line": 0, "character": 8 }, "includeDeclaration": false }),
+            "locations",
+        ),
+        ("document_symbols", json!({ "path": "main.rs" }), "symbols"),
+        (
+            "workspace_symbols",
+            json!({ "query": "", "server": "mock-lsp" }),
+            "symbols",
+        ),
+    ] {
+        let schema = tools
+            .tools
+            .iter()
+            .find(|candidate| candidate.name == tool)
+            .unwrap();
+        assert_eq!(schema.input_schema["properties"]["limit"]["default"], 100);
+        assert_eq!(schema.input_schema["properties"]["limit"]["maximum"], 500);
+        assert_eq!(schema.input_schema["properties"]["offset"]["default"], 0);
+        let output = schema.output_schema.as_ref().unwrap();
+        assert_eq!(
+            output["oneOf"][0]["properties"]["pagination"]["properties"]["maxBytes"]
+                ["const"],
+            65536
+        );
+        assert!(
+            output["oneOf"][0]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("pagination"))
+        );
+
+        for invalid in [
+            json!({ "limit": 0 }),
+            json!({ "limit": 501 }),
+            json!({ "limit": -1 }),
+            json!({ "limit": 1.5 }),
+            json!({ "limit": "1" }),
+            json!({ "offset": -1 }),
+            json!({ "offset": 0.5 }),
+            json!({ "offset": "0" }),
+            json!({ "offset": null }),
+            json!({ "unknown": 1 }),
+        ] {
+            let mut args = arguments.as_object().unwrap().clone();
+            args.extend(invalid.as_object().unwrap().clone());
+            let result = client
+                .call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(args),
+                )
+                .await;
+            let error = result.expect_err(
+                "malformed pagination must be an MCP protocol error",
+            );
+            assert!(error.to_string().contains("32602"), "{tool}: {error}");
+        }
+
+        let mut offset = 0;
+        let mut received = Vec::new();
+        loop {
+            let mut args = arguments.as_object().unwrap().clone();
+            args.insert("offset".to_owned(), json!(offset));
+            let result = timeout(
+                Duration::from_secs(10),
+                client.call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(args),
+                ),
+            )
+            .await??;
+            assert_eq!(result.is_error, Some(false), "{tool}: {result:?}");
+            let structured = result.structured_content.as_ref().unwrap();
+            let page = &structured["pagination"];
+            assert_eq!(page["total"], 205);
+            assert_eq!(page["offset"], offset);
+            assert_eq!(page["returned"], if offset == 200 { 5 } else { 100 });
+            assert_eq!(page["truncated"], offset < 200);
+            assert!(serde_json::to_vec(&structured[field])?.len() <= 65536);
+            let text = &result.content[0].as_text().unwrap().text;
+            assert!(text.len() < 300, "{text}");
+            assert!(!text.contains("mock:///reference/"));
+            assert!(!text.contains("child0"));
+            assert!(!text.contains("symbol0"));
+            if tool == "document_symbols" {
+                fn collect(nodes: &[JsonValue], indexes: &mut Vec<JsonValue>) {
+                    for node in nodes {
+                        indexes.push(node["index"].clone());
+                        if node["index"] != 0 {
+                            assert_eq!(node["parentIndex"], 0);
+                        }
+                        collect(node["children"].as_array().unwrap(), indexes);
+                    }
+                }
+                collect(structured[field].as_array().unwrap(), &mut received);
+            } else {
+                received.extend(
+                    structured[field].as_array().unwrap().iter().map(|item| {
+                        if tool == "references" {
+                            item["uri"].clone()
+                        } else {
+                            item["name"].clone()
+                        }
+                    }),
+                );
+            }
+            let Some(next) = page["nextOffset"].as_u64() else {
+                break;
+            };
+            assert!(next > offset);
+            offset = next;
+        }
+        let expected: Vec<_> = (0..205)
+            .map(|index| match tool {
+                "references" => json!(format!("mock:///reference/{index}")),
+                "document_symbols" => json!(index),
+                _ => json!(format!("symbol{index}")),
+            })
+            .collect();
+        assert_eq!(received, expected, "{tool}");
+
+        let mut args = arguments.as_object().unwrap().clone();
+        args.insert("offset".to_owned(), json!(100));
+        args.insert("limit".to_owned(), json!(1));
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .await?;
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["pagination"]["returned"], 1);
+        assert_eq!(structured["pagination"]["nextOffset"], 101);
+        assert_eq!(structured[field].as_array().unwrap().len(), 1);
+
+        let mut args = arguments.as_object().unwrap().clone();
+        args.insert("offset".to_owned(), json!(u64::MAX));
+        args.insert("limit".to_owned(), json!(500));
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .await?;
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured[field], json!([]));
+        assert_eq!(structured["pagination"]["returned"], 0);
+        assert_eq!(structured["pagination"]["truncated"], false);
+        assert!(
+            structured.get("readiness").is_none(),
+            "exhausted pages are not empty LSP results"
+        );
+    }
+
+    let query = "\"🦀".repeat(1500);
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("workspace_symbols").with_arguments(
+                json!({ "query": query, "server": "mock-lsp" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await?;
+    assert_eq!(result.is_error, Some(false));
+    let structured = result.structured_content.as_ref().unwrap();
+    assert!(structured["pagination"]["returned"].as_u64().unwrap() < 100);
+    assert_eq!(structured["pagination"]["truncated"], true);
+    assert!(serde_json::to_vec(&structured["symbols"])?.len() <= 65536);
+    assert!(result.content[0].as_text().unwrap().text.len() < 300);
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("workspace-symbol-fanout")?;
@@ -1320,12 +1506,25 @@ async fn workspace_symbols_fan_out_concurrently_in_stable_server_order()
     assert_eq!(symbols[1]["name"], "zetaSymbol");
     assert!(barrier.exists(), "the release server should have run");
     let text = result.content[0].as_text().unwrap().text.as_str();
-    assert!(
-        text.lines()
-            .next()
-            .unwrap()
-            .starts_with("alpha: alphaSymbol")
-    );
+    assert_eq!(text, "Returned 2 of 2 workspace symbols at offset 0.");
+
+    for (offset, server) in [(0, "alpha"), (1, "zeta")] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("workspace_symbols").with_arguments(
+                    json!({ "query": "answer", "limit": 1, "offset": offset })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await?;
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(structured["symbols"].as_array().unwrap().len(), 1);
+        assert_eq!(structured["symbols"][0]["server"], server);
+        assert_eq!(structured["pagination"]["total"], 2);
+        assert_eq!(structured["pagination"]["truncated"], offset == 0);
+    }
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())
@@ -1583,9 +1782,7 @@ async fn document_symbols_preserve_hierarchy_and_normalize_flat_responses()
             assert_eq!(children[0]["name"], "answer");
             assert_eq!(children[0]["server"], "mock-lsp");
             assert_eq!(children[0]["positionEncoding"], "utf-8");
-            assert!(text.lines().nth(1).is_some_and(|line| {
-                line.starts_with("  mock-lsp: answer")
-            }));
+            assert_eq!(text, "Returned 2 of 2 document symbols at offset 0.");
         } else {
             assert_eq!(symbols[0]["name"], "answer");
             assert_eq!(symbols[0]["containerName"], "binding");

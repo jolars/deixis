@@ -251,6 +251,53 @@ translated to UTF-8; other locations retain the server's negotiated encoding.
 Deixis advertises workspace-symbol kind and tag support, but not lazy resolve
 support, so returned locations must include a range.
 
+### Query output budgets
+
+The references and both symbol tools accept optional `limit` and `offset`
+arguments. `limit` defaults to 100 and must be an integer from 1 through 500;
+`offset` defaults to zero and must be an unsigned 64-bit integer. Invalid
+arguments fail as MCP `invalid_params` errors before routing or starting a
+server. A page examines at most `limit` items and returns a compact JSON result
+array no larger than 65,536 bytes, including escaped strings and extension
+fields. Pagination and readiness metadata are separate from this byte budget.
+Text fallbacks contain counts and continuation instructions instead of
+repeating structured items. Empty LSP responses retain their readiness and
+stability information; an offset past the end of a nonempty result is simply
+an empty page.
+
+Every successful response contains `pagination` with `offset`, `limit`,
+`maxBytes`, `returned`, `total`, and `truncated`. `total` counts the full
+normalized LSP response, including oversized items. `nextOffset` is present
+only when more items remain after the page. `truncated` is true when more items
+remain or this page omitted oversized items; it is false on an ordinary final
+page even when earlier pages preceded it. An item that cannot fit by itself is
+omitted in full, its zero-based result index is listed in `omitted`, and the
+continuation advances past it. This preserves complete retained items and
+allows later results to remain accessible. Oversized items count toward
+`limit`, so their metadata is bounded too.
+
+References and workspace symbols retain each server's response order.
+Workspace-symbol pagination applies once, after the existing merge in lexical
+server-name order, so the budget is shared across servers. Document symbols
+use depth-first preorder, counting every node. Each node gains an authoritative
+`index`, nullable `parentIndex`, and `childCount` for its full direct child
+count. A page retains parent-child nesting when both nodes occur on that page;
+a node whose parent is on another page or omitted appears at the page root
+with its original `parentIndex`. These indexes override conflicting server
+extension fields. Clients can join pages without repeating ancestors, and a
+single large subtree cannot evade the budget. Flat LSP symbol responses retain
+root-node semantics with null parent indexes.
+
+Continuation is stateless: the caller repeats the same query arguments with
+`offset: nextOffset`, and Deixis resynchronizes documents and reruns the LSP
+query. Offsets and totals describe that response, not a retained snapshot.
+File edits, indexing progress, server response ordering, restarts, or changes
+to attached servers can shift results, causing repeats or omissions across
+calls. Clients that need a fresh traversal should restart at zero. Deixis does
+not maintain a result cache or claim snapshot consistency. These MCP output
+budgets do not limit LSP computation, normalization, or fan-out memory; each
+server's existing `max_response_bytes` transport bound still applies.
+
 ### Workspace-edit and rename safety contract
 
 Rename is split across three tools. The mutating third step is available only

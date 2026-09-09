@@ -23,10 +23,6 @@ shipped stdio surface.
 
 ## Agent-facing query ergonomics
 
-- [ ] Define and enforce output budgets for high-cardinality results. Add
-  limits and continuation metadata to references and symbol queries; let text
-  fallbacks summarize rather than duplicate every structured item, and report
-  when a result was truncated.
 - [ ] Add optional, tightly bounded source context to root-contained navigation
   results so an agent can often assess a location without another broad file
   read.

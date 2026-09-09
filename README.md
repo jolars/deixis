@@ -43,6 +43,22 @@ has synchronized at least one document with its current process. Pass `server`
 for its detailed lifecycle and capability snapshot; `start: true` also requires
 an explicit server name.
 
+`references`, `document_symbols`, and `workspace_symbols` accept an optional
+`limit` (default 100, maximum 500) and `offset` (default 0). Each page also caps
+the compact JSON result array at 64 KiB. The structured `pagination` object
+reports `returned`, `total`, `truncated`, and, when more results remain,
+`nextOffset`. Continue with that offset and the same query arguments. Each
+call reruns the query, so file edits, indexing progress, or changes to attached
+servers can shift results between pages. Text responses summarize the page.
+
+Every nested document symbol counts toward the limit. Symbols retain their
+hierarchy within a page; `index` and `parentIndex` identify relationships across
+pages, and `childCount` reports the full number of direct children. Individual
+items too large for a page are omitted, with their indexes listed in
+`pagination.omitted` and `truncated: true`. Pagination advances past these
+items. Counts and byte limits apply to the normalized results returned by
+Deixis; language servers still compute their full responses.
+
 See [DESIGN.md](DESIGN.md) for the protocol and architecture and
 [TODO.md](TODO.md) for planned work.
 
