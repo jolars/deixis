@@ -48,6 +48,61 @@ async fn negotiates_an_empty_mcp_server_over_stdio()
     assert_eq!(implementation.name, "deixis");
     assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(peer.capabilities, ServerCapabilities::default());
+    assert!(peer.instructions.is_none());
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn advertises_document_symbols_as_an_optional_file_outline()
+-> Result<(), Box<dyn Error>> {
+    let root = unique_dir("file-outline-guidance")?;
+    let config_path = write_mock_config(&root)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let client = timeout(
+        Duration::from_secs(10),
+        ().serve(TokioChildProcess::new(command)?),
+    )
+    .await??;
+
+    let peer = client
+        .peer_info()
+        .expect("server metadata should be retained");
+    let instructions = peer
+        .instructions
+        .as_deref()
+        .expect("configured servers should provide tool-selection guidance");
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+    let description = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "document_symbols")
+        .and_then(|tool| tool.description.as_deref())
+        .expect("document_symbols should describe its purpose");
+
+    for guidance in [instructions, description] {
+        assert!(guidance.contains("file outline"), "{guidance}");
+        assert!(guidance.contains("only when"), "{guidance}");
+        assert!(
+            guidance.contains("not a default navigation step"),
+            "{guidance}"
+        );
+        for tool in [
+            "definition",
+            "type_definition",
+            "implementation",
+            "references",
+        ] {
+            assert!(guidance.contains(tool), "{guidance}");
+        }
+    }
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())

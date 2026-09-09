@@ -163,10 +163,22 @@ impl ServerHandler for DeixisServer {
             ServerCapabilities::builder().enable_tools().build()
         };
 
-        ServerInfo::new(capabilities).with_server_info(Implementation::new(
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-        ))
+        let info = ServerInfo::new(capabilities).with_server_info(
+            Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ),
+        );
+        if self.language_servers.is_empty() {
+            info
+        } else {
+            info.with_instructions(concat!(
+                "Use definition, type_definition, implementation, and references ",
+                "for targeted symbol navigation. Use document_symbols only when ",
+                "a file outline is needed; it is not a default navigation step ",
+                "or a prerequisite for other queries."
+            ))
+        }
     }
 
     async fn list_tools(
@@ -2546,7 +2558,7 @@ fn diagnostics_tool() -> Tool {
 fn document_symbols_tool() -> Tool {
     Tool::new(
         DOCUMENT_SYMBOLS_TOOL,
-        "Return a bounded page of file symbols in preorder, retaining hierarchy within the page. Every nested symbol counts toward the limit. Use pagination.nextOffset to continue and index/parentIndex to join pages.",
+        "Inspect a file outline only when the file's symbol structure is needed. This is not a default navigation step or a prerequisite for other queries; use definition, type_definition, implementation, or references directly for targeted symbol navigation. Return a bounded page of symbols in preorder, retaining hierarchy within the page. Every nested symbol counts toward the limit. Use pagination.nextOffset to continue and index/parentIndex to join pages.",
         object_schema(json!({
             "type": "object",
             "properties": {

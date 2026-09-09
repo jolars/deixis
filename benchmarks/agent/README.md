@@ -24,6 +24,11 @@ meaningful:
 - `deixis_instructed` versus `instruction_only`: the configured deployment;
 - `deixis_instructed` versus `deixis_available`: instruction-driven adoption.
 
+The instruction reserves `document_symbols` for an explicit file-outline need.
+It does not require an outline as a default navigation step or before another
+query. The Deixis tool description and MCP initialization guidance convey the
+same scope whenever Deixis is available, including the uninstructed arm.
+
 Deixis runs without `--allow-mutation`. Codex therefore uses the same built-in
 editing mechanism in every arm, while Deixis contributes semantic navigation
 only.

@@ -26,7 +26,7 @@ Starting it with `--allow-mutation` adds `apply_rename` as a fourteenth tool.
   | `implementation`       | Find implementations.                                       |
   | `references`           | Find references, with explicit declaration inclusion.       |
   | `diagnostics`          | Request pull diagnostics or return cached push diagnostics. |
-  | `document_symbols`     | Return a normalized hierarchy of symbols in a file.         |
+  | `document_symbols`     | Inspect a file outline when its symbol structure is needed. |
   | `workspace_symbols`    | Search attached servers, or one explicitly named server.    |
   | `prepare_rename`       | Check whether a symbol can be renamed at a position.         |
   | `preview_rename`       | Validate edits and return a diff plus a one-shot preview ID. |
@@ -36,6 +36,13 @@ Deixis negotiates UTF-8, UTF-16, and UTF-32 positions, synchronizes documents
 from disk before file-scoped requests, gates every operation on the language
 server's advertised capabilities, and preserves source-server provenance in
 results. Several language servers may serve one immutable project root.
+
+Use `definition`, `type_definition`, `implementation`, and `references`
+directly for targeted symbol navigation. Use `document_symbols` only when you
+need a file outline, such as a view of its types, functions, and nested members.
+It is not a default navigation step or a prerequisite for other queries. This
+guidance is also included in the MCP initialization instructions and tool
+description.
 
 Calling `deixis_server_status` without arguments lists every configured server
 as `not started`, `running`, or `attached`. A server is attached after Deixis

@@ -228,8 +228,16 @@ retain the negotiated server encoding because the old source text is not
 available for sound conversion. Reports preserve diagnostic extension fields
 and identify both their source and position encoding.
 
-The `document_symbols` tool takes a root-contained path and optional server
-override. Deixis advertises hierarchical document-symbol, symbol-kind, tag, and
+The `document_symbols` tool is an explicit file-outline operation for inspecting
+a file's symbol structure. Its tool description and the configured server's MCP
+initialization instructions reserve it for that need, without making it a
+default navigation step or a prerequisite for other queries. They direct agents
+to `definition`, `type_definition`, `implementation`, and `references` for
+targeted symbol navigation. Unconfigured sessions provide no tool-selection
+instructions.
+
+The tool takes a root-contained path and optional server override. Deixis
+advertises hierarchical document-symbol, symbol-kind, tag, and
 label support. Recursive `DocumentSymbol` responses retain their child trees.
 Deprecated flat `SymbolInformation` responses become root nodes in the same
 shape, using the location range as both the symbol range and selection range;
