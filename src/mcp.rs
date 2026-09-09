@@ -294,10 +294,7 @@ impl DeixisServer {
             for language_server in self.language_servers.values() {
                 statuses.push(language_server.status().await);
             }
-            return Ok(success_result(
-                status_overview_json(&statuses),
-                status_overview_text(&statuses),
-            ));
+            return Ok(status_overview_result(&statuses));
         }
 
         let language_server_name = arguments.server.as_deref();
@@ -2064,24 +2061,6 @@ struct ServerStatusArguments {
     start: bool,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum ServerStatusOverviewState {
-    NotStarted,
-    Running,
-    Attached,
-}
-
-impl ServerStatusOverviewState {
-    fn text(self) -> &'static str {
-        match self {
-            Self::NotStarted => "not started",
-            Self::Running => "running",
-            Self::Attached => "attached",
-        }
-    }
-}
-
 impl ServerStatusArguments {
     fn validate(&self) -> Result<(), McpError> {
         if self
@@ -2118,14 +2097,14 @@ pub async fn serve_stdio(startup: StartupState) -> Result<(), Box<dyn Error>> {
 fn server_status_tool() -> Tool {
     Tool::new(
         SERVER_STATUS_TOOL,
-        "Summarize all configured language servers, or return detailed status for one.",
+        "List attached language servers and count those not attached, or return detailed status for one named server.",
         object_schema(json!({
             "type": "object",
             "properties": {
                 "server": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Configured server name. Omit it for a compact overview of every configured server."
+                    "description": "Configured server name. Omit it to list attached servers and count those not attached."
                 },
                 "start": {
                     "type": "boolean",
@@ -3034,26 +3013,18 @@ fn status_overview_output_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
-            "servers": {
+            "attached": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "configuredName": { "type": "string" },
-                        "state": {
-                            "enum": [
-                                "notStarted",
-                                "running",
-                                "attached"
-                            ]
-                        }
-                    },
-                    "required": ["configuredName", "state"],
-                    "additionalProperties": false
-                }
+                "items": { "type": "string" },
+                "description": "Configured names of attached servers in lexical order."
+            },
+            "notAttached": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Number of configured servers without a synchronized document in their current process, including servers not started."
             }
         },
-        "required": ["servers"],
+        "required": ["attached", "notAttached"],
         "additionalProperties": false
     })
 }
@@ -3169,42 +3140,22 @@ fn status_json(status: &ServerSnapshot) -> JsonValue {
     })
 }
 
-fn status_overview_json(statuses: &[ServerSnapshot]) -> JsonValue {
-    json!({
-        "servers": statuses
-            .iter()
-            .map(|status| {
-                json!({
-                    "configuredName": status.configured_name(),
-                    "state": status_overview_state(status),
-                })
-            })
-            .collect::<Vec<_>>(),
-    })
-}
-
-fn status_overview_text(statuses: &[ServerSnapshot]) -> String {
-    statuses
+fn status_overview_result(statuses: &[ServerSnapshot]) -> CallToolResponse {
+    let attached = statuses
         .iter()
-        .map(|status| {
-            format!(
-                "{}: {}",
-                status.configured_name(),
-                status_overview_state(status).text()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn status_overview_state(status: &ServerSnapshot) -> ServerStatusOverviewState {
-    if !status.started() {
-        return ServerStatusOverviewState::NotStarted;
-    }
-    if status.attached() {
-        return ServerStatusOverviewState::Attached;
-    }
-    ServerStatusOverviewState::Running
+        .filter(|status| status.attached())
+        .map(ServerSnapshot::configured_name)
+        .collect::<Vec<_>>();
+    let not_attached = statuses.len() - attached.len();
+    let names = if attached.is_empty() {
+        "none".to_owned()
+    } else {
+        attached.join(", ")
+    };
+    success_result(
+        json!({ "attached": attached, "notAttached": not_attached }),
+        format!("attached: {names}\nnot attached: {not_attached}"),
+    )
 }
 
 fn status_text(status: &ServerSnapshot) -> String {

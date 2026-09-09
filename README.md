@@ -17,7 +17,7 @@ Starting it with `--allow-mutation` adds `apply_rename` as a fourteenth tool.
 
   | Tool                   | Purpose                                                     |
   | ---------------------- | ----------------------------------------------------------- |
-  | `deixis_server_status` | Summarize configured servers or inspect one in detail.      |
+  | `deixis_server_status` | List attached servers or inspect one server in detail.     |
   | `hover`                | Return hover markup at a zero-based UTF-8 position.         |
   | `signature_help`       | Return call signatures and structured parameter details.   |
   | `definition`           | Find definitions.                                           |
@@ -44,11 +44,21 @@ It is not a default navigation step or a prerequisite for other queries. This
 guidance is also included in the MCP initialization instructions and tool
 description.
 
-Calling `deixis_server_status` without arguments lists every configured server
-as `not started`, `running`, or `attached`. A server is attached after Deixis
-has synchronized at least one document with its current process. Pass `server`
-for its detailed lifecycle and capability snapshot; `start: true` also requires
-an explicit server name.
+Calling `deixis_server_status` without arguments lists attached servers in
+lexical order and counts the remaining configured servers:
+
+```text
+attached: python, rust
+not attached: 3
+```
+
+An empty list is shown as `attached: none`; the count is included even when zero.
+Structured output contains `attached` (an array of configured names) and
+`notAttached` (a count). A server is attached after Deixis has synchronized at
+least one document with its current process. Servers that have not started or
+have started without a synchronized document count as not attached. Pass
+`server` for its detailed lifecycle and capability snapshot; `start: true` also
+requires an explicit server name.
 
 `references`, `document_symbols`, and `workspace_symbols` accept an optional
 `limit` (default 100, maximum 500) and `offset` (default 0). Each page also caps

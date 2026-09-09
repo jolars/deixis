@@ -184,9 +184,14 @@ configuration, it advertises thirteen read-only tools: `deixis_server_status`,
 with `--allow-mutation` advertises and enables `apply_rename` as a fourteenth
 tool.
 The probe accepts an optional server name and `start` flag.
-Without a name, it returns every configured server in stable lexical order with
-a compact `not started`, `running`, or `attached` state. `Attached` means that
-Deixis has synchronized at least one document with the current server process.
+Without a name, it returns `attached`, an array of attached servers' configured
+names in stable lexical order, and `notAttached`, the count of remaining
+configured servers. The text response has two lines: `attached: x, y, z` (or
+`attached: none`) and `not attached: N`, including when the count is zero.
+`Attached` means that Deixis has synchronized at least one document with the
+current server process. The count includes both servers that have not started
+and running servers without synchronized documents. The overview does not
+start servers.
 With a name, the probe returns the detailed lifecycle, readiness, negotiated
 encoding, and capabilities for that server. Starting a server requires its
 explicit name.

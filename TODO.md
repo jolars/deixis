@@ -23,6 +23,8 @@ shipped stdio surface.
 
 ## Agent-facing query ergonomics
 
+- [x] Reduce the default server-status output to attached server names and a
+  count of configured servers that are not attached.
 - [ ] Add optional, tightly bounded source context to root-contained navigation
   results so an agent can often assess a location without another broad file
   read.

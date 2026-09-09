@@ -984,10 +984,11 @@ async fn rejects_rename_resource_operations_at_the_mcp_boundary()
 }
 
 #[tokio::test]
-async fn unqualified_server_status_summarizes_every_configured_server()
+async fn unqualified_server_status_lists_attached_servers_and_counts_the_rest()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("server-status-overview")?;
     fs::write(root.join("main.py"), "let answer = 42;\n")?;
+    fs::write(root.join("main.rs"), "let answer = 42;\n")?;
     let config_path = write_mixed_workspace_symbol_config(&root)?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
     command
@@ -998,6 +999,40 @@ async fn unqualified_server_status_summarizes_every_configured_server()
     let transport = TokioChildProcess::new(command)?;
     let client =
         timeout(Duration::from_secs(10), ().serve(transport)).await??;
+
+    let tools =
+        timeout(Duration::from_secs(10), client.list_tools(None)).await??;
+    let schema = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "deixis_server_status")
+        .unwrap()
+        .output_schema
+        .as_ref()
+        .unwrap();
+    let overview = &schema["oneOf"][0]["oneOf"][0];
+    assert_eq!(overview["required"], json!(["attached", "notAttached"]));
+    assert_eq!(
+        overview["properties"]["attached"]["items"]["type"],
+        "string"
+    );
+    assert_eq!(overview["properties"]["notAttached"]["type"], "integer");
+    assert_eq!(overview["properties"]["notAttached"]["minimum"], 0);
+    assert_eq!(overview["additionalProperties"], false);
+
+    let initial_status = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+    )
+    .await??;
+    assert_eq!(
+        initial_status.content[0].as_text().unwrap().text,
+        "attached: none\nnot attached: 2"
+    );
+    assert_eq!(
+        initial_status.structured_content,
+        Some(json!({ "attached": [], "notAttached": 2 }))
+    );
 
     let ambiguous_start_arguments =
         json!({ "start": true }).as_object().unwrap().clone();
@@ -1041,21 +1076,13 @@ async fn unqualified_server_status_summarizes_every_configured_server()
 
     assert_eq!(
         status.content[0].as_text().unwrap().text,
-        "alpha: not started\nzeta: running"
+        "attached: none\nnot attached: 2"
     );
     assert_eq!(
         status.structured_content,
         Some(json!({
-            "servers": [
-                {
-                    "configuredName": "alpha",
-                    "state": "notStarted",
-                },
-                {
-                    "configuredName": "zeta",
-                    "state": "running",
-                },
-            ],
+            "attached": [],
+            "notAttached": 2,
         }))
     );
     assert_eq!(status.is_error, Some(false));
@@ -1082,11 +1109,41 @@ async fn unqualified_server_status_summarizes_every_configured_server()
     .await??;
     assert_eq!(
         attached_status.content[0].as_text().unwrap().text,
-        "alpha: not started\nzeta: attached"
+        "attached: zeta\nnot attached: 1"
     );
     assert_eq!(
-        attached_status.structured_content.unwrap()["servers"][1]["state"],
-        "attached"
+        attached_status.structured_content,
+        Some(json!({ "attached": ["zeta"], "notAttached": 1 }))
+    );
+
+    let hover_arguments = json!({
+        "path": "main.rs",
+        "position": { "line": 0, "character": 8 },
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let result = timeout(
+        Duration::from_secs(10),
+        client.call_tool(
+            CallToolRequestParams::new("hover").with_arguments(hover_arguments),
+        ),
+    )
+    .await??;
+    assert_eq!(result.is_error, Some(false));
+
+    let all_attached = timeout(
+        Duration::from_secs(10),
+        client.call_tool(CallToolRequestParams::new("deixis_server_status")),
+    )
+    .await??;
+    assert_eq!(
+        all_attached.content[0].as_text().unwrap().text,
+        "attached: alpha, zeta\nnot attached: 0"
+    );
+    assert_eq!(
+        all_attached.structured_content,
+        Some(json!({ "attached": ["alpha", "zeta"], "notAttached": 0 }))
     );
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
@@ -1138,8 +1195,28 @@ async fn workspace_symbols_do_not_start_unattached_servers_by_default()
     .await??;
     assert_eq!(
         status.content[0].as_text().unwrap().text,
-        "alpha: not started\nzeta: not started"
+        "attached: none\nnot attached: 2"
     );
+    for server in ["alpha", "zeta"] {
+        let status = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("deixis_server_status")
+                    .with_arguments(
+                        json!({ "server": server })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+            ),
+        )
+        .await??;
+        assert_eq!(
+            status.structured_content.unwrap()["started"],
+            false,
+            "{server}"
+        );
+    }
 
     let unknown_arguments = json!({
         "query": "",
@@ -1189,8 +1266,28 @@ async fn workspace_symbols_do_not_start_unattached_servers_by_default()
     .await??;
     assert_eq!(
         status.content[0].as_text().unwrap().text,
-        "alpha: not started\nzeta: running"
+        "attached: none\nnot attached: 2"
     );
+    for (server, started) in [("alpha", false), ("zeta", true)] {
+        let status = timeout(
+            Duration::from_secs(10),
+            client.call_tool(
+                CallToolRequestParams::new("deixis_server_status")
+                    .with_arguments(
+                        json!({ "server": server })
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+            ),
+        )
+        .await??;
+        assert_eq!(
+            status.structured_content.unwrap()["started"],
+            started,
+            "{server}"
+        );
+    }
 
     timeout(Duration::from_secs(10), client.cancel()).await??;
     Ok(())
