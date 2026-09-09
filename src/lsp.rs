@@ -48,6 +48,11 @@ const MAX_CANCELLATION_RETRIES: usize = 3;
 const RETRY_MIN_DELAY: Duration = Duration::from_millis(50);
 const RETRY_READINESS_WAIT: Duration = Duration::from_secs(1);
 
+mod call_hierarchy;
+pub use call_hierarchy::{
+    CallHierarchyCall, CallHierarchyDirection, CallHierarchyItem,
+};
+
 #[cfg(test)]
 mod retry_tests;
 
@@ -3500,6 +3505,24 @@ impl ActiveServer {
         cancellation: &CancellationToken,
     ) -> Result<JsonValue, LspError> {
         let deadline = Instant::now() + request_timeout;
+        self.request_value_until(
+            method,
+            params,
+            deadline,
+            request_timeout,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn request_value_until(
+        &self,
+        method: &str,
+        params: Option<JsonValue>,
+        deadline: Instant,
+        request_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<JsonValue, LspError> {
         for retries in 0..=MAX_CANCELLATION_RETRIES {
             let result = self
                 .request_attempt(
@@ -4443,6 +4466,9 @@ fn initialize_params(
                 },
             },
             "textDocument": {
+                "callHierarchy": {
+                    "dynamicRegistration": true,
+                },
                 "diagnostic": {
                     "dynamicRegistration": true,
                     "relatedDocumentSupport": false,

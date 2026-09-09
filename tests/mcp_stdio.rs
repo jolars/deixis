@@ -25,6 +25,9 @@ use tokio::{
 
 mod support;
 
+#[path = "mcp_stdio/call_hierarchy.rs"]
+mod call_hierarchy;
+
 #[tokio::test]
 async fn negotiates_an_empty_mcp_server_over_stdio()
 -> Result<(), Box<dyn Error>> {

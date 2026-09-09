@@ -12,8 +12,8 @@ layer.
 
 ## Capabilities
 
-A configured Deixis session exposes thirteen read-only MCP tools by default.
-Starting it with `--allow-mutation` adds `apply_rename` as a fourteenth tool.
+A configured Deixis session exposes fifteen read-only MCP tools by default.
+Starting it with `--allow-mutation` adds `apply_rename` as a sixteenth tool.
 
   | Tool                   | Purpose                                                     |
   | ---------------------- | ----------------------------------------------------------- |
@@ -25,6 +25,8 @@ Starting it with `--allow-mutation` adds `apply_rename` as a fourteenth tool.
   | `type_definition`      | Find type definitions.                                      |
   | `implementation`       | Find implementations.                                       |
   | `references`           | Find references, with explicit declaration inclusion.       |
+  | `incoming_calls`       | Find callers and their call sites.                          |
+  | `outgoing_calls`       | Find callees and their call sites.                          |
   | `diagnostics`          | Request pull diagnostics or return cached push diagnostics. |
   | `document_symbols`     | Inspect a file outline when its symbol structure is needed. |
   | `workspace_symbols`    | Search attached servers, or one explicitly named server.    |
@@ -65,8 +67,9 @@ have started without a synchronized document count as not attached. Pass
 `server` for its detailed lifecycle and capability snapshot; `start: true` also
 requires an explicit server name.
 
-`references`, `document_symbols`, and `workspace_symbols` accept an optional
-`limit` (default 100, maximum 500) and `offset` (default 0). Each page also caps
+`references`, `incoming_calls`, `outgoing_calls`, `document_symbols`, and
+`workspace_symbols` accept an optional `limit` (default 100, maximum 500) and
+`offset` (default 0). Each page also caps
 the compact JSON result array at 64 KiB. The structured `pagination` object
 reports `returned`, `total`, `truncated`, and, when more results remain,
 `nextOffset`. Continue with that offset and the same query arguments. Each
@@ -309,6 +312,17 @@ servers match a file, supply `server` or make the configuration routes unique.
 parameter labels and documentation. Its text fallback contains only the active
 signature—or the first signature when the server does not select one—to keep
 agent context compact.
+
+`incoming_calls` and `outgoing_calls` take `path`, a UTF-8 `position`, and an
+optional `server`. They prepare the call hierarchy internally, then expand all
+symbols returned for that position. Each entry in `calls` contains `from`
+(the caller), `to` (the callee), and `fromRanges` (call sites in `from.uri`,
+using `from.positionEncoding`). Both symbols include their name, kind, URI,
+ranges, server, and position encoding, plus any server-provided details or
+opaque data. Readable project files use UTF-8; other targets retain the server
+encoding. The tools require negotiated call-hierarchy support. Preparation,
+expansion, and retries share one request timeout. Pagination applies across
+all returned calls, and each caller/callee pair counts as one item.
 
 Without a `server`, `workspace_symbols` fans out to capable attached servers
 without starting others and merges results in stable server-name order. Supply

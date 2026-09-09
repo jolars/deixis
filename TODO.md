@@ -31,7 +31,7 @@ shipped stdio surface.
 - [x] Retry retriggerable LSP cancellations, including error `-32802` with
   `retriggerRequest`, after a bounded readiness wait. Preserve the caller's
   deadline and cancellation, and report the terminal failure clearly.
-- [ ] Add incoming and outgoing call hierarchy behind negotiated server
+- [x] Add incoming and outgoing call hierarchy behind negotiated server
   capabilities, with the same result limits as references.
 - [x] Add signature help behind negotiated server capabilities, with concise
   text and structured parameter information.

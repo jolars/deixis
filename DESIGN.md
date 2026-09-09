@@ -177,11 +177,11 @@ access, or command interpolation.
 ## MCP surface
 
 Without selected configuration, the current server advertises no tools. With
-configuration, it advertises thirteen read-only tools: `deixis_server_status`,
+configuration, it advertises fifteen read-only tools: `deixis_server_status`,
 `hover`, `signature_help`, `definition`, `declaration`, `type_definition`,
-`implementation`, `references`, `diagnostics`, `document_symbols`,
-`workspace_symbols`, `prepare_rename`, and `preview_rename`. Starting Deixis
-with `--allow-mutation` advertises and enables `apply_rename` as a fourteenth
+`implementation`, `references`, `incoming_calls`, `outgoing_calls`,
+`diagnostics`, `document_symbols`, `workspace_symbols`, `prepare_rename`, and `preview_rename`. Starting Deixis
+with `--allow-mutation` advertises and enables `apply_rename` as a sixteenth
 tool.
 The probe accepts an optional server name and `start` flag.
 Without a name, it returns `attached`, an array of attached servers' configured
@@ -209,6 +209,29 @@ additionally requires an explicit `includeDeclaration` boolean, sends it in the
 LSP reference context, and normalizes `Location[]` or `null` to the configured
 server name, URI, range, and range position encoding. Each semantic tool also
 returns readable text content. No tool forwards arbitrary JSON-RPC.
+
+The `incoming_calls` and `outgoing_calls` tools accept the same path, UTF-8
+position, and optional server override as navigation tools, plus the result
+budgets below. Each query synchronizes the source document, sends
+`textDocument/prepareCallHierarchy`, and expands every returned item with
+`callHierarchy/incomingCalls` or `callHierarchy/outgoingCalls`. Both stages
+check `callHierarchyProvider` or dynamic registration for
+`textDocument/prepareCallHierarchy`, as specified by the
+[LSP call-hierarchy protocol](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy).
+The client advertises dynamic call-hierarchy registration support. Prepared
+items are forwarded unchanged, including their opaque `data` and original
+server-encoded ranges. Preparation, expansions, and cancellation retries share
+one request deadline and the caller's cancellation token.
+
+Results contain a flat `calls` array of caller/callee pairs: `from`, `to`, and
+`fromRanges`. Both endpoints retain the symbol's name, kind, URI, range,
+selection range, and server fields, with authoritative configured-server
+provenance and position encoding overriding conflicting extensions. For both
+directions, `fromRanges` belongs to the caller's URI and uses its encoding.
+The caller's symbol and call-site ranges are converted against the same
+content. Readable project files use UTF-8; unreadable, external, and non-file
+targets retain their server encoding without reading outside the root. Empty
+prepare or expansion responses produce empty results with readiness context.
 
 The `signature_help` tool takes a root-contained path, zero-based UTF-8
 position, and optional server override. It checks `signatureHelpProvider`,
@@ -266,8 +289,9 @@ support, so returned locations must include a range.
 
 ### Query output budgets
 
-The references and both symbol tools accept optional `limit` and `offset`
-arguments. `limit` defaults to 100 and must be an integer from 1 through 500;
+The references, call-hierarchy, and both symbol tools accept optional `limit`
+and `offset` arguments. `limit` defaults to 100 and must be an integer from
+1 through 500;
 `offset` defaults to zero and must be an unsigned 64-bit integer. Invalid
 arguments fail as MCP `invalid_params` errors before routing or starting a
 server. A page examines at most `limit` items and returns a compact JSON result
@@ -290,6 +314,10 @@ allows later results to remain accessible. Oversized items count toward
 `limit`, so their metadata is bounded too.
 
 References and workspace symbols retain each server's response order.
+Call hierarchy preserves preparation order, then each expansion's response
+order. Each complete caller/callee pair counts as one item; its symbol data
+and entire call-site array count toward the byte budget. An oversized pair is
+omitted in full under the same rules as an oversized reference.
 Workspace-symbol pagination applies once, after the existing merge in lexical
 server-name order, so the budget is shared across servers. Document symbols
 use depth-first preorder, counting every node. Each node gains an authoritative
@@ -384,10 +412,10 @@ information remain structured JSON. Each successful result also supplies a small
 textual representation for MCP clients that do not consume structured content.
 These fallbacks have deterministic, tool-specific formats rather than serialized
 JSON. Status is one sentence; hover uses the rendered markup body; navigation
-and references use one location per line; signature help uses one selected
-signature label; diagnostics summarize availability and count; and symbols use
-one line per symbol, with indentation for document-symbol children. Extension
-fields and other details that do not belong in the concise text remain
+uses one location per line; signature help uses one selected signature label;
+diagnostics summarize availability and count; and references, call hierarchy,
+and symbols summarize page counts and continuation. Extension fields and
+other details that do not belong in the concise text remain
 available in the structured result and do not perturb its rendering.
 
 Deixis advertises signature-help support for markdown and plaintext
@@ -396,8 +424,8 @@ It also advertises `window.workDoneProgress` and the rust-analyzer
 `experimental.serverStatusNotification` extension. It tracks active work-done
 tokens and rust-analyzer's health and quiescence values. The lifecycle probe
 exposes the resulting `readiness` state and its source. When hover, signature
-help, navigation, references, document symbols, or current diagnostics return
-no semantic result, their structured output also includes `readiness` and a
+help, navigation, references, call hierarchy, document symbols, or current
+diagnostics return no semantic result, their structured output also includes `readiness` and a
 derived `resultStability`: `transient` while observed work is active, `stable`
 after observed work has completed, and `indeterminate` when the server has
 emitted no usable readiness signal or reports degraded health. Initialization

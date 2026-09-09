@@ -20,7 +20,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+mod call_hierarchy;
 mod output;
+
+use crate::lsp::CallHierarchyDirection;
+use call_hierarchy::{
+    INCOMING_CALLS_TOOL, OUTGOING_CALLS_TOOL, call_hierarchy_tool,
+};
 
 use crate::{
     config::{Config, ConfigRouteError},
@@ -198,6 +204,8 @@ impl ServerHandler for DeixisServer {
                 location_tool(TYPE_DEFINITION_SPEC),
                 location_tool(IMPLEMENTATION_SPEC),
                 references_tool(),
+                call_hierarchy_tool(CallHierarchyDirection::Incoming),
+                call_hierarchy_tool(CallHierarchyDirection::Outgoing),
                 diagnostics_tool(),
                 document_symbols_tool(),
                 workspace_symbols_tool(),
@@ -242,6 +250,22 @@ impl ServerHandler for DeixisServer {
                     .await
             }
             REFERENCES_TOOL => self.call_references(request, &context.ct).await,
+            INCOMING_CALLS_TOOL => {
+                self.call_call_hierarchy(
+                    request,
+                    CallHierarchyDirection::Incoming,
+                    &context.ct,
+                )
+                .await
+            }
+            OUTGOING_CALLS_TOOL => {
+                self.call_call_hierarchy(
+                    request,
+                    CallHierarchyDirection::Outgoing,
+                    &context.ct,
+                )
+                .await
+            }
             DIAGNOSTICS_TOOL => {
                 self.call_diagnostics(request, &context.ct).await
             }

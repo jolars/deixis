@@ -334,3 +334,76 @@ fn locates_the_last_hover_target_in_utf8_coordinates()
     assert_eq!(last_position(source, "café")?, Position::new(1, 14));
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires clangd"]
+async fn call_hierarchy_works_with_clangd() -> Result<(), Box<dyn Error>> {
+    use deixis::lsp::CallHierarchyDirection;
+
+    let case = CompatibilityCase {
+        name: "clangd-call-hierarchy",
+        command_env: "DEIXIS_CLANGD",
+        command: "clangd",
+        args: &[],
+        extension: ".cpp",
+        language_id: "cpp",
+        file_name: "main.cpp",
+        source: "int callee() { return 42; }\nint caller() { return callee(); }\nint main() { return caller(); }\n",
+        hover_target: "callee",
+        project_files: &[],
+        initialization_options: "",
+    };
+    let root = unique_dir(case.name)?;
+    fs::write(root.join(case.file_name), case.source)?;
+    let command = env::var_os(case.command_env)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(case.command));
+    let config_path = write_config(&root, &command, &case)?;
+    let startup = StartupState::from_options_in(
+        CliOptions::new(Some(config_path), Some(root.clone())),
+        &root,
+    )?;
+    let manager = LazyLanguageServer::new(
+        startup.config().unwrap().servers()[0].clone(),
+        startup.project().clone(),
+    );
+    let result = async {
+        for (direction, position) in [
+            (CallHierarchyDirection::Incoming, Position::new(0, 4)),
+            (CallHierarchyDirection::Outgoing, Position::new(1, 4)),
+        ] {
+            let deadline = Instant::now() + RESULT_TIMEOUT;
+            loop {
+                let calls = manager
+                    .call_hierarchy(
+                        case.file_name,
+                        case.language_id,
+                        position,
+                        direction,
+                    )
+                    .await?;
+                if !calls.is_empty() {
+                    assert_eq!(calls.len(), 1);
+                    assert!(calls[0].from.name.starts_with("caller"));
+                    assert!(calls[0].to.name.starts_with("callee"));
+                    assert_eq!(
+                        calls[0].from_ranges[0].start,
+                        Position::new(1, 22)
+                    );
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(
+                        io::Error::other("clangd returned no calls").into()
+                    );
+                }
+                sleep(RESULT_RETRY_INTERVAL).await;
+            }
+        }
+        Ok::<_, Box<dyn Error>>(())
+    }
+    .await;
+    let shutdown = manager.shutdown().await?;
+    assert!(!shutdown.forced());
+    result
+}

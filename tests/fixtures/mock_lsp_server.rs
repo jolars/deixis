@@ -13,6 +13,8 @@ use std::{
 
 const JSONRPC_VERSION: &str = "2.0";
 
+mod call_hierarchy;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mode = parse_mode();
     let generation = record_start()?;
@@ -98,7 +100,13 @@ fn handle_request<R: BufRead>(
     params: Json,
     params_present: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if method == "textDocument/hover" && mode.starts_with("call-hierarchy-dynamic") {
+        call_hierarchy::register(output, input, true)?;
+    }
     match method {
+        "textDocument/prepareCallHierarchy" | "callHierarchy/incomingCalls" | "callHierarchy/outgoingCalls" => {
+            call_hierarchy::handle_request(mode, output, input, &state, id, method, params)?;
+        }
         "initialize" => {
             eprintln!("mock-lsp initializing");
             state.lock().unwrap().initialize_params = Some(params.clone());
@@ -239,6 +247,15 @@ fn handle_request<R: BufRead>(
                     workspace_symbol_provider,
                 ),
             ];
+            if mode != "call-hierarchy-absent" {
+                capabilities.push(("callHierarchyProvider".to_owned(),
+                    if mode == "call-hierarchy-unsupported" || mode.starts_with("call-hierarchy-dynamic") {
+                        Json::Bool(false)
+                    } else if mode == "call-hierarchy-options" {
+                        json_object([])
+                    } else { Json::Bool(true) }
+                ));
+            }
             if let Some(diagnostic_provider) = diagnostic_provider {
                 capabilities.push((
                     "diagnosticProvider".to_owned(),
@@ -1571,7 +1588,7 @@ fn handle_notification(
             if let Some(id) = canceled_id.as_ref() {
                 state.lock().unwrap().cancellations.insert(id.to_string());
             }
-            if mode.starts_with("hover-cancellation") {
+            if mode.starts_with("hover-cancellation") || mode.starts_with("call-hierarchy-cancel") {
                 write_message(
                     output,
                     notification(
@@ -2659,6 +2676,7 @@ struct MockState {
     initialized: bool,
     shutdown_requested: bool,
     client_probe_complete: bool,
+    hierarchy_attempts: BTreeMap<String, usize>,
     initialize_params: Option<Json>,
     cancellations: BTreeSet<String>,
     document_events: Vec<Json>,
@@ -2883,7 +2901,14 @@ impl<'a> Parser<'a> {
                         _ => return Err(self.error("invalid escape")),
                     }
                 }
-                other => value.push(other as char),
+                other if other.is_ascii() => value.push(other as char),
+                _ => {
+                    let remaining = std::str::from_utf8(&self.input[self.position - 1..])
+                        .map_err(|_| self.error("invalid UTF-8"))?;
+                    let character = remaining.chars().next().unwrap();
+                    self.position += character.len_utf8() - 1;
+                    value.push(character);
+                }
             }
         }
         Err(self.error("unterminated string"))
