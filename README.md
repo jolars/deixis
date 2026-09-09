@@ -37,6 +37,11 @@ from disk before file-scoped requests, gates every operation on the language
 server's advertised capabilities, and preserves source-server provenance in
 results. Several language servers may serve one immutable project root.
 
+Recoverable LSP cancellations are retried up to three times after a bounded
+readiness wait. Retries share the original request timeout and stop when the
+MCP caller cancels. If retries are exhausted, the error reports the attempt
+count and preserves the language server's error details.
+
 Use `definition`, `type_definition`, `implementation`, and `references`
 directly for targeted symbol navigation. Use `document_symbols` only when you
 need a file outline, such as a view of its types, functions, and nested members.

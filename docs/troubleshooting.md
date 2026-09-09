@@ -124,6 +124,15 @@ stuck.
 On timeout or MCP cancellation, Deixis removes the pending request and sends
 `$/cancelRequest` downstream. A late response is ignored.
 
+Deixis retries server cancellations (`-32802`, or legacy `-32800` when the
+caller has not canceled) up to three times. An explicit
+`retriggerRequest: false` disables retrying. Each retry waits between 50
+milliseconds and one second for readiness, within the original request
+timeout. If the server keeps canceling, the terminal `lsp_error` reports four
+attempts and includes the last server error in `lspError`. A timeout during
+retrying remains `request_timeout`; increasing a host timeout does not extend
+the configured LSP deadline.
+
 ## Empty results appear during startup
 
 Some language servers answer before background indexing finishes. Empty hover,

@@ -28,7 +28,7 @@ shipped stdio surface.
 - [ ] Add optional, tightly bounded source context to root-contained navigation
   results so an agent can often assess a location without another broad file
   read.
-- [ ] Retry retriggerable LSP cancellations, including error `-32802` with
+- [x] Retry retriggerable LSP cancellations, including error `-32802` with
   `retriggerRequest`, after a bounded readiness wait. Preserve the caller's
   deadline and cancellation, and report the terminal failure clearly.
 - [ ] Add incoming and outgoing call hierarchy behind negotiated server

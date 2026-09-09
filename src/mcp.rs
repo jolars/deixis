@@ -1585,6 +1585,11 @@ impl ToolError {
     }
 
     fn from_lsp(context: ToolContext<'_>, error: &LspError) -> Self {
+        if let LspError::RetryExhausted { source, .. } = error {
+            let mut result = Self::from_lsp(context, source);
+            result.message = error.to_string();
+            return result;
+        }
         let mut result =
             Self::new(lsp_error_code(error), context.tool, error.to_string());
         if let Some(server) = context.server {
@@ -1654,6 +1659,7 @@ impl ToolError {
             | LspError::DecodeResult(_)
             | LspError::DocumentPath(_)
             | LspError::ReadDocument { .. } => {}
+            LspError::RetryExhausted { .. } => unreachable!("handled above"),
         }
 
         result
@@ -1710,6 +1716,7 @@ fn lsp_error_code(error: &LspError) -> &'static str {
         | LspError::RestartLimitReached { .. } => "server_exited",
         LspError::OutboundQueueFull { .. } => "server_busy",
         LspError::ResponseError { .. } => "lsp_error",
+        LspError::RetryExhausted { source, .. } => lsp_error_code(source),
         LspError::Spawn { .. } | LspError::MissingPipe { .. } => {
             "server_start_failed"
         }

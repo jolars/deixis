@@ -2070,6 +2070,101 @@ async fn hover_returns_structured_markup_across_position_encodings()
 }
 
 #[tokio::test]
+async fn retries_server_cancellations_over_mcp_stdio()
+-> Result<(), Box<dyn Error>> {
+    for mode in [
+        "hover-retry-readiness-progress",
+        "hover-retry-readiness-server-status",
+    ] {
+        let result = call_hover_error(
+            mode,
+            "main.rs",
+            Some("let 🦀answer = 42;\n"),
+            0,
+            8,
+            2_000,
+        )
+        .await?;
+        assert_eq!(result.is_error, Some(false), "{mode}: {result:?}");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["contents"]["value"],
+            "`answer`: the ultimate value"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_retry_exhaustion_with_the_original_lsp_error()
+-> Result<(), Box<dyn Error>> {
+    let result = call_hover_error(
+        "hover-retry-always",
+        "main.rs",
+        Some("let 🦀answer = 42;\n"),
+        0,
+        8,
+        2_000,
+    )
+    .await?;
+    assert_tool_error(
+        &result,
+        "lsp_error",
+        Some("mock-lsp"),
+        Some("textDocument/hover"),
+        "main.rs",
+    );
+    let error = &result.structured_content.as_ref().unwrap()["error"];
+    assert_eq!(
+        error["lspError"],
+        json!({
+            "code": -32802,
+            "message": "mock hover canceled while indexing",
+            "data": {"retriggerRequest": true},
+        })
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("retry limit reached after 4 attempts")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_deadline_and_exit_failures_during_retry_waits()
+-> Result<(), Box<dyn Error>> {
+    for (mode, timeout_ms, code) in [
+        ("hover-retry-readiness-progress", 30, "request_timeout"),
+        ("hover-retry-exit", 2_000, "server_exited"),
+    ] {
+        let result = call_hover_error(
+            mode,
+            "main.rs",
+            Some("let 🦀answer = 42;\n"),
+            0,
+            8,
+            timeout_ms,
+        )
+        .await?;
+        assert_tool_error(
+            &result,
+            code,
+            Some("mock-lsp"),
+            Some("textDocument/hover"),
+            "main.rs",
+        );
+        if code == "request_timeout" {
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["error"]["timeoutMs"],
+                timeout_ms
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn forwards_mcp_cancellation_during_an_lsp_response_race()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("hover-cancellation-race")?;

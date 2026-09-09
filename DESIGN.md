@@ -548,6 +548,30 @@ growth; a full queue fails immediately. The LSP reader checks `Content-Length`
 before allocating or parsing a body and stops a transport that exceeds its
 configured response-size limit.
 
+Server-initiated cancellation responses (`ServerCancelled`, `-32802`, or the
+legacy `RequestCancelled`, `-32800`, when the caller has not canceled) permit
+up to three retries. If error data includes `retriggerRequest`, it must be the
+boolean `true`; `false` or a malformed value makes the error terminal. Other
+errors, including `ContentModified`, are not retried because replaying the same
+positions may no longer be valid. Initialization and shutdown are never
+retried within a server generation.
+
+Each retry preserves the method and parameters and receives a fresh request
+ID. A retry waits at least 50 milliseconds to avoid a tight loop when readiness
+is stale. Observed progress or server-status notifications wake the wait when
+the server becomes ready. With unknown readiness, the 50-millisecond delay is
+enough; busy or degraded readiness is awaited for at most one second per retry.
+The wait releases the concurrency slot and also wakes on transport failure.
+The original downstream request deadline covers all attempts, concurrency-slot
+waits, and readiness waits. Cancellation and deadline expiry prevent further
+attempts and cancel only the request currently in flight, if any. Late responses
+from earlier attempts cannot complete a later attempt.
+
+Exhausting the retry limit returns `lsp_error` with a message stating the total
+attempt count. Its `lspError` retains the last server error's original numeric
+code, message, and data. Deadline expiry, caller cancellation, and transport
+failure retain their respective terminal error codes.
+
 Errors are translated at the MCP boundary with enough context to act on them:
 tool name, server name, method, project-relative path when applicable, and the
 underlying LSP or process error. Protocol data and source contents are not

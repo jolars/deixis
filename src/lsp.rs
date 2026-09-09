@@ -44,6 +44,12 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const STDERR_CONTEXT_LINES: usize = 8;
 const STDERR_CLOSE_GRACE: Duration = Duration::from_millis(25);
+const MAX_CANCELLATION_RETRIES: usize = 3;
+const RETRY_MIN_DELAY: Duration = Duration::from_millis(50);
+const RETRY_READINESS_WAIT: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+mod retry_tests;
 
 pub struct LazyLanguageServer {
     config: LanguageServerConfig,
@@ -2459,6 +2465,10 @@ pub enum LspError {
         message: String,
         data: Option<JsonValue>,
     },
+    RetryExhausted {
+        attempts: usize,
+        source: Box<LspError>,
+    },
     Shutdown {
         server: String,
         source: io::Error,
@@ -2630,6 +2640,10 @@ impl fmt::Display for LspError {
                     "failed to stop language server `{server}`: {source}"
                 )
             }
+            Self::RetryExhausted { attempts, source } => write!(
+                formatter,
+                "{source}; retry limit reached after {attempts} attempts"
+            ),
         }
     }
 }
@@ -2642,6 +2656,7 @@ impl Error for LspError {
             | Self::Shutdown { source, .. } => Some(source),
             Self::PositionConversion { source, .. } => Some(source),
             Self::InvalidWorkspaceEdit { source, .. } => Some(source),
+            Self::RetryExhausted { source, .. } => Some(source.as_ref()),
             Self::DocumentPath(source) => Some(source),
             Self::EncodeMessage(source) | Self::DecodeResult(source) => {
                 Some(source)
@@ -3004,6 +3019,7 @@ struct ActiveServer {
     configuration: JsonValue,
     status: Arc<Mutex<ServerSnapshot>>,
     readiness: Arc<Mutex<ReadinessTracker>>,
+    readiness_changed: Arc<Notify>,
     diagnostics: Arc<Mutex<DiagnosticCache>>,
     registrations: Arc<Mutex<BTreeMap<String, JsonValue>>>,
     documents: Arc<Mutex<DocumentStore>>,
@@ -3042,6 +3058,7 @@ impl ActiveServer {
                 config.name(),
             ))),
             readiness: Arc::new(Mutex::new(ReadinessTracker::default())),
+            readiness_changed: Arc::new(Notify::new()),
             diagnostics: Arc::new(Mutex::new(DiagnosticCache::default())),
             registrations: Arc::new(Mutex::new(BTreeMap::new())),
             documents: Arc::new(Mutex::new(DocumentStore::default())),
@@ -3482,13 +3499,130 @@ impl ActiveServer {
         request_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<JsonValue, LspError> {
+        let deadline = Instant::now() + request_timeout;
+        for retries in 0..=MAX_CANCELLATION_RETRIES {
+            let result = self
+                .request_attempt(
+                    method,
+                    params.as_ref(),
+                    deadline,
+                    request_timeout,
+                    cancellation,
+                )
+                .await;
+            let error = match result {
+                Err(error) if is_retriggerable_cancellation(method, &error) => {
+                    error
+                }
+                result => return result,
+            };
+            self.check_request_deadline(
+                method,
+                deadline,
+                request_timeout,
+                cancellation,
+            )?;
+            if retries == MAX_CANCELLATION_RETRIES {
+                return Err(LspError::RetryExhausted {
+                    attempts: retries + 1,
+                    source: Box::new(error),
+                });
+            }
+            debug!(server = %self.name, method, retry = retries + 1, "waiting to retry canceled LSP request");
+            self.wait_to_retry(method, deadline, request_timeout, cancellation)
+                .await?;
+        }
+        unreachable!(
+            "the final attempt returns its result or retry-limit error"
+        )
+    }
+
+    fn check_request_deadline(
+        &self,
+        method: &str,
+        deadline: Instant,
+        request_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LspError> {
         if cancellation.is_cancelled() {
             return Err(LspError::RequestCanceled {
                 server: self.name.clone(),
                 method: method.to_owned(),
             });
         }
-        let deadline = Instant::now() + request_timeout;
+        if Instant::now() >= deadline {
+            return Err(LspError::RequestTimeout {
+                server: self.name.clone(),
+                method: method.to_owned(),
+                timeout: request_timeout,
+            });
+        }
+        Ok(())
+    }
+
+    async fn wait_to_retry(
+        &self,
+        method: &str,
+        deadline: Instant,
+        request_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LspError> {
+        let started = Instant::now();
+        let earliest_retry = started + RETRY_MIN_DELAY;
+        let latest_retry = started + RETRY_READINESS_WAIT;
+        loop {
+            // Subscribe before inspecting state so a readiness or exit signal
+            // cannot be lost between the inspection and the wait.
+            let changed = self.readiness_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            self.check_request_deadline(
+                method,
+                deadline,
+                request_timeout,
+                cancellation,
+            )?;
+            if let Some(failure) = self.transport_failure().await {
+                return Err(self.pending_error(failure, method).await);
+            }
+            let state = self.readiness.lock().await.snapshot().state();
+            let now = Instant::now();
+            if now >= earliest_retry
+                && (matches!(
+                    state,
+                    ReadinessState::Ready | ReadinessState::Unknown
+                ) || now >= latest_retry)
+            {
+                return Ok(());
+            }
+            let wake_at = if now < earliest_retry {
+                earliest_retry
+            } else {
+                latest_retry
+            };
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {},
+                _ = tokio::time::sleep_until(deadline.min(wake_at)) => {},
+                _ = changed => {},
+            }
+        }
+    }
+
+    async fn request_attempt(
+        &self,
+        method: &str,
+        params: Option<&JsonValue>,
+        deadline: Instant,
+        request_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<JsonValue, LspError> {
+        if cancellation.is_cancelled() {
+            return Err(LspError::RequestCanceled {
+                server: self.name.clone(),
+                method: method.to_owned(),
+            });
+        }
         let _permit = tokio::select! {
             biased;
             permit = self.request_permits.acquire() => {
@@ -3516,6 +3650,15 @@ impl ActiveServer {
             }
         };
 
+        // An immediately available permit must not outrank an expired deadline
+        // or cancellation when a retry is ready to send.
+        self.check_request_deadline(
+            method,
+            deadline,
+            request_timeout,
+            cancellation,
+        )?;
+
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut receiver) = oneshot::channel();
         {
@@ -3533,7 +3676,7 @@ impl ActiveServer {
             "method": method,
         });
         if let Some(params) = params {
-            message["params"] = params;
+            message["params"] = params.clone();
         }
         if let Err(error) = self.send_message(message).await {
             self.requests.lock().await.pending.remove(&id);
@@ -3542,18 +3685,6 @@ impl ActiveServer {
 
         tokio::select! {
             biased;
-            response = &mut receiver => match response {
-                Ok(Ok(response)) => {
-                    response.into_result(&self.name, method.to_owned())
-                }
-                Ok(Err(error)) => {
-                    Err(self.pending_error(error, method).await)
-                }
-                Err(_) => Err(LspError::RequestCanceled {
-                    server: self.name.clone(),
-                    method: method.to_owned(),
-                }),
-            },
             _ = cancellation.cancelled() => {
                 self.cancel_pending_request(id, method).await;
                 Err(LspError::RequestCanceled {
@@ -3569,6 +3700,18 @@ impl ActiveServer {
                     timeout: request_timeout,
                 })
             }
+            response = &mut receiver => match response {
+                Ok(Ok(response)) => {
+                    response.into_result(&self.name, method.to_owned())
+                }
+                Ok(Err(error)) => {
+                    Err(self.pending_error(error, method).await)
+                }
+                Err(_) => Err(LspError::RequestCanceled {
+                    server: self.name.clone(),
+                    method: method.to_owned(),
+                }),
+            },
         }
     }
 
@@ -3646,6 +3789,26 @@ impl ActiveServer {
             }
         }
     }
+}
+
+fn is_retriggerable_cancellation(method: &str, error: &LspError) -> bool {
+    // Lifecycle requests cannot be replayed within the same server generation.
+    if matches!(method, "initialize" | "shutdown") {
+        return false;
+    }
+    let LspError::ResponseError {
+        code: -32802 | -32800,
+        data,
+        ..
+    } = error
+    else {
+        return false;
+    };
+    // Older servers use RequestCancelled for server-initiated cancellation.
+    // A supplied retrigger directive must explicitly permit another attempt.
+    data.as_ref()
+        .and_then(|data| data.get("retriggerRequest"))
+        .is_none_or(|value| value.as_bool() == Some(true))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3850,6 +4013,7 @@ async fn reader_loop(
         requests.failure = Some(failure);
         std::mem::take(&mut requests.pending)
     };
+    active.readiness_changed.notify_waiters();
     for sender in pending.into_values() {
         let _ = sender.send(Err(failure));
     }
@@ -3969,6 +4133,7 @@ async fn handle_server_request(
                 return;
             };
             active.readiness.lock().await.start_progress(token);
+            active.readiness_changed.notify_waiters();
             let _ = active
                 .send_message(success_response(id, JsonValue::Null))
                 .await;
@@ -4066,6 +4231,7 @@ async fn handle_server_notification(
                             message: params.message,
                         },
                     );
+                    active.readiness_changed.notify_waiters();
                 }
                 Ok(params) => {
                     warn!(
@@ -4128,6 +4294,8 @@ async fn record_progress(
             "ignored progress notification with an unknown kind"
         ),
     }
+    drop(readiness);
+    active.readiness_changed.notify_waiters();
 }
 
 fn progress_token(value: &JsonValue) -> Option<String> {

@@ -569,6 +569,40 @@ fn handle_request<R: BufRead>(
             write_message(output, response(id, result))?;
         }
         "textDocument/hover" => {
+            if mode.starts_with("hover-retry-") {
+                let attempt = {
+                    let mut state = state.lock().unwrap();
+                    state.hover_requests += 1;
+                    state.hover_requests
+                };
+                if attempt == 1 || mode == "hover-retry-always" {
+                    write_message(
+                        output,
+                        error_response_with_data(
+                            id,
+                            -32802,
+                            "mock hover canceled while indexing".to_owned(),
+                            json_object([(
+                                "retriggerRequest",
+                                Json::Bool(true),
+                            )]),
+                        ),
+                    )?;
+                    if mode == "hover-retry-exit" {
+                        return Err(io::Error::other(
+                            "mock exited before retry",
+                        )
+                        .into());
+                    }
+                    let mode = mode.to_owned();
+                    let output = Arc::clone(output);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(150));
+                        let _ = send_readiness_finished(&mode, &output);
+                    });
+                    return Ok(());
+                }
+            }
             if mode == "hover-timeout" {
                 return Ok(());
             }
@@ -2631,6 +2665,7 @@ struct MockState {
     open_documents: BTreeSet<String>,
     document_texts: BTreeMap<String, String>,
     diagnostic_requests: usize,
+    hover_requests: usize,
     active_delays: usize,
     max_active_delays: usize,
 }
