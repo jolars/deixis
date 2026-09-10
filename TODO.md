@@ -45,7 +45,7 @@ shipped stdio surface.
   and patches.
 - [x] Curate and validate a pinned ten-task Rust pilot from SWE-bench
   Multilingual, including isolated base/gold grading.
-- [ ] Revise the Deixis treatment to target definitions, type definitions,
+- [x] Revise the Deixis treatment to target definitions, type definitions,
   implementations, references, and post-edit diagnostics. Do not require
   document-symbol calls or any Deixis call when a task has no semantic
   navigation need.

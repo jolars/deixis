@@ -20,14 +20,17 @@ arms = [
 ]
 
 instruction = """
-You must use the Deixis MCP server for semantic code navigation whenever it is
-available. For each navigation need involving definitions, references,
-implementations, hover information, or diagnostics, try the
-corresponding Deixis tool before using text search or reading broad file ranges.
-Use document_symbols only when a file outline is needed; it is not a default
-navigation step or a prerequisite for other queries.
-If Deixis is unavailable or its call fails, fall back to ordinary repository
-tools.
+When a task needs semantic code navigation and Deixis is available, try
+`definition`, `type_definition`, `implementation`, or `references` for
+the relevant question before using text search or reading broad file ranges.
+Use ordinary repository tools to locate an initial file or symbol position
+when needed. After editing code in a task with a semantic navigation need,
+use `diagnostics` on the changed files to check for language-server errors,
+and run the relevant tests. If the task has no semantic navigation need, no
+Deixis call is required, including diagnostics. Use `document_symbols` only
+when a file outline is needed; it is never a required step. If Deixis is
+unavailable, a call fails, or its result does not answer the question, fall
+back to ordinary repository tools.
 """
 
 [environment]

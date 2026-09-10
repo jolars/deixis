@@ -14,24 +14,31 @@ The four experimental arms separate tool availability from instructions:
 | `instruction_only` | No | Yes |
 | `deixis_instructed` | Yes | Yes |
 
-The task prompt never changes across arms. The instruction explicitly requires
-the agent to try the corresponding Deixis tool before text search or broad file
-reading for semantic-navigation needs. It allows ordinary repository tools when
-Deixis is absent or a call fails. This makes the following paired comparisons
+The task prompt never changes across arms. When a task needs semantic navigation
+and Deixis is available, the instruction directs the agent to `definition`,
+`type_definition`, `implementation`, or `references` before text search or broad
+file reading to answer that question. Ordinary repository tools can locate the
+initial file or symbol position. After editing code in these tasks, the agent
+checks changed files with `diagnostics` and runs the relevant tests. If Deixis is
+absent, a call fails, or its result does not answer the question, the agent falls
+back to ordinary repository tools. This makes the following paired comparisons
 meaningful:
 
 - `deixis_available` versus `control`: unprompted availability and discovery;
 - `deixis_instructed` versus `instruction_only`: the configured deployment;
 - `deixis_instructed` versus `deixis_available`: instruction-driven adoption.
 
-The instruction reserves `document_symbols` for an explicit file-outline need.
-It does not require an outline as a default navigation step or before another
-query. The Deixis tool description and MCP initialization guidance convey the
-same scope whenever Deixis is available, including the uninstructed arm.
+Tasks with no semantic navigation need require no Deixis calls, including
+diagnostics. For example, an already located, self-contained edit can use
+ordinary repository tools throughout. There is no minimum call count.
+`document_symbols` is optional and reserved for an explicit file-outline need;
+it is never a required navigation step. The Deixis tool description and MCP
+initialization guidance convey the same outline scope whenever Deixis is
+available, including the uninstructed arm.
 
 Deixis runs without `--allow-mutation`. Codex therefore uses the same built-in
 editing mechanism in every arm, while Deixis contributes semantic navigation
-only.
+and post-edit diagnostics.
 
 ## Requirements
 
@@ -86,6 +93,11 @@ overrides used for the factorial arms.
 
 Copy [benchmark.example.toml](benchmark.example.toml) to an untracked manifest
 and edit it. Relative paths are resolved from the manifest's directory.
+
+The optional `instruction` field overrides the harness's default treatment.
+The example and generated pilot manifests include it explicitly. To adopt the
+revised treatment in an existing manifest, replace that field with the example's
+instruction or omit it to use the harness default.
 
 Each task names a local Git repository, a revision, an arm-invariant prompt,
 and an evaluation command. Commands are argument arrays and are executed
