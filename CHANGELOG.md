@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.2](https://github.com/jolars/deixis/compare/v0.2.1...v0.2.2) (2026-09-16)
+
+### Bug Fixes
+- **mcp:** migrate to `rmcp` 3.4 server config ([`ab11745`](https://github.com/jolars/deixis/commit/ab117452d909764eef05cf2a7354cd1923d88c5f))
+- **lsp:** retry transient semantic query results ([`e687cab`](https://github.com/jolars/deixis/commit/e687cab69859b25699655000ebfb0f9873f1575d))
+
 ## [0.2.1](https://github.com/jolars/deixis/compare/v0.2.0...v0.2.1) (2026-09-07)
 
 ### Bug Fixes
