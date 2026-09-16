@@ -6,6 +6,9 @@ updates:
       interval: "weekly"
   - package-ecosystem: "github-actions"
     directory: "/"
+    # cargo-dist validates this generated workflow against its configuration.
+    exclude-paths:
+      - ".github/workflows/release.yml"
     schedule:
       interval: "weekly"
     groups:
