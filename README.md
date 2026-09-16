@@ -44,6 +44,14 @@ readiness wait. Retries share the original request timeout and stop when the
 MCP caller cancels. If retries are exhausted, the error reports the attempt
 count and preserves the language server's error details.
 
+Navigation, hover, signature help, references, symbols, and call-hierarchy
+preparation also retry empty results observed during indexing and
+`ContentModified` errors, waiting up to five seconds for readiness per retry
+within the same timeout and three-retry limit. File-scoped retries
+verify that both the synchronized document and its contents on disk are
+unchanged before reusing a position. Nonempty results and empty results from
+servers with ready or unknown status throughout the request return immediately.
+
 Use `definition`, `type_definition`, `implementation`, and `references`
 directly for targeted symbol navigation. Use `document_symbols` only when you
 need a file outline, such as a view of its types, functions, and nested members.

@@ -35,6 +35,9 @@ shipped stdio surface.
 - [x] Retry retriggerable LSP cancellations, including error `-32802` with
   `retriggerRequest`, after a bounded readiness wait. Preserve the caller's
   deadline and cancellation, and report the terminal failure clearly.
+- [x] Recover from startup-time empty semantic results and `ContentModified`
+  errors within one tool call. Bound readiness waits and retries, and verify
+  the source document before replaying a position-based query.
 - [x] Add incoming and outgoing call hierarchy behind negotiated server
   capabilities, with the same result limits as references.
 - [x] Add signature help behind negotiated server capabilities, with concise

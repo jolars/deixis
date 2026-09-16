@@ -2073,6 +2073,33 @@ async fn hover_returns_structured_markup_across_position_encodings()
 }
 
 #[tokio::test]
+async fn recovers_from_startup_empty_and_content_modified_over_mcp_stdio()
+-> Result<(), Box<dyn Error>> {
+    for mode in [
+        "hover-startup-readiness-progress",
+        "hover-startup-readiness-server-status",
+        "hover-content-modified",
+    ] {
+        let result = call_hover_error(
+            mode,
+            "main.rs",
+            Some("let 🦀answer = 42;\n"),
+            0,
+            8,
+            2_000,
+        )
+        .await?;
+        assert_eq!(result.is_error, Some(false), "{mode}: {result:?}");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["contents"]["value"],
+            "`answer`: the ultimate value",
+            "{mode}: {result:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn retries_server_cancellations_over_mcp_stdio()
 -> Result<(), Box<dyn Error>> {
     for mode in [

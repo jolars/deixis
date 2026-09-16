@@ -586,6 +586,32 @@ fn handle_request<R: BufRead>(
             write_message(output, response(id, result))?;
         }
         "textDocument/hover" => {
+            if mode.starts_with("hover-startup-")
+                || mode == "hover-content-modified"
+            {
+                let attempt = {
+                    let mut state = state.lock().unwrap();
+                    state.hover_requests += 1;
+                    state.hover_requests
+                };
+                if attempt == 1 && mode.starts_with("hover-startup-") {
+                    write_message(output, response(id, Json::Null))?;
+                    let mode = mode.to_owned();
+                    let output = Arc::clone(output);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(150));
+                        let _ = send_readiness_finished(&mode, &output);
+                    });
+                    return Ok(());
+                }
+                if attempt <= 2 {
+                    write_message(
+                        output,
+                        error_response(id, -32801, "content modified".to_owned()),
+                    )?;
+                    return Ok(());
+                }
+            }
             if mode.starts_with("hover-retry-") {
                 let attempt = {
                     let mut state = state.lock().unwrap();

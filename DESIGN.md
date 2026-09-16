@@ -429,7 +429,9 @@ diagnostics return no semantic result, their structured output also includes `re
 derived `resultStability`: `transient` while observed work is active, `stable`
 after observed work has completed, and `indeterminate` when the server has
 emitted no usable readiness signal or reports degraded health. Initialization
-by itself leaves readiness `unknown`.
+by itself leaves readiness `unknown`. Eligible semantic queries first retry
+empty responses observed during active work within the request's retry and
+timeout bounds, as described below.
 
 Deixis acknowledges `workspace/diagnostic/refresh` when a server sends it, but
 does not advertise proactive refresh support. Diagnostics remain
@@ -580,15 +582,38 @@ Server-initiated cancellation responses (`ServerCancelled`, `-32802`, or the
 legacy `RequestCancelled`, `-32800`, when the caller has not canceled) permit
 up to three retries. If error data includes `retriggerRequest`, it must be the
 boolean `true`; `false` or a malformed value makes the error terminal. Other
-errors, including `ContentModified`, are not retried because replaying the same
-positions may no longer be valid. Initialization and shutdown are never
-retried within a server generation.
+errors are terminal except for the guarded `ContentModified` recovery below.
+Initialization and shutdown are never retried within a server generation.
+
+Hover, signature help, navigation, references, document symbols, call-hierarchy
+preparation, and workspace symbols also retry `ContentModified` (`-32801`) and
+empty results. Empty results are retried only when the server was observed
+busy before or after the attempt.
+`ContentModified` can reflect an internal project-state change even when the
+source file has not changed. A supplied `retriggerRequest` directive must still
+permit a retry. These attempts share the existing three-retry budget. For these
+responses, the readiness wait is bounded at five seconds per retry. Nonempty
+results return immediately, and empty results without observed activity do not
+trigger recovery. Rename, diagnostics, and call-hierarchy expansion retain
+their existing behavior; prepared server objects are not replayed after
+`ContentModified`.
+
+Eligible file queries retain the original synchronized document. Before each
+retry, after acquiring a concurrency slot, Deixis verifies that its tracked
+version and text, canonical path, and current contents on disk are unchanged.
+The document-store lock prevents another synchronization from overtaking the
+validated request before it is queued. A changed, removed, or unreadable file
+stops recovery, preserving the preceding LSP error or returning `ContentModified`
+if the preceding response was empty. Workspace-symbol requests have no source
+position to invalidate. Lifecycle requests and arbitrary raw methods do not
+opt into this semantic recovery.
 
 Each retry preserves the method and parameters and receives a fresh request
 ID. A retry waits at least 50 milliseconds to avoid a tight loop when readiness
 is stale. Observed progress or server-status notifications wake the wait when
 the server becomes ready. With unknown readiness, the 50-millisecond delay is
 enough; busy or degraded readiness is awaited for at most one second per retry.
+Semantic recovery uses the five-second bound described above instead.
 The wait releases the concurrency slot and also wakes on transport failure.
 The original downstream request deadline covers all attempts, concurrency-slot
 waits, and readiness waits. Cancellation and deadline expiry prevent further
@@ -599,6 +624,8 @@ Exhausting the retry limit returns `lsp_error` with a message stating the total
 attempt count. Its `lspError` retains the last server error's original numeric
 code, message, and data. Deadline expiry, caller cancellation, and transport
 failure retain their respective terminal error codes.
+If empty responses exhaust the retry budget, the final empty result is returned
+with the usual readiness context where supported by the tool.
 
 Errors are translated at the MCP boundary with enough context to act on them:
 tool name, server name, method, project-relative path when applicable, and the

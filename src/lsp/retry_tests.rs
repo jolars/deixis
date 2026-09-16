@@ -314,3 +314,174 @@ async fn retry_in_flight_preserves_deadline_and_forwards_cancellation_to_its_id(
         assert_eq!(next.await.unwrap().unwrap(), "current");
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn semantic_retry_recovers_empty_then_content_modified() {
+    for ready_before_response in [false, true] {
+        let (active, mut receiver) = server().await;
+        readiness(&active, true, false).await;
+        let pending = request(
+            &active,
+            "workspace/symbol",
+            10_000,
+            &CancellationToken::new(),
+        );
+        let first = receive(&mut receiver).await;
+        if ready_before_response {
+            readiness(&active, true, true).await;
+        }
+        respond(&active, &first, json!({"result": []})).await;
+        assert_eq!(active.request_permits.available_permits(), 1);
+        if !ready_before_response {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(receiver.try_recv().is_err());
+            readiness(&active, true, true).await;
+        }
+        let second = receive(&mut receiver).await;
+        respond(&active, &second, canceled(-32801, JsonValue::Null)).await;
+        let third = receive(&mut receiver).await;
+        assert_ne!(first["id"], second["id"]);
+        assert_ne!(second["id"], third["id"]);
+        assert_eq!(first["params"], third["params"]);
+        respond(&active, &third, json!({"result": ["found"]})).await;
+        assert_eq!(pending.await.unwrap().unwrap(), json!(["found"]));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_retry_preserves_normal_results_and_bounds_busy_empty_results()
+{
+    for (busy, result, attempts) in [
+        (false, json!([]), 1),
+        (false, JsonValue::Null, 1),
+        (true, json!(["found"]), 1),
+        (true, json!([]), 4),
+    ] {
+        let (active, mut receiver) = server().await;
+        if busy {
+            readiness(&active, true, false).await;
+        }
+        let started = Instant::now();
+        let pending = request(
+            &active,
+            "workspace/symbol",
+            20_000,
+            &CancellationToken::new(),
+        );
+        for _ in 0..attempts {
+            let message = receive(&mut receiver).await;
+            respond(&active, &message, json!({"result": result})).await;
+        }
+        assert_eq!(pending.await.unwrap().unwrap(), result);
+        assert!(Instant::now() - started <= Duration::from_secs(15));
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_retry_obeys_cancellation_and_deadline() {
+    for cancel in [false, true] {
+        let (active, mut receiver) = server().await;
+        readiness(&active, true, false).await;
+        let token = CancellationToken::new();
+        let pending = request(&active, "workspace/symbol", 500, &token);
+        let first = receive(&mut receiver).await;
+        respond(&active, &first, json!({"result": []})).await;
+        if cancel {
+            token.cancel();
+        }
+        let error = pending.await.unwrap().unwrap_err();
+        if cancel {
+            assert!(matches!(error, LspError::RequestCanceled { .. }));
+        } else {
+            assert!(matches!(error, LspError::RequestTimeout { .. }));
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn semantic_retry_revalidates_documents_after_waiting_for_a_slot() {
+    for change in ["none", "disk", "synchronized", "deleted", "queued"] {
+        let (active, mut receiver) = server().await;
+        let directory = std::env::temp_dir()
+            .join(format!("deixis-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.test");
+        std::fs::write(&path, "original").unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let document = active
+            .documents
+            .lock()
+            .await
+            .synchronize(
+                &path,
+                Path::new("main.test"),
+                path_to_file_uri(&path),
+                "test",
+                "original".to_owned(),
+                true,
+            )
+            .unwrap()
+            .document()
+            .clone();
+        readiness(&active, true, false).await;
+        let pending = {
+            let active = active.clone();
+            let document = document.clone();
+            tokio::spawn(async move {
+                active.request_document_value(
+                    "textDocument/definition",
+                    json!({"textDocument": {"uri": document.uri()}, "position": {"line": 0, "character": 0}}),
+                    &document, Duration::from_secs(5), &CancellationToken::new(),
+                ).await
+            })
+        };
+        let first = receive(&mut receiver).await;
+        respond(&active, &first, canceled(-32801, JsonValue::Null)).await;
+        let permit = active.request_permits.acquire().await.unwrap();
+        readiness(&active, true, true).await;
+        if change == "queued" {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        match change {
+            "disk" | "queued" => std::fs::write(&path, "changed").unwrap(),
+            "deleted" => std::fs::remove_file(&path).unwrap(),
+            "synchronized" => {
+                active
+                    .documents
+                    .lock()
+                    .await
+                    .synchronize(
+                        &path,
+                        Path::new("main.test"),
+                        document.uri().to_owned(),
+                        "test",
+                        "changed".to_owned(),
+                        true,
+                    )
+                    .unwrap();
+            }
+            _ => {}
+        }
+        drop(permit);
+        if change == "none" {
+            let second = receive(&mut receiver).await;
+            assert_ne!(first["id"], second["id"]);
+            assert_eq!(first["params"], second["params"]);
+            respond(&active, &second, json!({"result": ["found"]})).await;
+            assert_eq!(pending.await.unwrap().unwrap(), json!(["found"]));
+        } else {
+            assert!(
+                matches!(
+                    pending.await.unwrap(),
+                    Err(LspError::ResponseError { code: -32801, .. })
+                ),
+                "{change}"
+            );
+            assert!(receiver.try_recv().is_err(), "{change}");
+        }
+        assert!(active.requests.lock().await.pending.is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}

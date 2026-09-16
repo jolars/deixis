@@ -125,7 +125,7 @@ impl LazyLanguageServer {
         let value = active.request_value_until(
             PREPARE_METHOD,
             Some(json!({ "textDocument": { "uri": document.uri() }, "position": position })),
-            deadline, request_timeout, cancellation,
+            Some(&document), deadline, request_timeout, cancellation,
         ).await?;
         let items: Option<Vec<JsonValue>> =
             serde_json::from_value(value).map_err(LspError::DecodeResult)?;
@@ -144,6 +144,7 @@ impl LazyLanguageServer {
                 .request_value_until(
                     direction.method(),
                     Some(json!({ "item": value })),
+                    None,
                     deadline,
                     request_timeout,
                     cancellation,

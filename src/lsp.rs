@@ -44,9 +44,10 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const STDERR_CONTEXT_LINES: usize = 8;
 const STDERR_CLOSE_GRACE: Duration = Duration::from_millis(25);
-const MAX_CANCELLATION_RETRIES: usize = 3;
+const MAX_REQUEST_RETRIES: usize = 3;
 const RETRY_MIN_DELAY: Duration = Duration::from_millis(50);
 const RETRY_READINESS_WAIT: Duration = Duration::from_secs(1);
+const SEMANTIC_READINESS_WAIT: Duration = Duration::from_secs(5);
 
 mod call_hierarchy;
 pub use call_hierarchy::{
@@ -217,12 +218,13 @@ impl LazyLanguageServer {
                 source,
             })?;
         let value = active
-            .request_value(
+            .request_document_value(
                 "textDocument/hover",
                 json!({
                     "textDocument": { "uri": document.uri() },
                     "position": lsp_position,
                 }),
+                &document,
                 self.config.timeouts().request(),
                 cancellation,
             )
@@ -300,12 +302,13 @@ impl LazyLanguageServer {
                 source,
             })?;
         let value = active
-            .request_value(
+            .request_document_value(
                 METHOD,
                 json!({
                     "textDocument": { "uri": document.uri() },
                     "position": lsp_position,
                 }),
+                &document,
                 self.config.timeouts().request(),
                 cancellation,
             )
@@ -706,7 +709,7 @@ impl LazyLanguageServer {
                 source,
             })?;
         let value = active
-            .request_value(
+            .request_document_value(
                 "textDocument/references",
                 json!({
                     "textDocument": { "uri": document.uri() },
@@ -715,6 +718,7 @@ impl LazyLanguageServer {
                         "includeDeclaration": include_declaration,
                     },
                 }),
+                &document,
                 self.config.timeouts().request(),
                 cancellation,
             )
@@ -787,9 +791,10 @@ impl LazyLanguageServer {
 
         let document = active.synchronize_document(file, language_id).await?;
         let value = active
-            .request_value(
+            .request_document_value(
                 METHOD,
                 json!({ "textDocument": { "uri": document.uri() } }),
+                &document,
                 self.config.timeouts().request(),
                 cancellation,
             )
@@ -995,12 +1000,13 @@ impl LazyLanguageServer {
                 source,
             })?;
         let value = active
-            .request_value(
+            .request_document_value(
                 method,
                 json!({
                     "textDocument": { "uri": document.uri() },
                     "position": lsp_position,
                 }),
+                &document,
                 self.config.timeouts().request(),
                 cancellation,
             )
@@ -3497,6 +3503,25 @@ impl ActiveServer {
         .await
     }
 
+    async fn request_document_value(
+        &self,
+        method: &str,
+        params: JsonValue,
+        document: &SynchronizedDocument,
+        request_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<JsonValue, LspError> {
+        self.request_value_until(
+            method,
+            Some(params),
+            Some(document),
+            Instant::now() + request_timeout,
+            request_timeout,
+            cancellation,
+        )
+        .await
+    }
+
     async fn request_value_with_optional_params(
         &self,
         method: &str,
@@ -3508,6 +3533,7 @@ impl ActiveServer {
         self.request_value_until(
             method,
             params,
+            None,
             deadline,
             request_timeout,
             cancellation,
@@ -3519,25 +3545,68 @@ impl ActiveServer {
         &self,
         method: &str,
         params: Option<JsonValue>,
+        document: Option<&SynchronizedDocument>,
         deadline: Instant,
         request_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<JsonValue, LspError> {
-        for retries in 0..=MAX_CANCELLATION_RETRIES {
-            let result = self
+        let recover_semantics =
+            document.is_some() || method == "workspace/symbol";
+        let mut previous = None;
+        for retries in 0..=MAX_REQUEST_RETRIES {
+            let was_busy = self.readiness.lock().await.snapshot().state()
+                == ReadinessState::Busy;
+            let attempt = self
                 .request_attempt(
                     method,
                     params.as_ref(),
+                    document.filter(|_| retries > 0),
                     deadline,
                     request_timeout,
                     cancellation,
                 )
                 .await;
-            let error = match result {
-                Err(error) if is_retriggerable_cancellation(method, &error) => {
-                    error
+            let result = match attempt {
+                Ok(Some(value)) => Ok(value),
+                Err(error) => Err(error),
+                Ok(None) => {
+                    return match previous {
+                        Some(Err(error)) => Err(error),
+                        _ => Err(LspError::ResponseError {
+                            server: self.name.clone(),
+                            method: method.to_owned(),
+                            code: -32801,
+                            message: "source document changed before retry"
+                                .to_owned(),
+                            data: None,
+                        }),
+                    };
                 }
-                result => return result,
+            };
+            let readiness_wait = match &result {
+                Err(error) if is_retriggerable_cancellation(method, error) => {
+                    RETRY_READINESS_WAIT
+                }
+                Err(LspError::ResponseError {
+                    code: -32801, data, ..
+                }) if recover_semantics && permits_retrigger(data.as_ref()) => {
+                    SEMANTIC_READINESS_WAIT
+                }
+                Ok(value)
+                    if recover_semantics
+                        && is_empty_semantic_result(method, value)
+                        && (was_busy
+                            || self
+                                .readiness
+                                .lock()
+                                .await
+                                .snapshot()
+                                .state()
+                                == ReadinessState::Busy) =>
+                {
+                    SEMANTIC_READINESS_WAIT
+                }
+                _ => return result,
             };
             self.check_request_deadline(
                 method,
@@ -3545,15 +3614,22 @@ impl ActiveServer {
                 request_timeout,
                 cancellation,
             )?;
-            if retries == MAX_CANCELLATION_RETRIES {
-                return Err(LspError::RetryExhausted {
+            if retries == MAX_REQUEST_RETRIES {
+                return result.map_err(|error| LspError::RetryExhausted {
                     attempts: retries + 1,
                     source: Box::new(error),
                 });
             }
-            debug!(server = %self.name, method, retry = retries + 1, "waiting to retry canceled LSP request");
-            self.wait_to_retry(method, deadline, request_timeout, cancellation)
-                .await?;
+            previous = Some(result);
+            debug!(server = %self.name, method, retry = retries + 1, "waiting to retry LSP request");
+            self.wait_to_retry(
+                method,
+                deadline,
+                request_timeout,
+                cancellation,
+                readiness_wait,
+            )
+            .await?;
         }
         unreachable!(
             "the final attempt returns its result or retry-limit error"
@@ -3589,10 +3665,11 @@ impl ActiveServer {
         deadline: Instant,
         request_timeout: Duration,
         cancellation: &CancellationToken,
+        readiness_wait: Duration,
     ) -> Result<(), LspError> {
         let started = Instant::now();
         let earliest_retry = started + RETRY_MIN_DELAY;
-        let latest_retry = started + RETRY_READINESS_WAIT;
+        let latest_retry = started + readiness_wait;
         loop {
             // Subscribe before inspecting state so a readiness or exit signal
             // cannot be lost between the inspection and the wait.
@@ -3636,10 +3713,11 @@ impl ActiveServer {
         &self,
         method: &str,
         params: Option<&JsonValue>,
+        retry_document: Option<&SynchronizedDocument>,
         deadline: Instant,
         request_timeout: Duration,
         cancellation: &CancellationToken,
-    ) -> Result<JsonValue, LspError> {
+    ) -> Result<Option<JsonValue>, LspError> {
         if cancellation.is_cancelled() {
             return Err(LspError::RequestCanceled {
                 server: self.name.clone(),
@@ -3682,6 +3760,46 @@ impl ActiveServer {
             cancellation,
         )?;
 
+        // Validate after acquiring a slot: another query may have synchronized
+        // an edit while this retry was queued. Keep synchronization ordered
+        // until the request is sent, but release the lock before its response.
+        let document_guard = if let Some(document) = retry_document {
+            let validation = async {
+                let documents = self.documents.lock().await;
+                if !documents.matches(document)
+                    || tokio::fs::canonicalize(document.absolute_path())
+                        .await
+                        .ok()
+                        .as_deref()
+                        != Some(document.absolute_path())
+                    || tokio::fs::read_to_string(document.absolute_path())
+                        .await
+                        .ok()
+                        .as_deref()
+                        != Some(document.text())
+                {
+                    return None;
+                }
+                Some(documents)
+            };
+            let guard = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                _ = tokio::time::sleep_until(deadline) => None,
+                guard = validation => guard,
+            };
+            self.check_request_deadline(
+                method,
+                deadline,
+                request_timeout,
+                cancellation,
+            )?;
+            let Some(guard) = guard else { return Ok(None) };
+            Some(guard)
+        } else {
+            None
+        };
+
         let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (sender, mut receiver) = oneshot::channel();
         {
@@ -3705,6 +3823,7 @@ impl ActiveServer {
             self.requests.lock().await.pending.remove(&id);
             return Err(error);
         }
+        drop(document_guard);
 
         tokio::select! {
             biased;
@@ -3725,7 +3844,7 @@ impl ActiveServer {
             }
             response = &mut receiver => match response {
                 Ok(Ok(response)) => {
-                    response.into_result(&self.name, method.to_owned())
+                    response.into_result(&self.name, method.to_owned()).map(Some)
                 }
                 Ok(Err(error)) => {
                     Err(self.pending_error(error, method).await)
@@ -3829,9 +3948,22 @@ fn is_retriggerable_cancellation(method: &str, error: &LspError) -> bool {
     };
     // Older servers use RequestCancelled for server-initiated cancellation.
     // A supplied retrigger directive must explicitly permit another attempt.
-    data.as_ref()
-        .and_then(|data| data.get("retriggerRequest"))
+    permits_retrigger(data.as_ref())
+}
+
+fn permits_retrigger(data: Option<&JsonValue>) -> bool {
+    data.and_then(|data| data.get("retriggerRequest"))
         .is_none_or(|value| value.as_bool() == Some(true))
+}
+
+fn is_empty_semantic_result(method: &str, value: &JsonValue) -> bool {
+    value.is_null()
+        || value.as_array().is_some_and(Vec::is_empty)
+        || (method == "textDocument/signatureHelp"
+            && value
+                .get("signatures")
+                .and_then(JsonValue::as_array)
+                .is_some_and(Vec::is_empty))
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -87,6 +87,14 @@ impl DocumentStore {
         self.documents.is_empty()
     }
 
+    pub(crate) fn matches(&self, document: &SynchronizedDocument) -> bool {
+        !self.closed
+            && self
+                .documents
+                .get(document.absolute_path())
+                .is_some_and(|tracked| tracked.document == *document)
+    }
+
     pub(crate) fn snapshots(&self) -> BTreeMap<PathBuf, SynchronizedDocument> {
         self.documents
             .iter()
