@@ -32,6 +32,9 @@ async fn call_hierarchy_preserves_items_and_converts_caller_ranges()
     for encoding in ["utf-8", "utf-16", "utf-32"] {
         let (root, client) =
             client_for(&format!("call-hierarchy-{encoding}"), 1000).await?;
+        let expected_uri =
+            url::Url::from_file_path(fs::canonicalize(root.join("main.rs"))?)
+                .unwrap();
         let tools = client.list_tools(None).await?;
         for tool in ["incoming_calls", "outgoing_calls"] {
             let schema = tools
@@ -77,12 +80,7 @@ async fn call_hierarchy_preserves_items_and_converts_caller_ranges()
                 calls[0][selected]["selectionRange"]["start"]["character"],
                 8
             );
-            assert_eq!(
-                calls[0][selected]["uri"],
-                url::Url::from_file_path(root.join("main.rs"))
-                    .unwrap()
-                    .as_str()
-            );
+            assert_eq!(calls[0][selected]["uri"], expected_uri.as_str());
             assert_eq!(
                 calls[0][other]["selectionRange"]["start"]["character"],
                 4

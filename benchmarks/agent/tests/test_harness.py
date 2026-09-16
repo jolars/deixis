@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -63,9 +64,9 @@ tags = ["rust", "semantic"]
 
             self.assertEqual(config.model, "test-model")
             self.assertEqual(config.repetitions, 2)
-            self.assertEqual(config.deixis_command, root / "deixis")
-            self.assertEqual(config.deixis_config, root / "deixis.toml")
-            self.assertEqual(config.tasks[0].repository, repository)
+            self.assertEqual(config.deixis_command, (root / "deixis").resolve())
+            self.assertEqual(config.deixis_config, (root / "deixis.toml").resolve())
+            self.assertEqual(config.tasks[0].repository, repository.resolve())
             self.assertEqual(config.tasks[0].tags, ("rust", "semantic"))
             self.assertEqual(config.instruction, DEFAULT_INSTRUCTION)
 
@@ -119,19 +120,25 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("developer_instructions", rendered)
 
     def test_instructed_deixis_arm_configures_both_factors(self) -> None:
-        command = build_codex_command(self.config, ARMS[3], Path("/work/tree"))
-        rendered = "\n".join(command)
-
-        self.assertIn('mcp_servers.deixis.command="/opt/deixis"', rendered)
-        self.assertIn(
-            'mcp_servers.deixis.args=["--root", "/work/tree", '
-            '"--config", "/opt/deixis.toml"]',
-            rendered,
+        worktree = Path("/work/tree")
+        command = build_codex_command(self.config, ARMS[3], worktree)
+        overrides = tomllib.loads(
+            "\n".join(
+                value
+                for option, value in zip(command, command[1:])
+                if option == "-c"
+            )
         )
-        self.assertIn("mcp_servers.deixis.required=true", rendered)
-        self.assertIn(
-            'developer_instructions="Use typed LSP tools when available."',
-            rendered,
+        deixis = overrides["mcp_servers"]["deixis"]
+
+        self.assertEqual(deixis["command"], str(self.config.deixis_command))
+        self.assertEqual(
+            deixis["args"],
+            ["--root", str(worktree), "--config", str(self.config.deixis_config)],
+        )
+        self.assertIs(deixis["required"], True)
+        self.assertEqual(
+            overrides["developer_instructions"], self.config.instruction
         )
 
     def test_command_forces_chatgpt_authentication(self) -> None:
@@ -141,6 +148,7 @@ class CommandTests(unittest.TestCase):
 
     def test_environment_removes_usage_billed_api_credentials(self) -> None:
         task = Task("one", Path("/repo"), "HEAD", "Fix it", ("test",))
+        authentication_directory = Path("/codex-home")
 
         with patch.dict(
             os.environ,
@@ -150,12 +158,14 @@ class CommandTests(unittest.TestCase):
                 "CODEX_API_KEY": "do-not-use",
             },
         ):
-            environment = _task_environment(self.config, task, Path("/codex-home"))
+            environment = _task_environment(
+                self.config, task, authentication_directory
+            )
 
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertNotIn("AZURE_OPENAI_API_KEY", environment)
         self.assertNotIn("CODEX_API_KEY", environment)
-        self.assertEqual(environment["CODEX_HOME"], "/codex-home")
+        self.assertEqual(environment["CODEX_HOME"], str(authentication_directory))
 
     def test_codex_home_requires_chatgpt_authentication(self) -> None:
         with (

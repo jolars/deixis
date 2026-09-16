@@ -168,11 +168,13 @@ class ManifestTests(unittest.TestCase):
             "repo": "owner/repo",
             "snapshot_commit": "abc123",
         }
+        assets = Path("/data/assets")
+        adapter = Path("/src/swebench.py")
         rendered = swebench.render_benchmark_manifest(
             tasks=[task],
             snapshots=Path("/data/snapshots"),
-            assets=Path("/data/assets"),
-            adapter=Path("/src/swebench.py"),
+            assets=assets,
+            adapter=adapter,
             deixis_command=Path("/src/target/release/deixis"),
             deixis_config=Path("/data/deixis-rust.toml"),
         )
@@ -186,10 +188,10 @@ class ManifestTests(unittest.TestCase):
             parsed["tasks"][0]["evaluation_command"],
             [
                 "python3",
-                "/src/swebench.py",
+                str(adapter),
                 "evaluate",
                 "--task",
-                "/data/assets/owner__repo-1/task.json",
+                str(assets / "owner__repo-1" / "task.json"),
             ],
         )
 

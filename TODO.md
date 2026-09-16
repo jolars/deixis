@@ -13,6 +13,8 @@ belongs in the [changelog](CHANGELOG.md) and Git history.
   for deferral in `DESIGN.md`.
 - [x] Automate release binaries for Linux, macOS, and Windows. Publish SHA-256
   checksums and GitHub build attestations with every artifact.
+- [x] Make Rust and agent benchmark path assertions portable across canonical
+  temporary paths and Windows path separators.
 - [ ] Publish the first functional read-only release and add its MCP Registry
   metadata.
 
