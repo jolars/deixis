@@ -17,6 +17,8 @@ belongs in the [changelog](CHANGELOG.md) and Git history.
   from direct Dependabot updates.
 - [x] Make Rust and agent benchmark path assertions portable across canonical
   temporary paths and Windows path separators.
+- [x] Migrate to `rmcp` 3.4.0's `ServerConfig` API so release dependency updates
+  pass CI with warnings denied.
 - [ ] Publish the first functional read-only release and add its MCP Registry
   metadata.
 

@@ -6,7 +6,7 @@ use rmcp::{
         CallToolRequestMethod, CallToolRequestParams, CallToolResponse,
         CallToolResult, ContentBlock, Implementation, JsonObject,
         ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-        ServerInfo, Tool, ToolAnnotations,
+        ServerConfig, Tool, ToolAnnotations,
     },
     service::RequestContext,
     transport::stdio,
@@ -161,7 +161,7 @@ impl DeixisServer {
 }
 
 impl ServerHandler for DeixisServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let _project = self.project();
         let capabilities = if self.language_servers.is_empty() {
             ServerCapabilities::default()
@@ -169,7 +169,7 @@ impl ServerHandler for DeixisServer {
             ServerCapabilities::builder().enable_tools().build()
         };
 
-        let info = ServerInfo::new(capabilities).with_server_info(
+        let info = ServerConfig::new(capabilities).with_server_info(
             Implementation::new(
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION"),
