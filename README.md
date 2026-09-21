@@ -46,11 +46,15 @@ count and preserves the language server's error details.
 
 Navigation, hover, signature help, references, symbols, and call-hierarchy
 preparation also retry empty results observed during indexing and
-`ContentModified` errors, waiting up to five seconds for readiness per retry
-within the same timeout and three-retry limit. File-scoped retries
-verify that both the synchronized document and its contents on disk are
-unchanged before reusing a position. Nonempty results and empty results from
-servers with ready or unknown status throughout the request return immediately.
+`ContentModified` errors within the same timeout and three-retry limit. After
+an empty result, Deixis waits for readiness up to the request deadline instead
+of spending retries while indexing continues. A server that remains busy
+produces a `request_timeout` error (30 seconds by default).
+`ContentModified` errors wait up to five seconds for readiness per retry.
+File-scoped retries verify that both the synchronized document and its
+contents on disk are unchanged before reusing a position. Nonempty results and
+empty results from servers with ready or unknown status throughout the request
+return immediately.
 
 Use `definition`, `type_definition`, `implementation`, and `references`
 directly for targeted symbol navigation. Use `document_symbols` only when you

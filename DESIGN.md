@@ -591,11 +591,15 @@ empty results. Empty results are retried only when the server was observed
 busy before or after the attempt.
 `ContentModified` can reflect an internal project-state change even when the
 source file has not changed. A supplied `retriggerRequest` directive must still
-permit a retry. These attempts share the existing three-retry budget. For these
-responses, the readiness wait is bounded at five seconds per retry. Nonempty
-results return immediately, and empty results without observed activity do not
-trigger recovery. Rename, diagnostics, and call-hierarchy expansion retain
-their existing behavior; prepared server objects are not replayed after
+permit a retry. These attempts share the existing three-retry budget.
+After an empty response, Deixis waits for readiness up to the original request
+deadline before retrying. Continued indexing does not consume retries every
+five seconds or return a transient empty result before that deadline. If the
+server stays busy, the call returns `request_timeout`. The readiness wait for
+`ContentModified` remains bounded at five seconds per retry. Nonempty results
+return immediately, and empty results without observed activity do not trigger
+recovery. Rename, diagnostics, and call-hierarchy expansion retain their
+existing behavior; prepared server objects are not replayed after
 `ContentModified`.
 
 Eligible file queries retain the original synchronized document. Before each
@@ -613,7 +617,8 @@ ID. A retry waits at least 50 milliseconds to avoid a tight loop when readiness
 is stale. Observed progress or server-status notifications wake the wait when
 the server becomes ready. With unknown readiness, the 50-millisecond delay is
 enough; busy or degraded readiness is awaited for at most one second per retry.
-Semantic recovery uses the five-second bound described above instead.
+`ContentModified` recovery uses a five-second bound, and recovery from empty
+results waits up to the original request deadline instead.
 The wait releases the concurrency slot and also wakes on transport failure.
 The original downstream request deadline covers all attempts, concurrency-slot
 waits, and readiness waits. Cancellation and deadline expiry prevent further

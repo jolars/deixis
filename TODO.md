@@ -40,6 +40,8 @@ shipped stdio surface.
 - [x] Recover from startup-time empty semantic results and `ContentModified`
   errors within one tool call. Bound readiness waits and retries, and verify
   the source document before replaying a position-based query.
+- [x] Wait for slow indexing up to the request deadline after an empty
+  semantic result instead of exhausting retries while the server stays busy.
 - [x] Add incoming and outgoing call hierarchy behind negotiated server
   capabilities, with the same result limits as references.
 - [x] Add signature help behind negotiated server capabilities, with concise

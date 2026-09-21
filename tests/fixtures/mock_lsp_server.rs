@@ -787,6 +787,33 @@ fn handle_request<R: BufRead>(
             write_message(output, response(id, result))?;
         }
         "textDocument/references" => {
+            if mode == "references-startup-readiness-progress" {
+                let mut snapshot = state.lock().unwrap();
+                snapshot.references_requests += 1;
+                if snapshot.references_requests == 1 {
+                    drop(snapshot);
+                    write_message(output, response(id, Json::Array(Vec::new())))?;
+                    let output = Arc::clone(output);
+                    let state = Arc::clone(&state);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_secs(6));
+                        let mut state = state.lock().unwrap();
+                        state.references_ready = true;
+                        let _ = send_readiness_finished(
+                            "references-startup-readiness-progress",
+                            &output,
+                        );
+                    });
+                    return Ok(());
+                }
+                if !snapshot.references_ready {
+                    write_message(
+                        output,
+                        error_response(id, -32603, "retried before indexing finished".to_owned()),
+                    )?;
+                    return Ok(());
+                }
+            }
             if mode == "references-unsupported" {
                 write_message(
                     output,
@@ -2710,6 +2737,8 @@ struct MockState {
     document_texts: BTreeMap<String, String>,
     diagnostic_requests: usize,
     hover_requests: usize,
+    references_requests: usize,
+    references_ready: bool,
     active_delays: usize,
     max_active_delays: usize,
 }

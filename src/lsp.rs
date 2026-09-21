@@ -3604,7 +3604,9 @@ impl ActiveServer {
                                 .state()
                                 == ReadinessState::Busy) =>
                 {
-                    SEMANTIC_READINESS_WAIT
+                    // Preserve retries while indexing continues. The original
+                    // request deadline bounds the wait for a usable result.
+                    request_timeout
                 }
                 _ => return result,
             };

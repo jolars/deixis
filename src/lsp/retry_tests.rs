@@ -349,17 +349,51 @@ async fn semantic_retry_recovers_empty_then_content_modified() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn semantic_retry_preserves_normal_results_and_bounds_busy_empty_results()
-{
-    for (busy, result, attempts) in [
-        (false, json!([]), 1),
-        (false, JsonValue::Null, 1),
-        (true, json!(["found"]), 1),
-        (true, json!([]), 4),
+async fn semantic_retry_waits_through_slow_indexing() {
+    for progress in [false, true] {
+        let (active, mut receiver) = server().await;
+        readiness(&active, progress, false).await;
+        let pending = request(
+            &active,
+            "workspace/symbol",
+            30_000,
+            &CancellationToken::new(),
+        );
+        let first = receive(&mut receiver).await;
+        respond(&active, &first, json!({"result": []})).await;
+        assert_eq!(active.request_permits.available_permits(), 1);
+
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            assert!(receiver.try_recv().is_err(), "retried during indexing");
+            assert!(!pending.is_finished());
+        }
+
+        let ready_at = Instant::now();
+        readiness(&active, progress, true).await;
+        let second = receive(&mut receiver).await;
+        assert!(Instant::now() - ready_at < Duration::from_millis(50));
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(first["params"], second["params"]);
+        respond(&active, &second, json!({"result": ["found"]})).await;
+        assert_eq!(pending.await.unwrap().unwrap(), json!(["found"]));
+        assert!(active.requests.lock().await.pending.is_empty());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_retry_preserves_normal_results() {
+    for (state, result) in [
+        ("unknown", json!([])),
+        ("unknown", JsonValue::Null),
+        ("ready", json!([])),
+        ("ready", JsonValue::Null),
+        ("busy", json!(["found"])),
     ] {
         let (active, mut receiver) = server().await;
-        if busy {
-            readiness(&active, true, false).await;
+        if state != "unknown" {
+            readiness(&active, true, state == "ready").await;
         }
         let started = Instant::now();
         let pending = request(
@@ -368,12 +402,10 @@ async fn semantic_retry_preserves_normal_results_and_bounds_busy_empty_results()
             20_000,
             &CancellationToken::new(),
         );
-        for _ in 0..attempts {
-            let message = receive(&mut receiver).await;
-            respond(&active, &message, json!({"result": result})).await;
-        }
+        let message = receive(&mut receiver).await;
+        respond(&active, &message, json!({"result": result})).await;
         assert_eq!(pending.await.unwrap().unwrap(), result);
-        assert!(Instant::now() - started <= Duration::from_secs(15));
+        assert_eq!(Instant::now(), started);
         assert!(receiver.try_recv().is_err());
     }
 }
@@ -384,9 +416,11 @@ async fn semantic_retry_obeys_cancellation_and_deadline() {
         let (active, mut receiver) = server().await;
         readiness(&active, true, false).await;
         let token = CancellationToken::new();
-        let pending = request(&active, "workspace/symbol", 500, &token);
+        let started = Instant::now();
+        let pending = request(&active, "workspace/symbol", 30_000, &token);
         let first = receive(&mut receiver).await;
         respond(&active, &first, json!({"result": []})).await;
+        tokio::time::advance(Duration::from_secs(20)).await;
         if cancel {
             token.cancel();
         }
@@ -395,6 +429,7 @@ async fn semantic_retry_obeys_cancellation_and_deadline() {
             assert!(matches!(error, LspError::RequestCanceled { .. }));
         } else {
             assert!(matches!(error, LspError::RequestTimeout { .. }));
+            assert_eq!(Instant::now() - started, Duration::from_secs(30));
         }
         assert!(receiver.try_recv().is_err());
     }

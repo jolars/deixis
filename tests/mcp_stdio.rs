@@ -3025,6 +3025,53 @@ async fn new_location_tools_report_their_unsupported_capabilities()
 }
 
 #[tokio::test]
+async fn references_wait_for_slow_indexing_over_mcp_stdio()
+-> Result<(), Box<dyn Error>> {
+    let mode = "references-startup-readiness-progress";
+    let root = unique_dir(mode)?;
+    fs::write(root.join("main.rs"), "let 🦀answer = 42;\n")?;
+    let config_path =
+        write_mock_config_for_mode_with_timeout(&root, mode, 10_000)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deixis"));
+    command
+        .arg("--root")
+        .arg(&root)
+        .arg("--config")
+        .arg(&config_path);
+    let client = timeout(
+        Duration::from_secs(10),
+        ().serve(TokioChildProcess::new(command)?),
+    )
+    .await??;
+    let result = timeout(
+        Duration::from_secs(15),
+        client.call_tool(
+            CallToolRequestParams::new("references").with_arguments(
+                json!({
+                    "path": "main.rs",
+                    "position": { "line": 0, "character": 8 },
+                    "includeDeclaration": true,
+                    "limit": 30,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        ),
+    )
+    .await??;
+
+    assert_eq!(result.is_error, Some(false), "{result:?}");
+    let content = result.structured_content.as_ref().unwrap();
+    assert_eq!(content["locations"].as_array().unwrap().len(), 2);
+    assert_eq!(content["pagination"]["total"], 2);
+    assert!(content.get("resultStability").is_none());
+
+    timeout(Duration::from_secs(10), client.cancel()).await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn exposes_references_with_explicit_declaration_inclusion()
 -> Result<(), Box<dyn Error>> {
     let root = unique_dir("references-locations-utf-16")?;
