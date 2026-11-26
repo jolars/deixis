@@ -2601,6 +2601,7 @@ fn document_symbols_tool() -> Tool {
 
 fn document_symbols_output_schema() -> Arc<JsonObject> {
     Arc::new(object_schema(json!({
+        "type": "object",
         "$defs": {
             "documentSymbol": {
                 "type": "object",
@@ -3062,6 +3063,7 @@ fn status_overview_output_schema() -> JsonValue {
 
 fn result_output_schema(success: JsonValue) -> Arc<JsonObject> {
     Arc::new(object_schema(json!({
+        "type": "object",
         "oneOf": [success, error_output_schema()]
     })))
 }
